@@ -120,8 +120,6 @@ class Settings(BaseSettings):
     max_signature_png_dimension: int = 4000
     min_signature_png_dimension: int = 8
     max_request_bytes: int = 8 * 1024 * 1024
-    #: Everything except a template upload is small JSON.
-    max_json_body_bytes: int = 2 * 1024 * 1024
 
     # ----------------------------------------------------------------- api and worker
     #: The built signing UI (``bun run build``). Served at /sign when the directory exists.

@@ -187,11 +187,14 @@ class _StreamLoggerFactory:
     So nothing is cached and the stream is resolved per log call unless one was given.
     """
 
-    def __init__(self, stream: LogStream | None) -> None:
+    def __init__(self, stream: LogStream | None, *, stderr: bool = False) -> None:
         self._stream = stream
+        self._stderr = stderr
 
     def __call__(self, *_args: Any) -> structlog.PrintLogger:
-        return structlog.PrintLogger(file=cast(TextIO, self._stream) if self._stream is not None else sys.stdout)
+        if self._stream is not None:
+            return structlog.PrintLogger(file=cast(TextIO, self._stream))
+        return structlog.PrintLogger(file=sys.stderr if self._stderr else sys.stdout)
 
 
 def configure_logging(
@@ -200,11 +203,13 @@ def configure_logging(
     json_output: bool = True,
     app_env: str = "dev",
     stream: LogStream | None = None,
+    stderr: bool = False,
 ) -> None:
     """Configure structlog and the stdlib root logger. Idempotent; call once at startup.
 
     ``stream`` pins the output (tests that read rendered lines pass a buffer); left as ``None``
-    every line goes to the current ``sys.stdout``.
+    every line goes to the current ``sys.stdout`` -- or ``sys.stderr`` with ``stderr=True``, which
+    is what the CLI uses so that its own output on stdout stays parseable.
     """
     numeric_level = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
 
@@ -224,7 +229,7 @@ def configure_logging(
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
-        logger_factory=_StreamLoggerFactory(stream),
+        logger_factory=_StreamLoggerFactory(stream, stderr=stderr),
         cache_logger_on_first_use=False,
     )
     structlog.contextvars.bind_contextvars(app_env=app_env)
@@ -233,3 +238,10 @@ def configure_logging(
 def get_logger(name: str = "esign") -> Any:
     """A bound logger. Keys must be on :data:`LOGGABLE_KEYS` or they are dropped."""
     return structlog.get_logger(name)
+
+
+# Safe by default. structlog's own default prints every key it is given, so a process that forgot
+# to call ``configure_logging`` would have no allowlist at all. Importing this module is enough to
+# have one; an entry point calls ``configure_logging`` again to choose level and format.
+if not structlog.is_configured():
+    configure_logging()

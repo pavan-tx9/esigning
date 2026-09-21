@@ -40,6 +40,9 @@ def make_engine(url: str, *, echo: bool = False, pool_size: int = 5, application
         echo=echo,
         future=True,
         pool_pre_ping=True,
+        # A driver error's text otherwise quotes the statement's parameters -- display names,
+        # prefill-derived values -- and exception text has a way of reaching logs.
+        hide_parameters=True,
         pool_size=pool_size,
         max_overflow=pool_size,
         connect_args={"application_name": application_name},
