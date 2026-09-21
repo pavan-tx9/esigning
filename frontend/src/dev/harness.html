@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Host page stand-in (dev only)</title>
+  </head>
+  <body>
+    <!-- Dev only. Plays the EHR page: embeds the signing UI in an iframe, answers esign:ready
+         with esign:init, and handles re-authentication. Never part of the production build. -->
+    <div class="flex h-dvh flex-col">
+      <details class="border-edge border-b bg-sunk text-sm" id="panel">
+        <summary class="cursor-pointer px-4 py-2 font-semibold text-ink-700">
+          Host page stand-in · <span id="scenario-name"></span>
+        </summary>
+        <div class="grid gap-3 px-4 pb-3">
+          <label class="grid gap-1">
+            <span class="font-semibold">Scenario</span>
+            <select id="scenario" class="min-h-11 rounded-md bg-sheet px-2 ring-1 ring-edge-strong"></select>
+          </label>
+          <p id="scenario-detail" class="text-ink-700"></p>
+          <ol id="log" class="m-0 max-h-40 list-none overflow-y-auto rounded-md bg-sheet p-2 font-mono text-xs"></ol>
+        </div>
+      </details>
+      <div
+        id="reauth"
+        hidden
+        class="flex flex-wrap items-center gap-3 border-warn-edge border-b-2 bg-warn-wash px-4 py-3"
+      >
+        <p class="flex-1 font-semibold">Host: the signer must sign in again.</p>
+        <button id="reauth-ok" type="button" class="min-h-11 rounded-md bg-accent-600 px-4 font-semibold text-on-accent">
+          Password confirmed
+        </button>
+        <button id="reauth-ignore" type="button" class="min-h-11 rounded-md px-3 underline">
+          Do nothing
+        </button>
+      </div>
+      <iframe id="frame" title="Sign document" class="w-full flex-1 border-0"></iframe>
+    </div>
+    <script type="module" src="./harness.ts"></script>
+  </body>
+</html>

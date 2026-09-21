@@ -1,7 +1,14 @@
 import { HttpResponse, http } from "msw";
 import { beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import { ApiError, ApiValidationError, api, hasSessionToken, setSessionToken } from "@/lib/api";
+import {
+  ApiError,
+  ApiNetworkError,
+  ApiValidationError,
+  api,
+  hasSessionToken,
+  setSessionToken,
+} from "@/lib/api";
 import { server } from "@/test/server";
 
 const sessionSchema = z.object({ envelope: z.object({ id: z.string(), page_count: z.number() }) });
@@ -105,5 +112,26 @@ describe("the fetch seam", () => {
     });
 
     expect(key).toBe("key-1");
+  });
+
+  it("reports a request that never completed as a network error, distinct from an API error", async () => {
+    server.use(http.get("/v1/signing/session", () => HttpResponse.error()));
+
+    await expect(api("/signing/session", sessionSchema)).rejects.toBeInstanceOf(ApiNetworkError);
+  });
+
+  it("still validates an empty 204 against the schema", async () => {
+    server.use(http.post("/v1/signing/viewed", () => new HttpResponse(null, { status: 204 })));
+
+    await expect(api("/signing/viewed", z.looseObject({}), { body: {} })).resolves.toEqual({});
+    await expect(api("/signing/viewed", sessionSchema, { body: {} })).rejects.toBeInstanceOf(
+      ApiValidationError,
+    );
+  });
+
+  it("rejects a 2xx whose body is not JSON at all", async () => {
+    server.use(http.get("/v1/signing/session", () => new HttpResponse("<html>")));
+
+    await expect(api("/signing/session", sessionSchema)).rejects.toBeInstanceOf(ApiValidationError);
   });
 });

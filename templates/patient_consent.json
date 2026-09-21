@@ -1,0 +1,102 @@
+{
+  "document_type": "patient_consent",
+  "fields": [
+    {
+      "id": "patient_signature",
+      "label": "Signature",
+      "page": 1,
+      "rect": {
+        "h": 46,
+        "w": 240,
+        "x": 72,
+        "y": 210
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "signature"
+    },
+    {
+      "id": "patient_date",
+      "label": "Date signed",
+      "page": 1,
+      "rect": {
+        "h": 18,
+        "w": 170,
+        "x": 352,
+        "y": 210
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "date_signed"
+    },
+    {
+      "id": "patient_agrees",
+      "label": "I have read and understood this consent",
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 14,
+        "x": 72,
+        "y": 300
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "checkbox"
+    }
+  ],
+  "key": "patient_consent",
+  "name": "Consent to treatment",
+  "prefill_fields": [
+    {
+      "font_size": 10,
+      "key": "patient_name",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 240,
+        "x": 72,
+        "y": 560
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "date_of_birth",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 170,
+        "x": 352,
+        "y": 560
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "treatment_summary",
+      "multiline": true,
+      "page": 1,
+      "rect": {
+        "h": 90,
+        "w": 450,
+        "x": 72,
+        "y": 430
+      },
+      "required": true
+    }
+  ],
+  "signer_roles": [
+    {
+      "allowed_capacities": [
+        "self",
+        "guardian"
+      ],
+      "key": "patient",
+      "label": "Patient or guardian",
+      "order_index": 0,
+      "requires_reauth": false
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+"""``DocumentService``: the implementation the rest of the system talks to.
+
+Every method is a thin, typed front for one focused module, so this file stays readable and the
+interesting logic stays testable on its own. Nothing here touches the database, the clock or the
+network: given the same inputs it returns the same bytes, which is what lets a revision hash mean
+something.
+
+Logging deliberately carries counts, hashes, page counts and error codes -- never a prefill value,
+a display name, a typed signature or PDF bytes. See ``esign.logging``.
+"""
+
+from __future__ import annotations
+
+from esign.config import Settings
+from esign.contracts import (
+    Capture,
+    CertificateSummary,
+    Clock,
+    FieldDef,
+    PrefillFieldDef,
+    SignerRoleDef,
+    SignerStamp,
+    TemplatePdfInfo,
+    ValidationFailed,
+)
+from esign.documents import certificate as certificate_module
+from esign.documents import definitions as definitions_module
+from esign.documents import images, inspection, stamping
+from esign.documents.fonts import ensure_fonts_registered
+from esign.documents.pdfutil import sanitize_document, to_bytes, writer_from_bytes
+from esign.logging import get_logger
+
+__all__ = ["PdfDocumentService"]
+
+log = get_logger(__name__)
+
+
+class PdfDocumentService:
+    """pypdf + reportlab + Pillow implementation of ``esign.contracts.DocumentService``."""
+
+    def __init__(self, settings: Settings, clock: Clock | None = None) -> None:
+        self._settings = settings
+        # Kept for factory symmetry with the other modules. This service never reads a clock: every
+        # timestamp it prints arrives inside a ``SignerStamp`` or ``CertificateSummary`` that the
+        # envelope service already took from ``Clock``. Reading the wall clock here would let two
+        # renderings of the same evidence disagree.
+        self._clock = clock
+        ensure_fonts_registered()
+
+    # ------------------------------------------------------------------ templates
+
+    def inspect_template_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        info = inspection.inspect_template(pdf, self._settings)
+        log.info(
+            "documents.template_inspected",
+            page_count=info.page_count,
+            sha256=info.sha256,
+            size_bytes=len(pdf),
+        )
+        return info
+
+    def validate_definitions(
+        self,
+        info: TemplatePdfInfo,
+        fields: list[FieldDef],
+        prefill_fields: list[PrefillFieldDef],
+        signer_roles: list[SignerRoleDef],
+    ) -> None:
+        definitions_module.validate_definitions(info, fields, prefill_fields, signer_roles)
+
+    # ------------------------------------------------------------------ preparation
+
+    def prepare(self, template_pdf: bytes, prefill_fields: list[PrefillFieldDef], prefill: dict[str, str]) -> bytes:
+        out = stamping.prepare(template_pdf, prefill_fields, prefill, self._settings)
+        log.info("documents.prepared", size_bytes=len(out), field_count=len(prefill_fields))
+        return out
+
+    # ------------------------------------------------------------------ signing
+
+    def sanitize_signature_png(self, data: bytes) -> bytes:
+        return images.sanitize_signature_png(data, self._settings)
+
+    def apply_signer_marks(
+        self, pdf: bytes, fields: list[FieldDef], captures: list[Capture], stamp: SignerStamp
+    ) -> bytes:
+        out = stamping.apply_signer_marks(pdf, fields, captures, stamp)
+        log.info(
+            "documents.marks_applied",
+            signer_id=stamp.signer_id,
+            capacity=stamp.capacity,
+            field_count=len(fields),
+            capture_count=len(captures),
+            size_bytes=len(out),
+        )
+        return out
+
+    # ------------------------------------------------------------------ completion
+
+    def build_certificate(self, summary: CertificateSummary) -> bytes:
+        out = certificate_module.build_certificate(summary, seal_profile=self._settings.seal_profile)
+        log.info(
+            "documents.certificate_built",
+            envelope_id=summary.envelope_id,
+            signer_count=len(summary.signers),
+            event_count=summary.audit_event_count,
+            size_bytes=len(out),
+        )
+        return out
+
+    def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
+        """Append the certificate pages and return the exact bytes to be sealed.
+
+        Both inputs are this service's own output, but they are re-checked anyway: a
+        ``finalize`` that quietly accepted a document with a form or a script would put one inside
+        the seal, where it is permanent.
+        """
+        writer = writer_from_bytes(pdf)
+        certificate_writer = writer_from_bytes(certificate_pdf)
+        if not certificate_writer.pages:  # pragma: no cover - writer_from_bytes already refuses
+            raise ValidationFailed("certificate has no pages", code="certificate_empty")
+        for page in certificate_writer.pages:
+            writer.add_page(page)
+        sanitize_document(writer)
+        out = to_bytes(writer)
+        log.info(
+            "documents.finalized",
+            page_count=len(writer.pages),
+            size_bytes=len(out),
+        )
+        return out

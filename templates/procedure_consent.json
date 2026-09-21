@@ -1,0 +1,202 @@
+{
+  "document_type": "procedure_consent",
+  "fields": [
+    {
+      "id": "patient_initials_risks",
+      "label": "Initials",
+      "page": 2,
+      "rect": {
+        "h": 40,
+        "w": 108,
+        "x": 432,
+        "y": 250
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "initials"
+    },
+    {
+      "id": "patient_signature",
+      "label": "Patient signature",
+      "page": 3,
+      "rect": {
+        "h": 46,
+        "w": 240,
+        "x": 72,
+        "y": 520
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "signature"
+    },
+    {
+      "id": "patient_date",
+      "label": "Date signed",
+      "page": 3,
+      "rect": {
+        "h": 18,
+        "w": 170,
+        "x": 352,
+        "y": 520
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "date_signed"
+    },
+    {
+      "id": "witness_signature",
+      "label": "Witness signature",
+      "page": 3,
+      "rect": {
+        "h": 46,
+        "w": 240,
+        "x": 72,
+        "y": 380
+      },
+      "required": true,
+      "signer_role": "witness",
+      "type": "signature"
+    },
+    {
+      "id": "witness_date",
+      "label": "Date signed",
+      "page": 3,
+      "rect": {
+        "h": 18,
+        "w": 170,
+        "x": 352,
+        "y": 380
+      },
+      "required": true,
+      "signer_role": "witness",
+      "type": "date_signed"
+    },
+    {
+      "id": "clinician_signature",
+      "label": "Clinician signature",
+      "page": 3,
+      "rect": {
+        "h": 46,
+        "w": 240,
+        "x": 72,
+        "y": 240
+      },
+      "required": true,
+      "signer_role": "clinician",
+      "type": "signature"
+    },
+    {
+      "id": "clinician_date",
+      "label": "Date signed",
+      "page": 3,
+      "rect": {
+        "h": 18,
+        "w": 170,
+        "x": 352,
+        "y": 240
+      },
+      "required": true,
+      "signer_role": "clinician",
+      "type": "date_signed"
+    }
+  ],
+  "key": "procedure_consent",
+  "name": "Consent to a procedure",
+  "prefill_fields": [
+    {
+      "font_size": 10,
+      "key": "patient_name",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 240,
+        "x": 72,
+        "y": 560
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "date_of_birth",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 170,
+        "x": 352,
+        "y": 560
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "procedure_name",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 450,
+        "x": 72,
+        "y": 520
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "procedure_description",
+      "multiline": true,
+      "page": 1,
+      "rect": {
+        "h": 110,
+        "w": 450,
+        "x": 72,
+        "y": 380
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "known_risks",
+      "multiline": true,
+      "page": 2,
+      "rect": {
+        "h": 180,
+        "w": 360,
+        "x": 72,
+        "y": 330
+      },
+      "required": true
+    }
+  ],
+  "signer_roles": [
+    {
+      "allowed_capacities": [
+        "self",
+        "guardian"
+      ],
+      "key": "patient",
+      "label": "Patient",
+      "order_index": 0,
+      "requires_reauth": false
+    },
+    {
+      "allowed_capacities": [
+        "witness"
+      ],
+      "key": "witness",
+      "label": "Witness",
+      "order_index": 1,
+      "requires_reauth": false
+    },
+    {
+      "allowed_capacities": [
+        "clinician"
+      ],
+      "key": "clinician",
+      "label": "Clinician",
+      "order_index": 2,
+      "requires_reauth": true
+    }
+  ]
+}

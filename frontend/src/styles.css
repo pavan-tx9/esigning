@@ -1,37 +1,172 @@
 @import "tailwindcss";
 
 /* Tailwind v4 is configured here, in CSS. There is no tailwind.config.js.
-   The signing UI is read by patients on a clinic tablet, so the defaults lean large and calm. */
+
+   The signing UI is read by patients, some elderly or anxious, often on a clinic tablet. The
+   look is stationery rather than software: warm paper, dark ink, one quiet pine-green accent, a
+   serif for headings so the screen reads like a letter from the clinic. No fonts are downloaded
+   (the CSP forbids it and a clinic network should not be asked to); the stacks below resolve to
+   good faces on iOS, Android, Windows and macOS.
+
+   Every colour is a token, and dark mode only redefines tokens. The PDF itself is always paper
+   white, so anything drawn on top of a page uses the fixed --color-page-* values. */
 
 @theme {
   --font-sans:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    "Avenir Next", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans",
+    "Helvetica Neue", sans-serif;
+  --font-serif:
+    "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", "Noto Serif", Georgia, serif;
+  --font-script:
+    "Snell Roundhand", "Segoe Script", "Apple Chancery", "Lucida Handwriting", "Brush Script MT",
+    "Dancing Script", cursive;
 
-  --color-ink-900: oklch(0.21 0.02 260);
-  --color-ink-700: oklch(0.38 0.02 260);
-  --color-ink-500: oklch(0.55 0.02 260);
-  --color-paper: oklch(0.99 0.002 260);
-  --color-edge: oklch(0.91 0.006 260);
-  --color-accent-600: oklch(0.52 0.13 250);
-  --color-accent-700: oklch(0.44 0.13 250);
-  --color-danger-600: oklch(0.54 0.17 25);
+  --color-paper: oklch(0.968 0.011 85);
+  --color-sheet: oklch(0.995 0.004 85);
+  --color-sunk: oklch(0.945 0.013 85);
+  --color-ink-900: oklch(0.24 0.02 240);
+  --color-ink-700: oklch(0.37 0.02 240);
+  --color-ink-500: oklch(0.49 0.02 240);
+  --color-edge: oklch(0.88 0.014 85);
+  --color-edge-strong: oklch(0.62 0.02 200);
+  --color-accent-600: oklch(0.43 0.075 190);
+  --color-accent-700: oklch(0.36 0.07 190);
+  --color-accent-wash: oklch(0.94 0.025 185);
+  --color-on-accent: oklch(0.99 0.005 85);
+  --color-danger-600: oklch(0.48 0.15 28);
+  --color-danger-wash: oklch(0.95 0.025 28);
+  --color-warn-wash: oklch(0.95 0.045 85);
+  --color-warn-edge: oklch(0.72 0.11 75);
+  --color-pen: oklch(0.29 0.09 265);
+
+  /* Drawn on top of a white PDF page: the same in light and dark. */
+  --color-page-mark: oklch(0.87 0.12 92 / 0.5);
+  --color-page-mark-edge: oklch(0.5 0.12 70);
+  --color-page-done: oklch(0.9 0.06 170 / 0.35);
+  --color-page-done-edge: oklch(0.43 0.075 190);
+  --color-page-ink: oklch(0.29 0.09 265);
+
+  --shadow-sheet: 0 1px 2px oklch(0.3 0.02 85 / 0.08), 0 8px 24px -12px oklch(0.3 0.02 85 / 0.18);
 }
 
 @layer base {
+  :root {
+    color-scheme: light dark;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --color-paper: oklch(0.19 0.012 230);
+      --color-sheet: oklch(0.235 0.014 230);
+      --color-sunk: oklch(0.165 0.012 230);
+      --color-ink-900: oklch(0.94 0.008 85);
+      --color-ink-700: oklch(0.82 0.01 85);
+      --color-ink-500: oklch(0.7 0.012 85);
+      --color-edge: oklch(0.33 0.015 230);
+      --color-edge-strong: oklch(0.6 0.02 200);
+      --color-accent-600: oklch(0.8 0.08 185);
+      --color-accent-700: oklch(0.87 0.07 185);
+      --color-accent-wash: oklch(0.28 0.03 190);
+      --color-on-accent: oklch(0.17 0.02 200);
+      --color-danger-600: oklch(0.78 0.11 28);
+      --color-danger-wash: oklch(0.27 0.04 28);
+      --color-warn-wash: oklch(0.28 0.04 80);
+      --color-warn-edge: oklch(0.72 0.11 75);
+      --color-pen: oklch(0.86 0.05 265);
+      --shadow-sheet: 0 0 0 1px oklch(0.33 0.015 230);
+    }
+  }
+
   html {
     -webkit-text-size-adjust: 100%;
+    /* Slightly larger than the browser default, and in rem everywhere so 200% zoom just works. */
+    font-size: 106.25%;
   }
 
   body {
     background: var(--color-paper);
     color: var(--color-ink-900);
     font-family: var(--font-sans);
+    line-height: 1.55;
     margin: 0;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1,
+  h2 {
+    font-family: var(--font-serif);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
   }
 
   /* Someone is signing a legal document. Focus must always be obvious. */
   :focus-visible {
-    outline: 2px solid var(--color-accent-600);
-    outline-offset: 2px;
+    outline: 3px solid var(--color-accent-600);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+
+  /* Headings receive focus when a step changes so a screen reader starts in the right place.
+     They are not interactive, so they do not need a ring. */
+  [data-step-heading]:focus {
+    outline: none;
+  }
+}
+
+@layer components {
+  /* A step arriving: a short settle, nothing that slides across the screen. */
+  .step-enter {
+    animation: step-enter 260ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+
+  .quiet-pulse {
+    animation: quiet-pulse 1.8s ease-in-out infinite;
+  }
+
+  /* The baseline a signature sits on, in the pad and in previews. */
+  .signature-line {
+    background-image: linear-gradient(var(--color-edge-strong), var(--color-edge-strong));
+    background-position: 1rem calc(100% - 2.25rem);
+    background-repeat: no-repeat;
+    background-size: calc(100% - 2rem) 1px;
+  }
+}
+
+/* Unlayered on purpose: it must beat every utility without resorting to !important. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+    scroll-behavior: auto;
+  }
+}
+
+@keyframes step-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes quiet-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
   }
 }

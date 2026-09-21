@@ -1,0 +1,243 @@
+"""The certificate of completion.
+
+This is the page a court reads. It has to stand alone: someone holding only the sealed PDF, with
+no access to this system, must be able to see who signed, in what capacity, how they were
+authenticated, what they consented to, when each step happened, what the document hashed to at
+each stage, and how to check all of that for themselves.
+
+It is built from :class:`~esign.contracts.CertificateSummary` and from nothing else, which is how
+"no chart data" is enforced rather than remembered: there is no chart data in the input. Signer
+display names are on it deliberately -- a signature nobody can attribute is not evidence -- and
+they are the only personal data present.
+
+The certificate is built *before* sealing, because appending pages after a PDF signature would
+invalidate it (SPEC section 3, step 7). So the seal profile it prints is the configured one, and
+the profile actually achieved is recorded in the ``document.sealed`` audit event. See the contract
+note in the module report.
+"""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Final
+
+from reportlab.lib.pagesizes import LETTER
+from reportlab.pdfgen.canvas import Canvas
+
+from esign.contracts import CertificateSigner, CertificateSummary, SealProfile
+from esign.documents.fonts import (
+    PLAIN_BOLD_FONT,
+    PLAIN_FONT,
+    ensure_fonts_registered,
+    truncate_to_width,
+    wrap_text,
+)
+from esign.documents.pdfutil import new_canvas
+
+__all__ = ["build_certificate"]
+
+_PAGE_W, _PAGE_H = LETTER
+_MARGIN: Final[float] = 54.0
+_CONTENT_W: Final[float] = _PAGE_W - 2 * _MARGIN
+_LABEL_W: Final[float] = 132.0
+_VALUE_W: Final[float] = _CONTENT_W - _LABEL_W
+_BODY: Final[float] = 9.0
+_LEADING: Final[float] = 12.5
+_INK = (0.08, 0.10, 0.16)
+_MUTED = (0.38, 0.41, 0.48)
+_RULE = (0.80, 0.82, 0.86)
+
+_TITLE: Final[str] = "Certificate of completion"
+
+_VERIFY_LINES: Final[tuple[str, ...]] = (
+    "How to verify this document: check the PAdES seal on this PDF against the issuing "
+    "organisation's trust root, then confirm that no bytes have changed since the seal was "
+    "applied. The hashes above identify the document at each stage; the audit trail they belong "
+    "to is hash-chained, and its head hash is printed above. The issuing service verifies all "
+    "three together with `esign verify <envelope id>`.",
+)
+
+
+@dataclass
+class _Cursor:
+    """A one-column layout that starts a new page when it runs out of room."""
+
+    canvas: Canvas
+    y: float
+    page: int = 1
+
+    def space(self, amount: float) -> None:
+        self.y -= amount
+
+    def ensure(self, needed: float) -> None:
+        if self.y - needed < _MARGIN + 28:
+            self.new_page()
+
+    def new_page(self) -> None:
+        _footer(self.canvas, self.page)
+        self.canvas.showPage()
+        self.page += 1
+        self.y = _PAGE_H - _MARGIN
+        _continued(self.canvas)
+        self.y -= 26
+
+
+def _footer(canvas: Canvas, page: int) -> None:
+    canvas.setFont(PLAIN_FONT, 7.5)
+    canvas.setFillColorRGB(*_MUTED)
+    canvas.drawString(_MARGIN, _MARGIN - 18, "Certificate of completion")
+    canvas.drawRightString(_PAGE_W - _MARGIN, _MARGIN - 18, f"Page {page}")
+
+
+def _continued(canvas: Canvas) -> None:
+    canvas.setFont(PLAIN_BOLD_FONT, 10)
+    canvas.setFillColorRGB(*_INK)
+    canvas.drawString(_MARGIN, _PAGE_H - _MARGIN - 10, f"{_TITLE} (continued)")
+
+
+def _hexed(value: bytes) -> str:
+    return value.hex()
+
+
+def _when(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _heading(cursor: _Cursor, text: str) -> None:
+    cursor.ensure(32)
+    canvas = cursor.canvas
+    cursor.space(16)
+    canvas.setFont(PLAIN_BOLD_FONT, 10.5)
+    canvas.setFillColorRGB(*_INK)
+    canvas.drawString(_MARGIN, cursor.y, text)
+    cursor.space(6)
+    canvas.setStrokeColorRGB(*_RULE)
+    canvas.setLineWidth(0.6)
+    canvas.line(_MARGIN, cursor.y, _PAGE_W - _MARGIN, cursor.y)
+    cursor.space(12)
+
+
+#: A single row never grows past this. A user agent string has no length limit on the wire, and a
+#: row that flows past the bottom margin would push a signer's details off the page entirely.
+_MAX_ROW_LINES: Final[int] = 4
+
+
+def _row(cursor: _Cursor, label: str, value: str, *, mono_wrap: bool = False) -> None:
+    ensure_fonts_registered()
+    text = value if value else "—"
+    lines = _split_hex(text) if mono_wrap else wrap_text(text, PLAIN_FONT, _BODY, _VALUE_W)
+    if len(lines) > _MAX_ROW_LINES:
+        lines = lines[:_MAX_ROW_LINES]
+        lines[-1] = truncate_to_width(lines[-1] + "…", PLAIN_FONT, _BODY, _VALUE_W)
+    cursor.ensure(len(lines) * _LEADING)
+    canvas = cursor.canvas
+    canvas.setFont(PLAIN_FONT, _BODY)
+    canvas.setFillColorRGB(*_MUTED)
+    canvas.drawString(_MARGIN, cursor.y, truncate_to_width(label, PLAIN_FONT, _BODY, _LABEL_W - 8))
+    canvas.setFillColorRGB(*_INK)
+    for index, line in enumerate(lines):
+        canvas.drawString(_MARGIN + _LABEL_W, cursor.y - index * _LEADING, line)
+    cursor.space(len(lines) * _LEADING)
+
+
+def _split_hex(text: str) -> list[str]:
+    """Hash digests wrap by character, not by word: there are no spaces to break on."""
+    per_line = 64
+    return [text[i : i + per_line] for i in range(0, len(text), per_line)] or [""]
+
+
+def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> None:
+    cursor.ensure(150)
+    canvas = cursor.canvas
+    cursor.space(8)
+    canvas.setFont(PLAIN_BOLD_FONT, 9.5)
+    canvas.setFillColorRGB(*_INK)
+    canvas.drawString(
+        _MARGIN,
+        cursor.y,
+        truncate_to_width(f"{index}. {signer.display_name}", PLAIN_BOLD_FONT, 9.5, _CONTENT_W),
+    )
+    cursor.space(_LEADING)
+
+    _row(cursor, "Role", signer.role_label)
+    _row(cursor, "Capacity", signer.capacity)
+    _row(cursor, "Signer id", str(signer.signer_id))
+    _row(cursor, "Authentication", signer.auth_method)
+    _row(cursor, "Re-authentication", signer.reauth_method or "not required")
+    _row(cursor, "Consent version", signer.consent_version)
+    _row(cursor, "Viewed", _when(signer.viewed_at))
+    _row(cursor, "Consented", _when(signer.consented_at))
+    _row(cursor, "Signed", _when(signer.signed_at))
+    _row(cursor, "IP address", signer.ip or "not recorded")
+    _row(cursor, "User agent", signer.user_agent or "not recorded")
+    if signer.kiosk_staff_user_id or signer.kiosk_identity_check:
+        _row(cursor, "Kiosk staff member", signer.kiosk_staff_user_id or "not recorded")
+        _row(cursor, "Identity check", signer.kiosk_identity_check or "not recorded")
+    cursor.space(4)
+
+
+def _paragraph(cursor: _Cursor, text: str, *, size: float = 8.0) -> None:
+    lines = wrap_text(text, PLAIN_FONT, size, _CONTENT_W)
+    cursor.ensure(len(lines) * (size + 2.5))
+    canvas = cursor.canvas
+    canvas.setFont(PLAIN_FONT, size)
+    canvas.setFillColorRGB(*_MUTED)
+    for line in lines:
+        canvas.drawString(_MARGIN, cursor.y, line)
+        cursor.space(size + 2.5)
+
+
+def build_certificate(summary: CertificateSummary, *, seal_profile: SealProfile) -> bytes:
+    """Implements ``DocumentService.build_certificate``.
+
+    ``seal_profile`` is the configured profile; the achieved one is in the ``document.sealed``
+    audit event, because the seal is applied after this document exists.
+    """
+    ensure_fonts_registered()
+    buffer = io.BytesIO()
+    canvas = new_canvas(buffer, _PAGE_W, _PAGE_H)
+
+    canvas.setFont(PLAIN_BOLD_FONT, 16)
+    canvas.setFillColorRGB(*_INK)
+    canvas.drawString(_MARGIN, _PAGE_H - _MARGIN - 12, _TITLE)
+    canvas.setFont(PLAIN_FONT, 8.5)
+    canvas.setFillColorRGB(*_MUTED)
+    canvas.drawString(
+        _MARGIN,
+        _PAGE_H - _MARGIN - 26,
+        "This page is part of the sealed document and records how it was signed.",
+    )
+
+    cursor = _Cursor(canvas=canvas, y=_PAGE_H - _MARGIN - 44)
+
+    _heading(cursor, "Document")
+    _row(cursor, "Envelope id", str(summary.envelope_id))
+    _row(cursor, "Document type", summary.document_type)
+    _row(cursor, "Template", f"{summary.template_key} v{summary.template_version}")
+    _row(cursor, "Created", _when(summary.created_at))
+    _row(cursor, "Completed", _when(summary.completed_at))
+    _row(cursor, "Signers", str(len(summary.signers)))
+
+    _heading(cursor, "Hashes (SHA-256)")
+    _row(cursor, "Presented to signers", _hexed(summary.presented_sha256), mono_wrap=True)
+    _row(cursor, "Final signed revision", _hexed(summary.final_revision_sha256), mono_wrap=True)
+
+    _heading(cursor, "Audit trail")
+    _row(cursor, "Events", str(summary.audit_event_count))
+    _row(cursor, "Head hash", _hexed(summary.audit_head_hash), mono_wrap=True)
+    _row(cursor, "Seal profile (configured)", seal_profile)
+
+    _heading(cursor, "Signers")
+    for index, signer in enumerate(summary.signers, start=1):
+        _signer_block(cursor, index, signer)
+
+    _heading(cursor, "Verification")
+    for paragraph in _VERIFY_LINES:
+        _paragraph(cursor, paragraph)
+
+    _footer(canvas, cursor.page)
+    canvas.showPage()
+    canvas.save()
+    return buffer.getvalue()

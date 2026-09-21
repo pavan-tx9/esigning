@@ -1,0 +1,76 @@
+{
+  "document_type": "hipaa_acknowledgement",
+  "fields": [
+    {
+      "id": "patient_signature",
+      "label": "Signature",
+      "page": 1,
+      "rect": {
+        "h": 46,
+        "w": 240,
+        "x": 72,
+        "y": 200
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "signature"
+    },
+    {
+      "id": "patient_date",
+      "label": "Date signed",
+      "page": 1,
+      "rect": {
+        "h": 18,
+        "w": 170,
+        "x": 352,
+        "y": 200
+      },
+      "required": true,
+      "signer_role": "patient",
+      "type": "date_signed"
+    }
+  ],
+  "key": "hipaa_acknowledgement",
+  "name": "Acknowledgement of privacy practices",
+  "prefill_fields": [
+    {
+      "font_size": 10,
+      "key": "patient_name",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 240,
+        "x": 72,
+        "y": 560
+      },
+      "required": true
+    },
+    {
+      "font_size": 10,
+      "key": "notice_version",
+      "multiline": false,
+      "page": 1,
+      "rect": {
+        "h": 14,
+        "w": 170,
+        "x": 352,
+        "y": 560
+      },
+      "required": true
+    }
+  ],
+  "signer_roles": [
+    {
+      "allowed_capacities": [
+        "self",
+        "guardian",
+        "proxy"
+      ],
+      "key": "patient",
+      "label": "Patient",
+      "order_index": 0,
+      "requires_reauth": false
+    }
+  ]
+}
