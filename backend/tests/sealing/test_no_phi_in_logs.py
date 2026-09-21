@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import structlog
 
 from esign.clock import FixedClock
 from esign.contracts import SealUnavailable, ValidationFailed
@@ -27,33 +27,19 @@ PREFILL_VALUE = "1962-11-04"
 REASON = "Envelope completed"
 
 
-@pytest.fixture(scope="session")
-def _log_buffer() -> io.StringIO:
-    """Point the structured logger at a buffer, once.
-
-    ``configure_logging`` reads ``sys.stdout`` when it builds the logger factory, and structlog
-    caches bound loggers on first use, so this is done once for the session rather than per test.
-    """
-    buffer = io.StringIO()
-    original = sys.stdout
-    sys.stdout = buffer
-    try:
-        configure_logging(level="DEBUG", json_output=True, app_env="test")
-    finally:
-        sys.stdout = original
-    return buffer
-
-
 @pytest.fixture
-def log_lines(_log_buffer: io.StringIO) -> Iterator[Callable[[], list[dict[str, object]]]]:
-    """Returns a reader for the structured log lines written since this test started."""
-    start = len(_log_buffer.getvalue())
+def log_lines() -> Iterator[Callable[[], list[dict[str, object]]]]:
+    """The real logging pipeline rendering into a buffer this test owns; returns a reader."""
+    buffer = io.StringIO()
+    configure_logging(level="DEBUG", json_output=True, app_env="test", stream=buffer)
 
     def read() -> list[dict[str, object]]:
-        written = _log_buffer.getvalue()[start:]
-        return [json.loads(line) for line in written.splitlines() if line.startswith("{")]
+        return [json.loads(line) for line in buffer.getvalue().splitlines() if line.startswith("{")]
 
-    yield read
+    try:
+        yield read
+    finally:
+        structlog.reset_defaults()
 
 
 def _exercise_every_path(dev_pki: Pki, tmp_path: Path) -> None:

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 from collections.abc import Iterator
 from typing import Any
 from uuid import uuid4
@@ -38,8 +37,7 @@ def json_logs(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     for the duration, and put back afterwards.
     """
     buffer = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", buffer)
-    configure_logging(level="DEBUG", json_output=True, app_env="test")
+    configure_logging(level="DEBUG", json_output=True, app_env="test", stream=buffer)
     monkeypatch.setattr(audit_log_module, "log", structlog.get_logger("tests.audit.capture"))
 
     def read() -> list[dict[str, Any]]:

@@ -121,8 +121,7 @@ def rendered_logs(monkeypatch: pytest.MonkeyPatch) -> Iterator[LogCapture]:
     in the process through a logger that is already bound.
     """
     capture = LogCapture()
-    monkeypatch.setattr(sys, "stdout", capture)
-    configure_logging(level="DEBUG", json_output=True, app_env="test")
+    configure_logging(level="DEBUG", json_output=True, app_env="test", stream=capture)
     monkeypatch.setattr("esign.envelopes.service.log", structlog.get_logger("esign.envelopes.service"))
     try:
         yield capture

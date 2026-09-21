@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any, Final
+from typing import Any, Final, Protocol, TextIO, cast
 from uuid import UUID
 
 import structlog
@@ -170,13 +170,42 @@ def drop_unlisted_keys(_logger: WrappedLogger, _method: str, event_dict: EventDi
     return kept
 
 
+class LogStream(Protocol):
+    """The two methods a log sink needs. ``sys.stdout``, a ``StringIO`` and a test capture all fit."""
+
+    def write(self, value: str, /) -> int: ...
+
+    def flush(self) -> None: ...
+
+
+class _StreamLoggerFactory:
+    """Builds print loggers against an explicit stream, or against ``sys.stdout`` as it is *now*.
+
+    structlog's own default captures ``sys.stdout`` when the library is imported, and a logger
+    cached on first use keeps whatever stream was current then -- both outlive test capture and
+    redirection, and surface much later as "I/O operation on closed file" in an unrelated module.
+    So nothing is cached and the stream is resolved per log call unless one was given.
+    """
+
+    def __init__(self, stream: LogStream | None) -> None:
+        self._stream = stream
+
+    def __call__(self, *_args: Any) -> structlog.PrintLogger:
+        return structlog.PrintLogger(file=cast(TextIO, self._stream) if self._stream is not None else sys.stdout)
+
+
 def configure_logging(
     *,
     level: str = "INFO",
     json_output: bool = True,
     app_env: str = "dev",
+    stream: LogStream | None = None,
 ) -> None:
-    """Configure structlog and the stdlib root logger. Idempotent; call once at startup."""
+    """Configure structlog and the stdlib root logger. Idempotent; call once at startup.
+
+    ``stream`` pins the output (tests that read rendered lines pass a buffer); left as ``None``
+    every line goes to the current ``sys.stdout``.
+    """
     numeric_level = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
 
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=numeric_level, force=True)
@@ -195,8 +224,8 @@ def configure_logging(
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
+        logger_factory=_StreamLoggerFactory(stream),
+        cache_logger_on_first_use=False,
     )
     structlog.contextvars.bind_contextvars(app_env=app_env)
 
