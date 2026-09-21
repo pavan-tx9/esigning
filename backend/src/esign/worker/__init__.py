@@ -166,6 +166,14 @@ def run_once(rt: Runtime, *, send: Sender | None = None, batch: int = 20) -> Tic
         if swept == 0:
             break
 
+    # Housekeeping: idempotency keys past their window. A replay after that is a new request,
+    # which the envelope service still refuses to turn into a second signature.
+    with rt.transaction() as db:
+        db.execute(
+            text("DELETE FROM idempotency_keys WHERE created_at < :cutoff"),
+            {"cutoff": now - timedelta(hours=rt.settings.idempotency_ttl_hours)},
+        )
+
     owned: HttpSender | None = None
     if send is None:
         owned = HttpSender(rt.settings)

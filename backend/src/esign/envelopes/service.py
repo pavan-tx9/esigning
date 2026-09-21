@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from typing import Any, Final, Literal
 from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from esign.clock import Clock
@@ -839,6 +840,12 @@ class EnvelopeServiceImpl:
             return
         try:
             with self._new_session() as fresh:
+                # The failed attempt's transaction is still open and holds the envelope row lock,
+                # and it is *this thread* that would have to release it -- so anything in here
+                # that waited on that lock would wait forever, invisibly to Postgres's deadlock
+                # detector. Nothing below should (the job row exists, so no foreign-key check
+                # touches the envelope), but a bound turns "should not" into "cannot hang".
+                fresh.execute(text("SET LOCAL lock_timeout = '5s'"))
                 attempts = repo.seal_job_attempts(fresh, envelope_id) + 1
                 delay = next_backoff(attempts)
                 repo.fail_seal_job(

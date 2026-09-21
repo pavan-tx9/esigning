@@ -170,7 +170,10 @@ class Verifier:
         envelope = db.execute(
             text(
                 "SELECT id, host_id, status, presented_sha256, current_revision_sha256, sealed_sha256 "
-                "FROM envelopes WHERE id = :id"
+                # A shared row lock: signing and sealing wait, so the envelope, its revisions and
+                # its trail are read as one consistent state and a seal landing mid-check cannot
+                # show up as a false finding. Other verifications are not blocked.
+                "FROM envelopes WHERE id = :id FOR SHARE"
             ),
             {"id": envelope_id},
         ).first()
