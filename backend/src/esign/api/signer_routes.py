@@ -31,7 +31,7 @@ from esign.api.schemas import (
 from esign.contracts import RequestContext, SessionInfo, ValidationFailed
 from esign.identity import RateLimits, ip_key, session_key
 from esign.runtime import Runtime
-from esign.worker import seal_one
+from esign.worker import claim_seal_job, seal_one
 
 __all__ = ["router"]
 
@@ -123,7 +123,6 @@ def post_sign(
         raise ValidationFailed("signing needs an Idempotency-Key", code="idempotency_key_required")
     with rt.transaction() as db:
         session, ctx = authenticate_signer(request, rt, db)
-        _limit(rt, "sign", session, ctx)
         scope = f"session:{session.id}"
         # The digest covers the captures, image included. Only the digest is kept.
         digest = idempotency.request_hash("POST", "/v1/signing/sign", body.model_dump(mode="json"))
@@ -137,11 +136,21 @@ def post_sign(
         )
         if stored is not None:
             return JSONResponse(stored.body, status_code=stored.status)
+        # After the replay check: a retry of a signature that already succeeded must get its first
+        # answer back, not a 429, however many times the connection drops.
+        _limit(rt, "sign", session, ctx)
         view = rt.envelopes.sign(db, session, body.to_contract(rt.settings), ctx)
         ack = signer_ack_json(view, session.signer_id)
         idempotency.complete(db, scope=scope, key=idempotency_key, status=200, body=ack)
     if view.status == "completed_pending_seal":
-        seal_one(rt, view.id)  # never raises for an expected failure; the job is already queued
+        # Claim the job like any worker would, so a worker ticking right now does not make a second
+        # attempt inside the backoff window if this one fails. If a worker got there first, it
+        # seals. seal_one never raises for an expected failure; the job stays queued either way.
+        claimed_at = rt.clock.now()
+        with rt.transaction() as db:
+            mine = claim_seal_job(db, view.id, now=claimed_at)
+        if mine:
+            seal_one(rt, view.id, claimed_at=claimed_at)
     return JSONResponse(ack)
 
 

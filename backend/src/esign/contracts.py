@@ -560,6 +560,20 @@ DECLINE_REASON_CODES: Final[tuple[str, ...]] = (
 )
 
 
+#: Why a host voids an envelope. Closed for the same reason: a host-invented code ("wrong_dx_hiv")
+#: would be free text with underscores, and it is written to the audit trail and the logs.
+VOID_REASON_CODES: Final[tuple[str, ...]] = (
+    "entered_in_error",
+    "wrong_patient",
+    "wrong_template",
+    "incorrect_information",
+    "duplicate",
+    "patient_request",
+    "signed_on_paper",
+    "other",
+)
+
+
 @dataclass(frozen=True)
 class NewSigner:
     role_key: str

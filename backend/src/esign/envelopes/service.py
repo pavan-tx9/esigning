@@ -21,7 +21,6 @@ through it), so the two sides cannot drift apart silently.
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -36,6 +35,7 @@ from esign.clock import Clock
 from esign.config import Settings
 from esign.contracts import (
     DECLINE_REASON_CODES,
+    VOID_REASON_CODES,
     Actor,
     ActorRole,
     AuditLog,
@@ -103,9 +103,6 @@ log = get_logger(__name__)
 #: A factory for a fresh, independently committing session. Used only to record a seal failure
 #: after the failed attempt's transaction has been rolled back.
 SessionScope = Callable[[], AbstractContextManager[Session]]
-
-#: Host-chosen reason codes (void) must look like a machine code, not a sentence.
-_REASON_CODE = re.compile(r"\A[a-z][a-z0-9_]{1,62}\Z")
 
 _SEAL_REASON = "Certified complete by the e-signing service"
 
@@ -640,8 +637,8 @@ class EnvelopeServiceImpl:
     def void(self, db: Session, host: Host, envelope_id: UUID, reason_code: str, ctx: RequestContext) -> EnvelopeView:
         loaded = self._load(db, envelope_id, host=host, lock=True)
         transition = self._decide(loaded, Command.VOID, None)
-        if not _REASON_CODE.match(reason_code):
-            raise ValidationFailed("reason code must be a short machine code", code="invalid_reason_code")
+        if reason_code not in VOID_REASON_CODES:
+            raise ValidationFailed("unknown void reason", code="invalid_reason_code")
         now = self._clock.now()
 
         repo.update_envelope(

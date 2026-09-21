@@ -39,6 +39,10 @@ def test_a_double_submitted_signature_returns_the_same_response_and_makes_one_re
     assert _count(world, revisions, id=envelope["id"]) == 1
     assert ehr.audit_types(envelope["id"]).count("signer.signed") == 1
 
+    # However often the connection drops, the retry gets the first answer -- never a 429.
+    for _ in range(15):
+        assert patient.sign(payload, key="tap-1").json() == first.json()
+
     # The same key with a different body is a conflict, not a second signature and not a replay.
     different = patient.post(
         "/sign",

@@ -98,7 +98,6 @@ def build_payload(
         "occurred_at": occurred_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "envelope_id": str(envelope.id),
         "status": envelope.status,
-        "document_type": envelope.document_type,
         "template_key": envelope.template_key,
         "template_version": envelope.template_version,
         "presented_sha256": _hex(envelope.presented_sha256),

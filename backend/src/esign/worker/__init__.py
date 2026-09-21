@@ -34,7 +34,7 @@ from esign.logging import get_logger
 from esign.runtime import Runtime
 from esign.webhooks import HttpSender, Sender, deliver_due
 
-__all__ = ["TickResult", "claim_seal_jobs", "run_forever", "run_once", "seal_one"]
+__all__ = ["TickResult", "claim_seal_job", "claim_seal_jobs", "run_forever", "run_once", "seal_one"]
 
 log = get_logger(__name__)
 
@@ -68,6 +68,18 @@ def claim_seal_jobs(db: Session, *, now: datetime, stale_before: datetime, limit
         {"now": now, "stale_before": stale_before, "limit": limit},
     ).all()
     return [row.envelope_id for row in rows]
+
+
+def claim_seal_job(db: Session, envelope_id: UUID, *, now: datetime) -> bool:
+    """Claim one specific, unclaimed job (the API's inline attempt). The caller commits."""
+    row = db.execute(
+        text(
+            "UPDATE seal_jobs SET locked_at = :now WHERE envelope_id = :id AND completed_at IS NULL "
+            "AND locked_at IS NULL RETURNING envelope_id"
+        ),
+        {"id": envelope_id, "now": now},
+    ).first()
+    return row is not None
 
 
 def seal_one(rt: Runtime, envelope_id: UUID, *, claimed_at: datetime | None = None) -> bool:

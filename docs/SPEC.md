@@ -257,7 +257,7 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 | `GET /v1/templates`, `GET /v1/templates/{key}` | list, detail |
 | `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names) |
 | `GET /v1/envelopes/{id}` | `EnvelopeView` |
-| `POST /v1/envelopes/{id}/void` | `{reason_code}` |
+| `POST /v1/envelopes/{id}/void` | `{reason_code}` from the fixed list `contracts.VOID_REASON_CODES` (a host-invented code would be free text with underscores, and it reaches the audit trail) |
 | `POST /v1/envelopes/{id}/signers/{sid}/sessions` | `{auth: {method, auth_time}, kiosk?: {staff_user_id, identity_check}}` -> `{token, session_id, expires_at}` |
 | `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` -> `{session_id, reauth_valid_until}`; another host's session is `not_found` |
 | `GET /v1/envelopes/{id}/document` | sealed PDF, or 409 `not_sealed` |
@@ -321,7 +321,7 @@ The token lives in memory only: not in the URL, not in storage.
 ### Webhooks
 `envelope.completed`, `envelope.sealed`, `envelope.declined`, `envelope.voided`,
 `envelope.expired`. Payload: ids, status, hashes only (`id` of the delivery, `event`,
-`occurred_at`, `envelope_id`, `status`, template key and version, the three hashes, and each
+`occurred_at`, `envelope_id`, `status`, template key and version (not the document type), the three hashes, and each
 signer's `id`, `role_key` and `status`; never a name, `patient_ref` or `host_document_ref`). Signed
 with `X-Esign-Signature: t=<unix>,v1=<hex hmac-sha256 of "t.body">` using the secret printed once
 by `esign hosts create`; a receiver should reject a `t` more than five minutes old
@@ -415,7 +415,7 @@ changes were made once, by the integration owner, with this document updated alo
   `Literal`s. `Capture.kind` is optional (checkbox and text captures have none, matching the wire
   shapes). `SignerRoleDef.required`. `CertificateSummary.seal_profile` (the configured profile).
   `EnvelopeView` gained `current_revision_sha256`, `created_at`, `host_id`.
-  `DECLINE_REASON_CODES`, `OPAQUE_ID_PATTERN` and `is_opaque_id` live in `contracts.py`.
+  `DECLINE_REASON_CODES`, `VOID_REASON_CODES`, `OPAQUE_ID_PATTERN` and `is_opaque_id` live in `contracts.py`.
 - **Sealing**: `SealValidation.ok` also requires `problems` to be empty; the envelope id is bound
   into the signature; `Sealer.seal` documents which exceptions escape.
 - **Identity**: `attest_reauth` takes the `Host` (another host's session is `not_found`) and

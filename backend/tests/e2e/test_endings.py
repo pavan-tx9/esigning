@@ -44,6 +44,9 @@ def test_a_host_can_void_before_completion_and_never_after(ehr: Ehr, world: Worl
 
     sentence = ehr.post(f"/envelopes/{envelope['id']}/void", {"reason_code": "Wrong patient, sorry"})
     assert sentence.status_code == 422
+    # A slug is not enough: a host-invented code is free text with underscores.
+    invented = ehr.post(f"/envelopes/{envelope['id']}/void", {"reason_code": "wrong_diagnosis_hiv"})
+    assert invented.status_code == 422 and invented.json()["error"]["code"] == "invalid_reason_code"
 
     voided = ehr.post(f"/envelopes/{envelope['id']}/void", {"reason_code": "entered_in_error"})
     assert voided.status_code == 200, voided.text
