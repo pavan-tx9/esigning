@@ -1,0 +1,121 @@
+[project]
+name = "esign"
+version = "0.1.0"
+description = "Legally binding e-signatures for an EHR"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-multipart>=0.0.12",
+    "pyhanko>=0.25",
+    "pyhanko-certvalidator>=0.26",
+    "cryptography>=43",
+    "pypdf>=5",
+    "reportlab>=4.2",
+    "pillow>=11",
+    "boto3>=1.35",
+    "httpx>=0.27",
+    "structlog>=24.4",
+]
+
+[project.scripts]
+esign = "esign.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6",
+    "pytest-xdist>=3.6",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "moto[s3,kms]>=5.0",
+    "boto3-stubs[kms,s3]>=1.35",
+    "types-reportlab>=4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/esign"]
+
+# `esign.cli` is written by the integration agent; until then the console script is absent.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+# --------------------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+src = ["src", "tests"]
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RUF",  # ruff
+    "S",    # bandit
+    "TID",  # tidy imports
+    "PTH",  # use pathlib
+    "ARG",  # unused arguments
+    "DTZ",  # naive datetimes
+]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "B008",    # FastAPI's Depends() in defaults
+    "S101",    # assert is how tests are written
+    "RUF012",  # ClassVar annotations on mutable class attrs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ARG", "DTZ"]
+"src/esign/migrate.py" = ["S608"]  # migration filenames are ours, not user input
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.format]
+quote-style = "double"
+# contracts.py belongs to the architecture and is read-only for every agent, this one included.
+# It is still linted by `ruff check`; it is just never rewritten by the formatter.
+exclude = ["src/esign/contracts.py"]
+
+# --------------------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+exclude = "(^|/)\\.venv/"
+
+# pyhanko ships inline annotations but no py.typed marker, so mypy needs telling to read them.
+# Everything else in the dependency set is either typed or has stubs installed.
+[[tool.mypy.overrides]]
+module = ["pyhanko.*"]
+follow_untyped_imports = true
+
+# --------------------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "db: needs the Postgres from docker-compose.yml (auto-skipped when unreachable)",
+    "slow: takes more than a second",
+]
+filterwarnings = ["error::DeprecationWarning:esign.*"]

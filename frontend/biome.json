@@ -1,0 +1,58 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "vcs": { "enabled": false, "clientKind": "git", "useIgnoreFile": false },
+  "files": {
+    "includes": ["**", "!dist", "!node_modules", "!playwright-report", "!test-results", "!bun.lock"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": { "quoteStyle": "double", "semicolons": "always" }
+  },
+  "css": {
+    "parser": { "tailwindDirectives": true }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "style": {
+        "noRestrictedGlobals": {
+          "level": "error",
+          "options": {
+            "deniedGlobals": {
+              "fetch": "Call the API through src/lib/api.ts. It is the only place that may fetch: it attaches the session token, parses every response with Zod, and turns error bodies into ApiError.",
+              "XMLHttpRequest": "Call the API through src/lib/api.ts.",
+              "localStorage": "The signing token lives in memory only. Nothing about a signing session may be persisted in the browser.",
+              "sessionStorage": "The signing token lives in memory only. Nothing about a signing session may be persisted in the browser."
+            }
+          }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["src/lib/api.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedGlobals": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["e2e/**", "src/test/**", "**/*.test.ts", "**/*.test.tsx"],
+      "linter": {
+        "rules": {
+          "style": { "noRestrictedGlobals": "off" }
+        }
+      }
+    }
+  ]
+}

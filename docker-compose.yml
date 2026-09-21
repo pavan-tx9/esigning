@@ -1,0 +1,65 @@
+# Local infrastructure. Nothing here is a production deployment.
+#
+# Postgres is on 54329 rather than 5432 so it cannot collide with whatever else is running on the
+# machine. The superuser is `esign_owner`, which is the role migration 0002 expects to own the
+# schema; 0002 then creates the restricted `esign_app` runtime role.
+#
+# MinIO is optional and off by default -- the S3 blob backend is tested with moto. Bring it up with
+# `docker compose --profile minio up -d` when you want a real object-lock bucket to poke at.
+
+name: esign
+
+services:
+  db:
+    image: postgres:16
+    container_name: esign-db
+    environment:
+      POSTGRES_USER: esign_owner
+      POSTGRES_PASSWORD: esign_owner_dev
+      POSTGRES_DB: esign
+      # Test databases are created and dropped constantly; skip the fsync tax locally.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - max_connections=200
+    ports:
+      - "54329:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U esign_owner -d esign"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    container_name: esign-minio
+    profiles: ["minio"]
+    command: server /data --console-address ":9101"
+    environment:
+      MINIO_ROOT_USER: esign_minio
+      MINIO_ROOT_PASSWORD: esign_minio_dev
+    ports:
+      - "9100:9000"
+      - "9101:9101"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  db-data:
+  minio-data:

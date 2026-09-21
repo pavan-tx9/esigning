@@ -1,0 +1,37 @@
+@import "tailwindcss";
+
+/* Tailwind v4 is configured here, in CSS. There is no tailwind.config.js.
+   The signing UI is read by patients on a clinic tablet, so the defaults lean large and calm. */
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  --color-ink-900: oklch(0.21 0.02 260);
+  --color-ink-700: oklch(0.38 0.02 260);
+  --color-ink-500: oklch(0.55 0.02 260);
+  --color-paper: oklch(0.99 0.002 260);
+  --color-edge: oklch(0.91 0.006 260);
+  --color-accent-600: oklch(0.52 0.13 250);
+  --color-accent-700: oklch(0.44 0.13 250);
+  --color-danger-600: oklch(0.54 0.17 25);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--color-paper);
+    color: var(--color-ink-900);
+    font-family: var(--font-sans);
+    margin: 0;
+  }
+
+  /* Someone is signing a legal document. Focus must always be obvious. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent-600);
+    outline-offset: 2px;
+  }
+}
