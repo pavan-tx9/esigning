@@ -250,30 +250,40 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 ### Host API (`Authorization: Bearer esk_...`)
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/templates` | create template (multipart: PDF + JSON definitions) as draft v1 |
+| `POST /v1/templates` | create template as draft v1. Multipart: `pdf` (file) + `definitions` (JSON text: `{key, name, document_type, fields, prefill_fields, signer_roles}`) |
 | `POST /v1/templates/{key}/versions` | new draft version |
 | `POST /v1/templates/{key}/versions/{n}/publish` | publish (immutable from here) |
 | `POST /v1/templates/{key}/versions/{n}/retire` | retire |
 | `GET /v1/templates`, `GET /v1/templates/{key}` | list, detail |
-| `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` |
+| `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names) |
 | `GET /v1/envelopes/{id}` | `EnvelopeView` |
 | `POST /v1/envelopes/{id}/void` | `{reason_code}` |
 | `POST /v1/envelopes/{id}/signers/{sid}/sessions` | `{auth: {method, auth_time}, kiosk?: {staff_user_id, identity_check}}` -> `{token, session_id, expires_at}` |
-| `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` |
+| `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` -> `{session_id, reauth_valid_until}`; another host's session is `not_found` |
 | `GET /v1/envelopes/{id}/document` | sealed PDF, or 409 `not_sealed` |
 | `GET /v1/envelopes/{id}/audit` | audit events |
-| `GET /v1/envelopes/{id}/verification` | run and return a verification report |
+| `GET /v1/envelopes/{id}/verification` | run and return a verification report. Always 200 for an envelope that exists: a failed verification is a finding (`ok: false`, `problems`), not a transport error |
+
+Requests outside the scope of section 1 (`POST /v1/envelopes/bulk`, `.../email-links`,
+`.../documents`) are refused with `422 out_of_scope`. There is no `DELETE`, `PUT` or `PATCH` route.
 
 ### Signer API (`Authorization: Bearer est_...`)
 | Method and path | Purpose |
 |---|---|
-| `GET /v1/signing/session` | everything the UI needs, shape below |
+| `GET /v1/signing/session` | everything the UI needs, shape below. `?locale=` picks the disclosure language |
 | `GET /v1/signing/document` | current revision PDF; records `document.presented` |
 | `POST /v1/signing/viewed` | `{pages_viewed: int}` must equal the page count |
-| `POST /v1/signing/consent` | `{consent_version, accepted: true}` |
+| `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?}` (`locale` as shown in the session payload; default locale when omitted) |
 | `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...]}` + `Idempotency-Key` |
 | `POST /v1/signing/decline` | `{reason_code}` from a fixed list including `prefers_paper` |
-| `GET /v1/signing/copy` | sealed PDF (records `document.downloaded`), or 202 `{status: "sealing"}` |
+| `GET /v1/signing/copy` | sealed PDF (records `document.downloaded`), or 202 `{status: "sealing"}` while the seal is pending, or 409 `envelope_not_complete` while other signers are outstanding |
+
+Every signer `POST` answers `{"envelope": {"id", "status"}, "signer": {"id", "status"}}`: ids and
+statuses only. `sign` reports the state as of the signature (`completed_pending_seal` for the last
+signer) even when the inline seal attempt then succeeds; the UI learns of sealing from `copy` or
+the session. `sign` requires `Idempotency-Key` (422 `idempotency_key_required`). Request bodies
+forbid unknown keys, so a client that sends a hash, a timestamp, a PDF or a `date_signed` value is
+refused (422) rather than ignored.
 
 `GET /v1/signing/session` response:
 ```json
@@ -288,7 +298,7 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
               "rect": {"x": 72, "y": 120, "w": 220, "h": 48}, "required": true,
               "label": "Patient signature"}],
   "consent": {"version": "2026-09", "locale": "en-US", "body": "..."},
-  "session": {"expires_at": "...", "kiosk": false},
+  "session": {"id": "...", "expires_at": "...", "kiosk": false},
   "decline_reasons": [{"code": "prefers_paper", "label": "I would rather sign on paper"}]
 }
 ```
@@ -297,8 +307,12 @@ Capture shapes: `{"field_id", "kind": "drawn", "image_png_base64"}`, `{"field_id
 `{"field_id", "checked"}` or `{"field_id", "text_value"}`.
 
 ### Embedding protocol
-The UI is served at `/sign` and loaded in an iframe. On load it posts `{type: "esign:ready"}` to the
-parent. The parent replies `{type: "esign:init", token, locale?}`. The UI accepts `init` only from
+The UI is served at `/sign?host=<host id>` and loaded in an iframe. The host id is not a secret and
+says nothing about a patient; it lets that response carry `Content-Security-Policy: frame-ancestors
+<the host's allowed_origins>` and `<meta name="esign-allowed-origins" content="...">` (the list
+the UI checks `init` against) before any token exists. Without a known host both are empty: the UI
+cannot be framed and trusts nobody. Built assets are served from `/assets`. On load it posts
+`{type: "esign:ready"}` to the parent. The parent replies `{type: "esign:init", token, locale?}`. The UI accepts `init` only from
 an origin in the host's `allowed_origins` (checked again server-side via a `frame-ancestors` CSP).
 UI to parent: `esign:reauth_required {session_id}`, `esign:signed`, `esign:sealed`,
 `esign:declined`, `esign:expired`, `esign:resize {height}`. Parent to UI: `esign:reauth_done`.
@@ -306,8 +320,21 @@ The token lives in memory only: not in the URL, not in storage.
 
 ### Webhooks
 `envelope.completed`, `envelope.sealed`, `envelope.declined`, `envelope.voided`,
-`envelope.expired`. Payload: ids, status, hashes only. Signed with
-`X-Esign-Signature: t=<unix>,v1=<hex hmac-sha256 of "t.body">`. Retried with backoff by the worker.
+`envelope.expired`. Payload: ids, status, hashes only (`id` of the delivery, `event`,
+`occurred_at`, `envelope_id`, `status`, template key and version, the three hashes, and each
+signer's `id`, `role_key` and `status`; never a name, `patient_ref` or `host_document_ref`). Signed
+with `X-Esign-Signature: t=<unix>,v1=<hex hmac-sha256 of "t.body">` using the secret printed once
+by `esign hosts create`; a receiver should reject a `t` more than five minutes old
+(`esign.webhooks.verify_signature` is the reference). A delivery row is written in the transaction
+that changed the envelope and sent by the worker: at least once, in queue order while nothing
+fails, retried with backoff (30s, 2m, 10m, 30m, then hourly) up to `WEBHOOK_MAX_ATTEMPTS`.
+
+### Worker
+`esign worker` claims due `seal_jobs` with `FOR UPDATE SKIP LOCKED` in a short transaction that
+commits before sealing starts (the claim is `locked_at`; one older than
+`SEAL_JOB_LOCK_TIMEOUT_SECONDS` is taken over), runs `seal_pending` in a transaction of its own,
+sweeps expiries, and delivers webhooks. Any number of workers may run. The envelope row lock means
+two workers holding the same job still seal once.
 
 ## 10. Security and PHI rules
 
@@ -400,6 +427,7 @@ changes were made once, by the integration owner, with this document updated alo
   `signer_copy` and `sealed_document` are part of the Protocol (the last two record
   `document.downloaded`); `seal_pending` documents the separately committed failure record;
   `EnvelopeNotifier` lets the service queue a webhook in the transaction that made the change.
-- **Schema**: `0600` adds the missing `BEFORE TRUNCATE` triggers.
+- **Schema**: `0600` adds the missing `BEFORE TRUNCATE` triggers; `0601` gives
+  `webhook_deliveries` an insertion sequence to order by.
 - **Foundation**: `configure_logging` no longer caches loggers or binds `sys.stdout` at configure
   time (it broke full-suite runs); signature PNG per-axis limits moved into `Settings`.
