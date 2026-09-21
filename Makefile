@@ -92,8 +92,8 @@ dev:  ## Run the API and the signing UI together (Ctrl-C stops both)
 	$(MAKE) dev-web & \
 	wait
 
-dev-api:  ## API on :8000 (needs esign.api, which the integration step adds)
-	$(UV) run uvicorn esign.api:app --reload --port 8000
+dev-api:  ## API on :8000. Proxy headers are the app's job (TRUSTED_PROXY_CIDRS), not uvicorn's.
+	$(UV) run uvicorn esign.api:app --reload --port 8000 --no-proxy-headers --no-server-header
 
 dev-web:  ## Signing UI on :5273, proxying /v1 to :8000
 	$(BUN) bun run dev
