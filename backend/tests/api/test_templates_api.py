@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import json
+from typing import Any
+
+import httpx
 
 from tests.e2e.conftest import TEMPLATES_DIR, Ehr, World
 
 
-def _upload(ehr: Ehr, path: str, key: str, *, definitions: dict[str, object] | None = None, pdf: bytes | None = None):  # type: ignore[no-untyped-def]
+def _upload(
+    ehr: Ehr, path: str, key: str, *, definitions: dict[str, Any] | None = None, pdf: bytes | None = None
+) -> httpx.Response:
     document = definitions or json.loads((TEMPLATES_DIR / f"{key}.json").read_text(encoding="utf-8"))
     content = pdf if pdf is not None else (TEMPLATES_DIR / f"{key}.pdf").read_bytes()
-    return ehr.client.post(
+    response: httpx.Response = ehr.client.post(
         f"/v1{path}",
         headers=ehr.headers,
         files={"pdf": ("template.pdf", content, "application/pdf")},
         data={"definitions": json.dumps(document)},
     )
+    return response
 
 
 def test_draft_publish_new_version_retire(world: World) -> None:

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
+
+import httpx
 
 from tests.e2e.conftest import Ehr, World
 
 
-def _open(ehr: Ehr, envelope: dict[str, object], body: dict[str, object]):  # type: ignore[no-untyped-def]
-    signer_id = ehr.signer_id(envelope, "patient")  # type: ignore[arg-type]
+def _open(ehr: Ehr, envelope: dict[str, Any], body: dict[str, Any]) -> httpx.Response:
+    signer_id = ehr.signer_id(envelope, "patient")
     return ehr.post(f"/envelopes/{envelope['id']}/signers/{signer_id}/sessions", body)
 
 
@@ -16,7 +19,7 @@ def test_refused_sessions_are_recorded_and_survive_the_rollback(ehr: Ehr, world:
     envelope = ehr.create_envelope("hipaa_acknowledgement")
     now = world.clock.now()
 
-    cases = [
+    cases: list[tuple[dict[str, Any], str]] = [
         ({"auth": {"method": "password", "auth_time": (now - timedelta(hours=13)).isoformat()}}, "auth_too_old"),
         (
             {"auth": {"method": "password", "auth_time": (now + timedelta(seconds=5)).isoformat()}},
