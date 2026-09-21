@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import io
 import re
+from dataclasses import replace
 
 from pypdf import PdfReader
 
-from esign.config import Settings
-from esign.contracts import CertificateSummary, DocumentService
-from esign.documents import build_document_service
+from esign.contracts import CertificateSummary, DocumentService, SealProfile
 from tests.documents.conftest import certificate_summary
 
 
@@ -86,10 +85,12 @@ def test_no_signer_block_is_silently_dropped_when_it_spans_a_page_break(document
         assert str(signer.signer_id) in text
 
 
-def test_the_seal_profile_printed_is_the_configured_one(settings_no_db: Settings) -> None:
-    for profile in ("PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA"):
-        service = build_document_service(settings_no_db.model_copy(update={"seal_profile": profile}))
-        assert profile in text_of(service.build_certificate(certificate_summary()))
+def test_the_seal_profile_printed_is_the_one_in_the_summary(documents: DocumentService) -> None:
+    """The caller passes the *configured* profile (contracts.py); the page never reads settings."""
+    profiles: tuple[SealProfile, ...] = ("PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA")
+    for profile in profiles:
+        summary = replace(certificate_summary(), seal_profile=profile)
+        assert profile in text_of(documents.build_certificate(summary))
 
 
 def test_the_certificate_has_nothing_interactive(documents: DocumentService) -> None:
@@ -117,6 +118,7 @@ def test_nothing_but_the_summary_reaches_the_page(documents: DocumentService) ->
         "document_type",
         "template_key",
         "template_version",
+        "seal_profile",
         "presented_sha256",
         "final_revision_sha256",
         "created_at",

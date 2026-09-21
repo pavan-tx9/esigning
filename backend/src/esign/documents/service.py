@@ -27,7 +27,7 @@ from esign.documents import certificate as certificate_module
 from esign.documents import definitions as definitions_module
 from esign.documents import images, inspection, stamping
 from esign.documents.fonts import ensure_fonts_registered
-from esign.documents.pdfutil import sanitize_document, to_bytes, writer_from_bytes
+from esign.documents.pdfutil import open_reader, sanitize_document, to_bytes, writer_from_bytes
 from esign.logging import get_logger
 
 __all__ = ["PdfDocumentService"]
@@ -97,7 +97,7 @@ class PdfDocumentService:
     # ------------------------------------------------------------------ completion
 
     def build_certificate(self, summary: CertificateSummary) -> bytes:
-        out = certificate_module.build_certificate(summary, seal_profile=self._settings.seal_profile)
+        out = certificate_module.build_certificate(summary, seal_profile=summary.seal_profile)
         log.info(
             "documents.certificate_built",
             envelope_id=summary.envelope_id,
@@ -106,6 +106,10 @@ class PdfDocumentService:
             size_bytes=len(out),
         )
         return out
+
+    def page_count(self, pdf: bytes) -> int:
+        """Pages in a PDF this service produced (a prepared, stamped or finalized revision)."""
+        return len(open_reader(pdf).pages)
 
     def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
         """Append the certificate pages and return the exact bytes to be sealed.

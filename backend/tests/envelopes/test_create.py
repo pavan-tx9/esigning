@@ -297,7 +297,7 @@ def test_an_envelope_needs_a_signer(bench: Bench, db: Session) -> None:
 
 
 @pytest.mark.parametrize(
-    ("blank", "code"), [("display_name", "display_name_required"), ("host_user_id", "host_user_id_required")]
+    ("blank", "code"), [("display_name", "display_name_required"), ("host_user_id", "host_user_id_invalid")]
 )
 def test_a_blank_signer_field_is_refused(bench: Bench, db: Session, blank: str, code: str) -> None:
     host = bench.host(db)
@@ -316,7 +316,24 @@ def test_a_blank_patient_ref_is_refused(bench: Bench, db: Session) -> None:
 
     with pytest.raises(ValidationFailed) as seen:
         bench.create(db, host, PATIENT_CONSENT, patient_ref="")
-    assert seen.value.code == "patient_ref_required"
+    assert seen.value.code == "patient_ref_invalid"
+
+
+@pytest.mark.parametrize("value", ["Jane Doe", "1970-01-01", "123-45-6789"])
+def test_an_identifier_that_looks_like_a_person_is_refused_at_the_door(bench: Bench, db: Session, value: str) -> None:
+    """``host_user_id`` and ``patient_ref`` become the audit actor. The trail refuses names, dates
+    and social security numbers, so they are refused here -- at creation, not when someone signs."""
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+
+    with pytest.raises(ValidationFailed) as seen:
+        bench.create(db, host, PATIENT_CONSENT, patient_ref=value)
+    assert seen.value.code == "patient_ref_invalid"
+
+    signer = NewSigner(role_key="patient", host_user_id=value, display_name="A Person", capacity="self")
+    with pytest.raises(ValidationFailed) as seen:
+        bench.create(db, host, PATIENT_CONSENT, signers=(signer,))
+    assert seen.value.code == "host_user_id_invalid"
 
 
 # --------------------------------------------------------------------------- expiry

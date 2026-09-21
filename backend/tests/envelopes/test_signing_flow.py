@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from esign.contracts import Conflict, IntegrityFailure, NotFound
-from tests.envelopes.conftest import CONSENT_VERSION, CTX, PATIENT_CONSENT, Bench
+from tests.envelopes.conftest import CONSENT_VERSION, CTX, PAGES, PATIENT_CONSENT, Bench
 
 
 def test_presenting_moves_created_to_in_progress(bench: Bench, db: Session) -> None:
@@ -41,7 +41,9 @@ def test_presenting_records_what_this_session_was_shown(bench: Bench, db: Sessio
     events = bench.audit.list(db, "envelope", view.id)
     presented = next(e for e in events if str(e.event_type) == "document.presented")
     assert presented.document_sha256 == view.presented_sha256
-    assert presented.data == {"revision_no": 1}
+    assert presented.data["revision_no"] == 1
+    assert presented.data["page_count"] == PAGES
+    assert presented.data["signer_id"] == str(session.signer_id)
 
 
 def test_a_corrupted_revision_is_never_served(bench: Bench, db: Session) -> None:
@@ -78,7 +80,7 @@ def test_viewed_requires_the_document_to_have_been_served(bench: Bench, db: Sess
     session = bench.session(db, bench.signer_id(view, "patient"))
 
     with pytest.raises(Conflict) as seen:
-        bench.service.record_viewed(db, session, CTX)
+        bench.service.record_viewed(db, session, PAGES, CTX)
     assert seen.value.code == "not_presented"
 
 
@@ -93,7 +95,7 @@ def test_a_second_session_cannot_claim_a_view_it_was_not_served(bench: Bench, db
 
     second = bench.session(db, signer_id)
     with pytest.raises(Conflict) as seen:
-        bench.service.record_viewed(db, second, CTX)
+        bench.service.record_viewed(db, second, PAGES, CTX)
     assert seen.value.code == "not_presented"
 
 
@@ -105,10 +107,10 @@ def test_viewed_is_recorded_once(bench: Bench, db: Session) -> None:
     session = bench.session(db, signer_id)
     bench.service.present(db, session, CTX)
 
-    bench.service.record_viewed(db, session, CTX)
+    bench.service.record_viewed(db, session, PAGES, CTX)
     first_at = db.execute(text("SELECT viewed_at FROM signers WHERE id = :id"), {"id": signer_id}).scalar_one()
     bench.clock.advance(600)
-    bench.service.record_viewed(db, session, CTX)
+    bench.service.record_viewed(db, session, PAGES, CTX)
 
     again = db.execute(text("SELECT viewed_at FROM signers WHERE id = :id"), {"id": signer_id}).scalar_one()
     assert again == first_at
@@ -124,7 +126,7 @@ def test_viewing_again_after_consent_does_not_undo_consent(bench: Bench, db: Ses
     session = bench.session(db, signer_id)
     bench.ready_to_sign(db, session)
 
-    bench.service.record_viewed(db, session, CTX)
+    bench.service.record_viewed(db, session, PAGES, CTX)
     assert bench.signer_status(db, signer_id) == "consented"
 
 
@@ -153,7 +155,7 @@ def test_consent_to_a_stale_version_is_refused(bench: Bench, db: Session) -> Non
     signer_id = bench.signer_id(view, "patient")
     session = bench.session(db, signer_id)
     bench.service.present(db, session, CTX)
-    bench.service.record_viewed(db, session, CTX)
+    bench.service.record_viewed(db, session, PAGES, CTX)
 
     with pytest.raises(Conflict) as seen:
         bench.service.accept_consent(db, session, "2019-01", CTX)
@@ -178,9 +180,11 @@ def test_consent_stores_the_text_it_was_given(bench: Bench, db: Session) -> None
 
     accepted = next(e for e in bench.audit.list(db, "envelope", view.id) if str(e.event_type) == "consent.accepted")
     assert accepted.data == {
+        "signer_id": str(signer_id),
+        "consent_text_id": str(current.id),
         "consent_version": consent_version,
         "locale": "en-US",
-        "consent_sha256": current.body_sha256.hex(),
+        "body_sha256": current.body_sha256.hex(),
     }
 
 

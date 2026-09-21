@@ -315,7 +315,7 @@ def test_a_seal_failure_is_recorded_and_the_job_backs_off(
         events = bench.audit.list(check, "envelope", view.id)
         failed = [e for e in events if str(e.event_type) == "seal.failed"]
         assert len(failed) == 1
-        assert failed[0].data == {"error_code": "kms_unavailable", "attempts": 1, "retry_in_seconds": 60}
+        assert failed[0].data == {"error_code": "kms_unavailable", "attempt": 1, "retry_in_seconds": 60}
         # Nothing anywhere reports the document as complete.
         assert "document.sealed" not in [str(e.event_type) for e in events]
         assert [e.sequence for e in events] == list(range(1, len(events) + 1))

@@ -19,17 +19,17 @@ from sqlalchemy.orm import Session
 
 from esign.clock import FixedClock
 from esign.config import Settings
-from esign.contracts import AuthContext, KioskContext, NotFound, RequestContext, Unauthorized, ValidationFailed
+from esign.contracts import AuthContext, Host, KioskContext, NotFound, RequestContext, Unauthorized, ValidationFailed
 from esign.identity import SESSION_TOKEN_PREFIX, SqlIdentityService
 from esign.identity.tokens import TOKEN_LENGTH, token_sha256
 from esign.ids import new_id
-from tests.identity.factories import SignerFixture, live_session_count, make_signer
+from tests.identity.factories import SignerFixture, host_of, insert_host_row, live_session_count, make_signer
 
 CTX = RequestContext(ip="203.0.113.9", user_agent="Mozilla/5.0 (iPad; CPU OS 18_0)")
 
 
 def _auth(clock: FixedClock, *, method: str = "password+mfa", age_seconds: int = 30) -> AuthContext:
-    return AuthContext(method=method, auth_time=clock.now() - timedelta(seconds=age_seconds))
+    return AuthContext(method=method, auth_time=clock.now() - timedelta(seconds=age_seconds))  # type: ignore[arg-type]  # deliberately outside the Literal
 
 
 @pytest.fixture
@@ -227,8 +227,8 @@ def test_a_kiosk_session_reads_back_from_its_token(
         KioskContext(staff_user_id="", identity_check="photo_id"),
         KioskContext(staff_user_id="   ", identity_check="photo_id"),
         KioskContext(staff_user_id="s" * 129, identity_check="photo_id"),
-        KioskContext(staff_user_id="staff-42", identity_check="vibes"),
-        KioskContext(staff_user_id="staff-42", identity_check=""),
+        KioskContext(staff_user_id="staff-42", identity_check="vibes"),  # type: ignore[arg-type]  # deliberately outside the Literal
+        KioskContext(staff_user_id="staff-42", identity_check=""),  # type: ignore[arg-type]  # deliberately outside the Literal
     ],
 )
 def test_an_unusable_kiosk_context_is_refused(
@@ -434,12 +434,39 @@ def test_two_hosts_opening_a_session_at_once_leave_exactly_one_live(
 def test_a_session_can_be_traced_back_to_its_host(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
-    """``attest_reauth`` takes no host, so the API needs this to stop cross-host refreshes."""
     _, info = identity.create_session(db, signer_id=signer.signer_id, auth=_auth(clock), kiosk=None, ctx=CTX)
     assert identity.session_host_id(db, info.id) == signer.host_id
 
     with pytest.raises(NotFound):
         identity.session_host_id(db, new_id())
+
+
+def test_another_hosts_session_does_not_exist_for_reauth(
+    db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
+) -> None:
+    """SPEC section 10: one host can never refresh another host's session, and is told
+    ``not_found`` rather than ``forbidden``."""
+    _, info = identity.create_session(db, signer_id=signer.signer_id, auth=_auth(clock), kiosk=None, ctx=CTX)
+    stranger = Host(id=insert_host_row(db, clock, name="Other EHR"), name="Other EHR", allowed_origins=())
+
+    with pytest.raises(NotFound) as caught:
+        identity.attest_reauth(db, host=stranger, session_id=info.id, auth=_auth(clock, age_seconds=0))
+    assert caught.value.code == "session_not_found"
+    assert identity.fresh_reauth(db, info.id) is None
+
+    returned = identity.attest_reauth(db, host=host_of(signer), session_id=info.id, auth=_auth(clock, age_seconds=0))
+    assert returned.id == info.id and returned.signer_id == signer.signer_id
+
+
+def test_revoking_can_spare_the_session_a_signer_signed_from(
+    db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
+) -> None:
+    token, info = identity.create_session(db, signer_id=signer.signer_id, auth=_auth(clock), kiosk=None, ctx=CTX)
+    assert identity.revoke_sessions(db, signer.signer_id, except_session_id=info.id) == 0
+    assert identity.authenticate_session(db, token).id == info.id
+    assert identity.revoke_sessions(db, signer.signer_id) == 1
+    with pytest.raises(Unauthorized):
+        identity.authenticate_session(db, token)
 
 
 # --------------------------------------------------------------------------- configuration and scope

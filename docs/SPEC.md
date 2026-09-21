@@ -9,7 +9,8 @@ an architecture.
 show who signed, what they saw, that they meant to sign, and that nothing changed afterwards. When
 two designs are otherwise equal, pick the one that produces better evidence.
 
-The contract lives in two files that are already written and that module authors must not edit:
+The contract lives in two files that module authors must not edit. They were revised once, at
+integration, from the module hand-off reports; every such revision is listed in section 13:
 
 - `backend/src/esign/contracts.py`: every cross-module type and interface
 - `backend/migrations/0001_schema.sql`: the full schema
@@ -72,8 +73,10 @@ and grants. A module that truly needs a change adds a file in its range (evidenc
 - `esign_owner` runs migrations.
 - `esign_app` is the runtime role. It gets `SELECT, INSERT` only on `audit_events`, `blobs`,
   `document_revisions`, `consent_texts`, `reauth_attestations`; full DML on the rest; no DDL, no
-  `TRUNCATE`. The append-only triggers in `0001` are the second line of defence. Tests must prove
-  both: the app role is denied, and the owner role hits the trigger.
+  `TRUNCATE`. The append-only triggers are the second line of defence: `BEFORE UPDATE OR DELETE`
+  in `0001`, and `BEFORE TRUNCATE` on all five tables (`audit_events` in `0001`, `blobs` in `0100`,
+  the other three in `0600`). Tests must prove both: the app role is denied, and the owner role
+  hits the trigger.
 
 ## 3. The pipeline
 
@@ -86,6 +89,10 @@ the state change.
 2. **Session**: host calls `POST /v1/envelopes/{id}/signers/{sid}/sessions`, attesting how and when
    the user authenticated (and the kiosk context for in-clinic tablets). It gets back an opaque
    token, which it hands to the embedded UI via `postMessage`. The token never appears in a URL.
+   The identity module writes no audit events; the **API layer** appends `session.created` in the
+   same transaction, `auth.reauthenticated` likewise in step 5, and `session.rejected` in a
+   transaction of its own (the refused request's transaction is rolled back, and the refusal is
+   evidence that has to survive that).
 3. **Present and view**: the UI fetches the current revision. The server records
    `document.presented` with the hash of the bytes it served. The UI reports `viewed` once every
    page has been displayed. The server refuses consent and signing before that.
@@ -114,9 +121,17 @@ signer step produces a hashed, stored, audit-chained revision, and the single fi
 document plus certificate with DocMDP "no changes permitted". The per-signer evidence is the audit
 chain and the stored revisions, which verification re-hashes.
 
-**Failure rule:** never fail open. If KMS, the timestamp authority or storage is unavailable the
-envelope stays `completed_pending_seal`, `seal.failed` is recorded with an error code, the job
-backs off (1m, 5m, 15m, 1h, then hourly), and nothing anywhere reports the document as complete.
+**Failure rule:** never fail open. If KMS, the timestamp authority or storage is unavailable
+(`SealUnavailable`, `StorageUnavailable`) the envelope stays `completed_pending_seal`,
+`seal.failed` is recorded with an error code, the job backs off (1m, 5m, 15m, 1h, then hourly),
+and nothing anywhere reports the document as complete. The same holds for a failure that is not
+retryable (an integrity failure, a seal that does not validate, a bug): pending, recorded, loud.
+`seal.failed` and the job's backoff are written in a separate committed transaction, because the
+failed attempt's own transaction is rolled back.
+
+An envelope waiting for its seal cannot be voided (`created|in_progress -> voided` only). This is
+deliberate: every signer has signed, and the honest states are "sealed" or "still trying". There
+is no operator escape hatch that would turn a fully signed document into a cancelled one.
 
 ### Envelope states
 ```
@@ -144,15 +159,27 @@ signed; parallel order allows any order, serialised by the envelope row lock.
   except through validated, typed fields.
 - `data` is validated per event type against an allowlist of keys and value shapes (ids, enums,
   hashes, versions, counts, error codes). Names, dates of birth, free text and prefill values can
-  never appear. Reject unknown keys.
+  never appear. Reject unknown keys. The allowlist has exactly one definition,
+  `esign/audit/events.py` (`EVENT_DATA_MODELS`); no other module keeps a copy, and the envelope
+  module's tests validate through it so the two cannot drift.
+- Host-chosen identifiers that reach the trail (`host_user_id`, `patient_ref`, kiosk
+  `staff_user_id`) must be opaque: `contracts.is_opaque_id` (no whitespace, not a date, not an SSN).
+  They are checked where they enter (envelope and session creation) and again on append.
+- If `Clock` is behind the head of a stream, `append` refuses with `IntegrityFailure`
+  (`audit_clock_regression`) rather than writing an out-of-order event or clamping the time.
 - IP and user agent are taken from the request server-side, honouring `TRUSTED_PROXY_CIDRS`.
 
 ## 5. Sealing
 
 - PAdES via pyHanko. Production profile `PAdES-B-LT` (embedded validation info); `B-LTA` available
   by config. If the dev PKI cannot supply revocation data offline, dev and test may use `B-T`, but
-  this must be an explicit `SEAL_PROFILE` setting, never a silent downgrade, and the profile
-  actually achieved is recorded in the `document.sealed` event and on the certificate.
+  this must be an explicit `SEAL_PROFILE` setting, never a silent downgrade. The profile actually
+  achieved is recorded in the `document.sealed` event. The certificate of completion is inside the
+  sealed bytes, so it is written before the seal exists: it prints the *configured* profile
+  (`CertificateSummary.seal_profile`), labelled as such.
+- The envelope id is written into the signature dictionary (`/Location = envelope:<id>`), binding
+  the seal to the envelope it completes.
+- `SealValidation.ok` is false whenever `problems` is non-empty, whatever the four flags say.
 - The seal is a certification signature with DocMDP level 1 (no changes).
 - Key backends behind one interface: `local` (dev PKI generated by `esign dev-pki` into a
   git-ignored directory: root CA, intermediate, seal certificate, timestamp authority certificate)
@@ -174,7 +201,10 @@ signed; parallel order allows any order, serialised by the envelope row lock.
   signatures in an embedded script-style font with a plain fallback; click-to-sign renders the
   signer's name in the plain font. Every signature gets a small caption: name, capacity (and "on
   behalf of" where relevant), UTC time, signer id. `date_signed` fields are filled by the server
-  from `Clock`, never by the client.
+  from `Clock`, never by the client. Signature and initials fields are at least 80x28pt, so the
+  caption never has to abbreviate the signer id (the link between the mark and the audit trail).
+- A signer role may be declared `required: false` (an optional witness or interpreter); an
+  envelope may omit such a role. Every role that is present must sign.
 - Embed fonts. Output must contain no JavaScript, no form fields, no annotations that can be edited.
 - Certificate of completion: envelope id, document type, template key and version, hashes, and per
   signer: name, role, capacity, authentication method, re-authentication method, consent version,
@@ -191,8 +221,11 @@ signed; parallel order allows any order, serialised by the envelope row lock.
   an existing key is never replaced). S3 tests use `moto`; an optional MinIO integration test may
   be included but skipped when MinIO is not running.
 - `get` re-hashes and raises `IntegrityFailure` on mismatch.
-- `retain_until` comes from `RETENTION_YEARS_BY_DOCUMENT_TYPE` (default 10 years). Nothing in the
-  codebase deletes a blob. There is no delete method.
+- `retain_until` comes from `RETENTION_YEARS_BY_DOCUMENT_TYPE` (default 10 years): the caller
+  computes it with `Settings.retain_until(document_type, now)` and passes it to `put`; an omitted
+  value gets the default retention. Nothing in the codebase deletes a blob. There is no delete
+  method.
+- An unreachable backend raises `StorageUnavailable` (retryable, 503).
 
 ## 8. Identity
 
@@ -338,3 +371,35 @@ each test a migrated schema and connections as both roles. Required evidence tes
 - no log line in a full end-to-end run contains a signer name or prefill value
 
 `make check` runs ruff, mypy, pytest, and the frontend's typecheck, lint and tests. It must pass.
+
+## 13. Contract revisions made at integration
+
+The modules were built in parallel against `contracts.py` and reported where it was wrong. These
+changes were made once, by the integration owner, with this document updated alongside:
+
+- **Audit allowlist**: the envelope module kept its own copy of the allowed `data` keys and it
+  disagreed with the audit module's on almost every event (a real envelope could not be created).
+  One definition now (`esign/audit/events.py`); the envelope service emits exactly those shapes.
+  `signer.signed` gained `base_revision_sha256` and `reauth_method`; capture kinds in the trail
+  are `drawn | typed | click | checkbox | text`. New event `envelope.declined`.
+- **Errors**: `StorageUnavailable` (retryable, like `SealUnavailable`); `RateLimited` carries
+  `retry_after_seconds`.
+- **Types**: `Actor.role`/`capacity`, `AuthContext.method` and `KioskContext.identity_check` are
+  `Literal`s. `Capture.kind` is optional (checkbox and text captures have none, matching the wire
+  shapes). `SignerRoleDef.required`. `CertificateSummary.seal_profile` (the configured profile).
+  `EnvelopeView` gained `current_revision_sha256`, `created_at`, `host_id`.
+  `DECLINE_REASON_CODES`, `OPAQUE_ID_PATTERN` and `is_opaque_id` live in `contracts.py`.
+- **Sealing**: `SealValidation.ok` also requires `problems` to be empty; the envelope id is bound
+  into the signature; `Sealer.seal` documents which exceptions escape.
+- **Identity**: `attest_reauth` takes the `Host` (another host's session is `not_found`) and
+  returns the `SessionInfo`; `revoke_sessions(..., except_session_id=)`; `create_session`
+  documents its error codes; the API layer owns the three session audit events.
+- **Documents**: `DocumentService.page_count`.
+- **Envelopes**: `record_viewed` takes `pages_viewed` and checks it against the bytes the session
+  was served; `accept_consent` takes the signer's `locale`; `signing_view`, `may_download_copy`,
+  `signer_copy` and `sealed_document` are part of the Protocol (the last two record
+  `document.downloaded`); `seal_pending` documents the separately committed failure record;
+  `EnvelopeNotifier` lets the service queue a webhook in the transaction that made the change.
+- **Schema**: `0600` adds the missing `BEFORE TRUNCATE` triggers.
+- **Foundation**: `configure_logging` no longer caches loggers or binds `sys.stdout` at configure
+  time (it broke full-suite runs); signature PNG per-axis limits moved into `Settings`.

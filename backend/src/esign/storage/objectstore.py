@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Protocol
 
-from esign.contracts import EsignError
+from esign.contracts import StorageUnavailable
 
 __all__ = ["BlobStoreUnavailable", "ObjectStore", "PutOutcome", "content_key"]
 
@@ -19,7 +19,7 @@ __all__ = ["BlobStoreUnavailable", "ObjectStore", "PutOutcome", "content_key"]
 PutOutcome = Literal["created", "already_present"]
 
 
-class BlobStoreUnavailable(EsignError):
+class BlobStoreUnavailable(StorageUnavailable):
     """The blob store did not answer, or refused for a reason that is not about this content.
 
     Retryable in the sense that matters: the caller must leave the envelope where it is rather
@@ -27,7 +27,6 @@ class BlobStoreUnavailable(EsignError):
     """
 
     code = "blob_store_unavailable"
-    http_status = 503
 
 
 def content_key(sha256: bytes, prefix: str = "") -> str:

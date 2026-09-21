@@ -36,7 +36,7 @@ def test_declining_ends_the_envelope(bench: Bench, db: Session) -> None:
     assert result.status == "declined"
     assert bench.signer_status(db, bench.signer_id(view, "patient")) == "declined"
     assert bench.signer_status(db, bench.signer_id(view, "witness")) == "pending"
-    assert bench.event_types(db, view.id)[-1] == "signer.declined"
+    assert bench.event_types(db, view.id)[-2:] == ["signer.declined", "envelope.declined"]
 
     row = db.execute(
         text("SELECT declined_at, decline_reason_code FROM signers WHERE id = :id"),
@@ -57,7 +57,10 @@ def test_the_reason_code_reaches_the_audit_trail_and_nothing_else_does(bench: Be
     bench.service.decline(db, session, "needs_interpreter", CTX)
 
     declined = next(e for e in bench.audit.list(db, "envelope", view.id) if str(e.event_type) == "signer.declined")
-    assert declined.data == {"decline_reason_code": "needs_interpreter"}
+    signer_id = str(bench.signer_id(view, "patient"))
+    assert declined.data == {"signer_id": signer_id, "role_key": "patient", "reason_code": "needs_interpreter"}
+    ended = next(e for e in bench.audit.list(db, "envelope", view.id) if str(e.event_type) == "envelope.declined")
+    assert ended.data == {"signer_id": signer_id, "reason_code": "needs_interpreter"}
 
 
 def test_an_unknown_decline_reason_is_refused(bench: Bench, db: Session) -> None:

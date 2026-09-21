@@ -22,17 +22,19 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from esign.audit.events import validate_event_data
 from esign.clock import Clock
 from esign.contracts import (
     Actor,
     AuditEvent,
     AuthContext,
+    AuthMethod,
     BlobKind,
     BlobRef,
     Capture,
@@ -56,6 +58,7 @@ from esign.contracts import (
     TemplatePdfInfo,
     Unauthorized,
     ValidationFailed,
+    is_opaque_id,
 )
 from esign.ids import advisory_lock_key, new_id
 
@@ -136,12 +139,8 @@ def _canonical(value: Any) -> Any:
 
 
 class FakeAuditLog:
-    """A real hash chain in the real table, minus the audit module's data allowlist.
-
-    Leaving the allowlist out is deliberate: it means these tests cannot pass because some other
-    module happened to reject a bad key. ``assert_no_phi`` below checks the envelope module's own
-    promise instead.
-    """
+    """A simple hash chain in the real table, validating ``data`` through the audit module's
+    allowlist -- the one definition both sides are held to."""
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
@@ -160,6 +159,13 @@ class FakeAuditLog:
     ) -> AuditEvent:
         actor = actor or Actor()
         ctx = ctx or RequestContext()
+        # The allowlist has one definition (esign.audit.events). Validating against it here is
+        # what keeps this module and the audit module from disagreeing about a key name until the
+        # first real envelope: a payload the real log would refuse fails these tests too.
+        data = validate_event_data(event_type, data)
+        for value in (actor.user_id, actor.on_behalf_of):
+            if value is not None and not is_opaque_id(value):
+                raise ValidationFailed("actor identifier is not opaque", code="audit_actor_invalid")
         db.execute(
             text("SELECT pg_advisory_xact_lock(:key)"),
             {"key": advisory_lock_key(f"audit:{stream_type}", stream_id)},
@@ -319,15 +325,15 @@ class FakeDocumentService:
     """
 
     def __init__(self) -> None:
-        self.page_count = 3
+        self.pages = 3
         self.prepared_with: list[dict[str, str]] = []
         self.marks: list[tuple[UUID, tuple[str, ...]]] = []
         self.sanitized = 0
 
     def inspect_template_pdf(self, pdf: bytes) -> TemplatePdfInfo:
         return TemplatePdfInfo(
-            page_count=self.page_count,
-            page_sizes=tuple((612.0, 792.0) for _ in range(self.page_count)),
+            page_count=self.pages,
+            page_sizes=tuple((612.0, 792.0) for _ in range(self.pages)),
             sha256=hashlib.sha256(pdf).digest(),
         )
 
@@ -375,6 +381,9 @@ class FakeDocumentService:
     def build_certificate(self, summary: CertificateSummary) -> bytes:
         self.last_summary = summary
         return b"%PDF-certificate " + summary.envelope_id.bytes + summary.audit_head_hash
+
+    def page_count(self, pdf: bytes) -> int:
+        return self.pages + (1 if b"% certificate" in pdf else 0)
 
     def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
         return pdf + b"\n% certificate\n" + certificate_pdf
@@ -556,15 +565,20 @@ class FakeIdentityService:
             raise Unauthorized("unknown, expired or revoked", code="unauthorized")
         return record.info
 
-    def revoke_sessions(self, db: Session, signer_id: UUID) -> None:
+    def revoke_sessions(self, db: Session, signer_id: UUID, *, except_session_id: UUID | None = None) -> int:
         self.revoked_signers.append(signer_id)
-        db.execute(
-            text("UPDATE signing_sessions SET revoked_at = :at WHERE signer_id = :id AND revoked_at IS NULL"),
-            {"id": signer_id, "at": self._clock.now()},
+        result = db.execute(
+            text(
+                "UPDATE signing_sessions SET revoked_at = :at WHERE signer_id = :id AND revoked_at IS NULL "
+                "AND (CAST(:keep AS uuid) IS NULL OR id <> CAST(:keep AS uuid))"
+            ),
+            {"id": signer_id, "at": self._clock.now(), "keep": except_session_id},
         )
+        return int(getattr(result, "rowcount", 0) or 0)
 
     # -- re-authentication --------------------------------------------------
-    def attest_reauth(self, db: Session, *, session_id: UUID, auth: AuthContext) -> None:
+    def attest_reauth(self, db: Session, *, host: Host, session_id: UUID, auth: AuthContext) -> SessionInfo:
+        _ = host
         db.execute(
             text(
                 "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at) "
@@ -578,6 +592,7 @@ class FakeIdentityService:
                 "at": self._clock.now(),
             },
         )
+        return next(record.info for record in self._sessions.values() if record.info.id == session_id)
 
     def fresh_reauth(self, db: Session, session_id: UUID) -> AuthContext | None:
         row = db.execute(
@@ -592,7 +607,7 @@ class FakeIdentityService:
         age = (self._clock.now() - row.attested_at.astimezone(UTC)).total_seconds()
         if age > self._settings.reauth_max_age_seconds:
             return None
-        return AuthContext(method=str(row.method), auth_time=row.auth_time.astimezone(UTC))
+        return AuthContext(method=cast(AuthMethod, str(row.method)), auth_time=row.auth_time.astimezone(UTC))
 
 
 # --------------------------------------------------------------------------- log capture

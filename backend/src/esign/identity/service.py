@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
-from typing import Any, Final
+from typing import Any, Final, cast, get_args
 from uuid import UUID
 
 from sqlalchemy import RowMapping, text
@@ -30,16 +30,19 @@ from sqlalchemy.orm import Session
 from esign.config import Settings
 from esign.contracts import (
     AuthContext,
+    AuthMethod,
     Clock,
     Conflict,
     ConsentText,
     Host,
+    IdentityCheck,
     KioskContext,
     NotFound,
     RequestContext,
     SessionInfo,
     Unauthorized,
     ValidationFailed,
+    is_opaque_id,
 )
 from esign.db import advisory_xact_lock
 from esign.identity.client_ip import client_ip, parse_trusted_proxies
@@ -55,10 +58,10 @@ __all__ = ["AUTH_METHODS", "IDENTITY_CHECKS", "SqlIdentityService"]
 #: The ways a host may say a user authenticated. Closed, because the value ends up on the
 #: certificate of completion, and an open string there would be both unverifiable evidence and a
 #: place free text could leak into.
-AUTH_METHODS: Final = frozenset({"password", "password+mfa", "sso", "portal_otp", "pin", "staff_verified"})
+AUTH_METHODS: Final[frozenset[str]] = frozenset(get_args(AuthMethod))
 
 #: How staff established identity at a kiosk. Closed, for the same reason.
-IDENTITY_CHECKS: Final = frozenset({"photo_id", "dob_and_name", "known_to_staff", "wristband"})
+IDENTITY_CHECKS: Final[frozenset[str]] = frozenset(get_args(IdentityCheck))
 
 #: ``staff_verified`` means a named member of staff vouched for the signer; without the kiosk
 #: context naming them, the claim is unattributable and therefore worthless as evidence.
@@ -204,15 +207,21 @@ class SqlIdentityService:
             raise Unauthorized("invalid credentials")
         return _row_to_session_info(row)
 
-    def revoke_sessions(self, db: Session, signer_id: UUID) -> None:
-        """Revoke every live session for a signer. Idempotent."""
-        self._revoke_live_sessions(db, signer_id, self._now())
+    def revoke_sessions(self, db: Session, signer_id: UUID, *, except_session_id: UUID | None = None) -> int:
+        """Revoke every live session for a signer, optionally sparing one. Idempotent."""
+        return self._revoke_live_sessions(db, signer_id, self._now(), except_session_id=except_session_id)
 
-    def _revoke_live_sessions(self, db: Session, signer_id: UUID, now: datetime) -> None:
-        db.execute(
-            text("UPDATE signing_sessions SET revoked_at = :now WHERE signer_id = :signer_id AND revoked_at IS NULL"),
-            {"now": now, "signer_id": signer_id},
+    def _revoke_live_sessions(
+        self, db: Session, signer_id: UUID, now: datetime, *, except_session_id: UUID | None = None
+    ) -> int:
+        result = db.execute(
+            text(
+                "UPDATE signing_sessions SET revoked_at = :now WHERE signer_id = :signer_id AND revoked_at IS NULL "
+                "AND (CAST(:keep AS uuid) IS NULL OR id <> CAST(:keep AS uuid))"
+            ),
+            {"now": now, "signer_id": signer_id, "keep": except_session_id},
         )
+        return int(getattr(result, "rowcount", 0) or 0)
 
     def session_host_id(self, db: Session, session_id: UUID) -> UUID:
         """The host that owns the envelope this session belongs to.
@@ -238,8 +247,11 @@ class SqlIdentityService:
 
     # ----------------------------------------------------------------- re-authentication
 
-    def attest_reauth(self, db: Session, *, session_id: UUID, auth: AuthContext) -> None:
+    def attest_reauth(self, db: Session, *, host: Host, session_id: UUID, auth: AuthContext) -> SessionInfo:
         """Record that the host re-authenticated the user for this session.
+
+        A session that belongs to another host's envelope does not exist as far as this host is
+        concerned: ``NotFound``, never ``Forbidden`` (SPEC section 10).
 
         Rejected, rather than recorded and ignored later: an attestation older than the
         re-authentication window, in the future, or predating the session itself. The table is
@@ -249,13 +261,17 @@ class SqlIdentityService:
         checked = self._validate_auth(auth, now=now, max_age=self._settings.reauth_max_age_seconds)
         row = (
             db.execute(
-                text("SELECT id, created_at, expires_at, revoked_at FROM signing_sessions WHERE id = :id"),
+                text(
+                    f"SELECT {_SESSION_COLUMNS}, e.host_id AS host_id FROM signing_sessions ss "  # noqa: S608 - fixed column list
+                    "JOIN signers s ON s.id = ss.signer_id JOIN envelopes e ON e.id = s.envelope_id "
+                    "WHERE ss.id = :id"
+                ),
                 {"id": session_id},
             )
             .mappings()
             .first()
         )
-        if row is None:
+        if row is None or req_uuid(row, "host_id") != host.id:
             raise NotFound("session", code="session_not_found")
         if opt_time(row, "revoked_at") is not None or now >= req_time(row, "expires_at"):
             raise Conflict("session is not live", code="session_not_live")
@@ -275,6 +291,7 @@ class SqlIdentityService:
             },
         )
         _log().info("identity.reauth_attested", session_id=session_id, reauth_method=checked.method)
+        return _row_to_session_info(row)
 
     def fresh_reauth(self, db: Session, session_id: UUID) -> AuthContext | None:
         """The most recent usable attestation for this session, or ``None``.
@@ -310,7 +327,7 @@ class SqlIdentityService:
         method = req_str(row, "method")
         if method not in AUTH_METHODS:
             return None
-        return AuthContext(method=method, auth_time=req_time(row, "auth_time"))
+        return AuthContext(method=cast(AuthMethod, method), auth_time=req_time(row, "auth_time"))
 
     # ----------------------------------------------------------------- consent
 
@@ -389,6 +406,9 @@ class SqlIdentityService:
         staff_user_id = kiosk.staff_user_id.strip()
         if not staff_user_id or len(staff_user_id) > _MAX_STAFF_ID_CHARS:
             raise ValidationFailed("kiosk staff_user_id is empty or too long", code="invalid_kiosk_context")
+        if not is_opaque_id(staff_user_id):
+            # It is recorded in the audit trail, which only takes identifiers: never a staff name.
+            raise ValidationFailed("kiosk staff_user_id must be an opaque identifier", code="invalid_kiosk_context")
         if kiosk.identity_check not in IDENTITY_CHECKS:
             raise ValidationFailed("unsupported kiosk identity check", code="invalid_kiosk_context")
         return KioskContext(staff_user_id=staff_user_id, identity_check=kiosk.identity_check)
@@ -401,7 +421,7 @@ def _row_to_session_info(row: RowMapping) -> SessionInfo:
     staff_user_id = opt_str(row, "kiosk_staff_user_id")
     identity_check = opt_str(row, "kiosk_identity_check")
     kiosk = (
-        KioskContext(staff_user_id=staff_user_id, identity_check=identity_check)
+        KioskContext(staff_user_id=staff_user_id, identity_check=cast(IdentityCheck, identity_check))
         if staff_user_id is not None and identity_check is not None
         else None
     )
@@ -409,7 +429,7 @@ def _row_to_session_info(row: RowMapping) -> SessionInfo:
         id=req_uuid(row, "id"),
         signer_id=req_uuid(row, "signer_id"),
         envelope_id=req_uuid(row, "envelope_id"),
-        auth=AuthContext(method=req_str(row, "auth_method"), auth_time=req_time(row, "auth_time")),
+        auth=AuthContext(method=cast(AuthMethod, req_str(row, "auth_method")), auth_time=req_time(row, "auth_time")),
         kiosk=kiosk,
         expires_at=req_time(row, "expires_at"),
     )

@@ -18,8 +18,8 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from esign.contracts import Capture, NewSigner
-from esign.envelopes.service import AUDIT_DATA_KEYS
+from esign.audit.events import declared_data_keys
+from esign.contracts import Capture, EventType, NewSigner
 from esign.logging import LOGGABLE_KEYS, RESERVED_KEYS, configure_logging
 from tests.envelopes.conftest import CTX, PROCEDURE_CONSENT, Bench
 from tests.envelopes.fakes import LogCapture
@@ -185,13 +185,12 @@ def test_no_audit_event_data_carries_phi(bench: Bench, db: Session) -> None:
 
 
 def test_every_data_key_is_one_this_module_declares(bench: Bench, db: Session) -> None:
-    """``AUDIT_DATA_KEYS`` is the promise; this checks the code keeps it in a real run."""
+    """The audit module's allowlist is the promise; this checks the code keeps it in a real run."""
     _host, view = drive_everything(bench, db)
 
     seen: set[str] = set()
     for event in bench.audit.list(db, "envelope", view.id):
-        declared = AUDIT_DATA_KEYS.get(event.event_type)
-        assert declared is not None, f"{event.event_type} has no declared data keys"
+        declared = declared_data_keys(event.event_type)
         assert set(event.data) <= declared, f"{event.event_type} carried {sorted(set(event.data) - declared)}"
         seen.add(str(event.event_type))
 
@@ -211,9 +210,19 @@ def test_every_data_key_is_one_this_module_declares(bench: Bench, db: Session) -
 
 def test_the_declared_keys_contain_nothing_that_could_be_phi() -> None:
     """A reviewer should be able to check the claim by reading one dictionary. So: read it."""
-    forbidden_fragments = ("name", "dob", "birth", "prefill", "patient_ref", "text", "note", "address", "token")
-    for event_type, keys in AUDIT_DATA_KEYS.items():
-        for key in keys:
+    forbidden_fragments = (
+        "name",
+        "dob",
+        "birth",
+        "prefill_value",
+        "patient_ref",
+        "free_text",
+        "note",
+        "address",
+        "token",
+    )
+    for event_type in EventType:
+        for key in declared_data_keys(event_type):
             assert not any(fragment in key for fragment in forbidden_fragments), f"{event_type}.{key}"
 
 

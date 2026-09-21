@@ -21,7 +21,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from ipaddress import ip_address
-from typing import Any, Final, get_args
+from typing import Any, Final, cast, get_args
 from uuid import UUID
 
 from sqlalchemy import Row, text
@@ -38,6 +38,7 @@ from esign.audit.events import (
 from esign.config import Settings
 from esign.contracts import (
     Actor,
+    ActorRole,
     AuditEvent,
     Capacity,
     ChainReport,
@@ -339,7 +340,12 @@ class PostgresAuditLog:
             stream_id=stream_id,
             sequence=sequence,
             event_type=event_type,
-            actor=Actor(user_id=actor_user_id, role=actor_role, capacity=actor_capacity, on_behalf_of=on_behalf_of),
+            actor=Actor(
+                user_id=actor_user_id,
+                role=cast("ActorRole | None", actor_role),  # membership checked by _member above
+                capacity=cast("Capacity | None", actor_capacity),
+                on_behalf_of=on_behalf_of,
+            ),
             ctx=RequestContext(ip=ip, user_agent=user_agent, auth_method=auth_method, session_id=ctx.session_id),
             document_sha256=document_sha256,
             data=validated_data,

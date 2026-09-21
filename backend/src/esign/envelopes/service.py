@@ -11,10 +11,11 @@ A refusal at step 3 changes nothing. An exception anywhere rolls the whole step 
 the audit event and the state change share one transaction: an envelope can never move without the
 event that explains why, and an event can never describe a move that did not happen.
 
-PHI discipline: ``display_name``, ``patient_ref``, ``host_user_id``, prefill values and PDF bytes
-live in the database, the blob store and the PDF. They never reach a log line or an audit ``data``
-payload. The only keys this module will put in ``data`` are the ones in :data:`AUDIT_DATA_KEYS`,
-and ``_append`` refuses anything else before it can be persisted.
+PHI discipline: ``display_name``, prefill values and PDF bytes live in the database, the blob store
+and the PDF. They never reach a log line or an audit ``data`` payload. What may appear in ``data``
+has exactly one definition -- ``esign.audit.events.EVENT_DATA_MODELS`` -- which the audit log
+enforces on every append, and which this module's tests run against (the fake audit log validates
+through it), so the two sides cannot drift apart silently.
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ import re
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
-from datetime import datetime
-from typing import Any, Final
+from datetime import datetime, timedelta
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -33,7 +34,9 @@ from sqlalchemy.orm import Session
 from esign.clock import Clock
 from esign.config import Settings
 from esign.contracts import (
+    DECLINE_REASON_CODES,
     Actor,
+    ActorRole,
     AuditLog,
     BlobService,
     Capacity,
@@ -42,7 +45,9 @@ from esign.contracts import (
     CertificateSummary,
     Conflict,
     DocumentService,
+    EnvelopeNotifier,
     EnvelopeView,
+    EsignError,
     EventType,
     FieldDef,
     Forbidden,
@@ -59,7 +64,11 @@ from esign.contracts import (
     SignerRoleDef,
     SignerStamp,
     SignerView,
+    SigningFieldView,
+    SigningView,
     ValidationFailed,
+    WebhookEvent,
+    is_opaque_id,
 )
 from esign.envelopes import repository as repo
 from esign.envelopes.definitions import (
@@ -82,7 +91,6 @@ from esign.ids import new_id
 from esign.logging import get_logger
 
 __all__ = [
-    "AUDIT_DATA_KEYS",
     "DECLINE_REASON_CODES",
     "EnvelopeServiceImpl",
     "SessionScope",
@@ -95,48 +103,8 @@ log = get_logger(__name__)
 #: after the failed attempt's transaction has been rolled back.
 SessionScope = Callable[[], AbstractContextManager[Session]]
 
-#: SPEC section 9: a fixed list, including ``prefers_paper``. Declining never needs free text,
-#: because free text is how PHI gets into an audit trail.
-DECLINE_REASON_CODES: Final[tuple[str, ...]] = (
-    "prefers_paper",
-    "needs_more_time",
-    "disagrees_with_terms",
-    "needs_interpreter",
-    "incorrect_information",
-    "not_the_right_signer",
-    "wants_to_ask_a_question",
-    "other",
-)
-
 #: Host-chosen reason codes (void) must look like a machine code, not a sentence.
 _REASON_CODE = re.compile(r"\A[a-z][a-z0-9_]{1,62}\Z")
-
-#: Every key this module may put into an audit event's ``data``, by event type. The audit module
-#: validates against its own allowlist; this is the same promise stated where it is kept, so
-#: "no PHI in the audit trail" can be checked by reading one dictionary.
-AUDIT_DATA_KEYS: Final[dict[EventType, frozenset[str]]] = {
-    EventType.ENVELOPE_CREATED: frozenset(
-        {"template_key", "template_version", "document_type", "signing_order", "signer_count"}
-    ),
-    EventType.DOCUMENT_PREPARED: frozenset({"revision_no", "size_bytes"}),
-    EventType.DOCUMENT_PRESENTED: frozenset({"revision_no"}),
-    EventType.DOCUMENT_VIEWED: frozenset({"revision_no"}),
-    EventType.CONSENT_ACCEPTED: frozenset({"consent_version", "locale", "consent_sha256"}),
-    EventType.SIGNER_SIGNED: frozenset(
-        {"revision_no", "presented_sha256", "base_revision_sha256", "capture_count", "reauth_method"}
-    ),
-    EventType.SIGNER_DECLINED: frozenset({"decline_reason_code"}),
-    EventType.ENVELOPE_COMPLETED: frozenset({"signer_count", "revision_no"}),
-    EventType.DOCUMENT_FINALIZED: frozenset(
-        {"revision_no", "certificate_sha256", "audit_event_count", "audit_head_hash"}
-    ),
-    EventType.SEAL_FAILED: frozenset({"error_code", "attempts", "retry_in_seconds"}),
-    EventType.DOCUMENT_SEALED: frozenset({"seal_profile", "cert_sha256"}),
-    EventType.DOCUMENT_STORED: frozenset({"blob_kind", "size_bytes", "retention_years"}),
-    EventType.ENVELOPE_VOIDED: frozenset({"reason_code"}),
-    EventType.ENVELOPE_EXPIRED: frozenset(),
-    EventType.ENVELOPE_SUPERSEDED: frozenset({"superseded_by_envelope_id"}),
-}
 
 _SEAL_REASON = "Certified complete by the e-signing service"
 
@@ -165,6 +133,7 @@ class EnvelopeServiceImpl:
         identity_service: IdentityService,
         sealer: Sealer,
         new_session: SessionScope | None = None,
+        notifier: EnvelopeNotifier | None = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
@@ -174,6 +143,7 @@ class EnvelopeServiceImpl:
         self._identity = identity_service
         self._sealer = sealer
         self._new_session = new_session
+        self._notifier = notifier
 
     # ----------------------------------------------------------------- creation
 
@@ -191,7 +161,7 @@ class EnvelopeServiceImpl:
             # The schema's CHECK would catch this, but as a driver error with no usable code.
             raise ValidationFailed("unknown signing order", code="signing_order_invalid")
 
-        patient_ref = _require_text(spec.patient_ref, "patient_ref_required", limit=200)
+        patient_ref = _require_opaque(spec.patient_ref, "patient_ref_invalid")
         planned = self._plan_signers(spec, roles, patient_ref)
         expires_at = self._resolve_expiry(spec.expires_at, now)
         superseded = self._lock_superseded(db, host, spec.supersedes_envelope_id)
@@ -200,6 +170,7 @@ class EnvelopeServiceImpl:
         # IntegrityFailure here rather than being quietly turned into a document someone signs.
         template_pdf = self._blobs.get(db, template.pdf_sha256)
         prepared = self._documents.prepare(template_pdf, list(prefill_fields), dict(spec.prefill))
+        page_count = self._documents.page_count(prepared)
         retain_until = self._settings.retain_until(template.document_type, now)
         presented = self._blobs.put(db, prepared, kind="presented_pdf", retain_until=retain_until)
 
@@ -250,11 +221,15 @@ class EnvelopeServiceImpl:
             actor=actor,
             ctx=ctx,
             data={
+                "host_id": host.id,
                 "template_key": template.template_key,
                 "template_version": template.version,
+                "template_version_id": template.id,
                 "document_type": template.document_type,
                 "signing_order": spec.signing_order,
                 "signer_count": len(planned),
+                "expires_at": expires_at,
+                "supersedes_envelope_id": superseded.id if superseded else None,
             },
         )
         self._append(
@@ -264,7 +239,14 @@ class EnvelopeServiceImpl:
             actor=actor,
             ctx=ctx,
             document_sha256=presented.sha256,
-            data={"revision_no": 1, "size_bytes": presented.size_bytes},
+            data={
+                "revision_no": 1,
+                "revision_kind": "presented",
+                "page_count": page_count,
+                "size_bytes": presented.size_bytes,
+                # A count, never the keys or the values: prefill is chart data.
+                "prefill_field_count": len(spec.prefill),
+            },
         )
         if superseded is not None:
             self._append(
@@ -273,7 +255,7 @@ class EnvelopeServiceImpl:
                 EventType.ENVELOPE_SUPERSEDED,
                 actor=actor,
                 ctx=ctx,
-                data={"superseded_by_envelope_id": str(envelope_id)},
+                data={"superseded_by_envelope_id": envelope_id},
             )
 
         log.info(
@@ -316,6 +298,79 @@ class EnvelopeServiceImpl:
         envelope = repo.load_envelope(db, signer.envelope_id)
         return envelope is not None and envelope.status in ("completed_pending_seal", "sealed")
 
+    def signing_view(self, db: Session, session: SessionInfo) -> SigningView:
+        """What the signing UI shows. Read-only: no lock, no event. Other signers appear by role
+        label and status only -- one signer never learns another's name from this service."""
+        loaded = self._load(db, session.envelope_id, host=None, lock=False)
+        signer = self._signer_of(loaded, session.signer_id)
+        fields = parse_field_defs(loaded.template.fields)
+        current = _require_revision(loaded.envelope.current_revision_sha256)
+        fresh = self._identity.fresh_reauth(db, session.id) if signer.requires_reauth else None
+        return SigningView(
+            envelope_id=loaded.envelope.id,
+            envelope_status=loaded.envelope.status,
+            document_type=loaded.envelope.document_type,
+            title=loaded.template.template_name,
+            page_count=self._documents.page_count(self._blobs.get(db, current)),
+            expires_at=loaded.envelope.expires_at,
+            signer=self._signer_view(loaded, signer),
+            on_behalf_of_label=signer.on_behalf_of,
+            reauth_valid_until=(
+                fresh.auth_time + timedelta(seconds=self._settings.reauth_max_age_seconds) if fresh else None
+            ),
+            other_signers=tuple(
+                (loaded.roles[s.role_key].label if s.role_key in loaded.roles else s.role_key, s.status)
+                for s in sorted(loaded.signers, key=lambda s: (s.order_index, s.role_key))
+                if s.id != signer.id
+            ),
+            fields=tuple(
+                SigningFieldView(id=f.id, type=f.type, page=f.page, rect=f.rect, required=f.required, label=f.label)
+                for f in fields
+                if f.signer_role == signer.role_key
+            ),
+        )
+
+    # ----------------------------------------------------------------- downloads
+
+    def signer_copy(self, db: Session, session: SessionInfo, ctx: RequestContext) -> bytes | None:
+        loaded = self._load(db, session.envelope_id, host=None, lock=True)
+        signer = self._signer_of(loaded, session.signer_id)
+        if signer.status != "signed":
+            raise Forbidden("the copy is available to a signer who has signed", code="copy_not_available")
+        status = loaded.envelope.status
+        if status == "completed_pending_seal":
+            return None
+        if status != "sealed":
+            # Other signers are still to sign, or the envelope ended some other way. Either way
+            # there is no sealed document, and nothing short of one is ever handed out as "the copy".
+            raise Conflict("the signed document is not available yet", code="envelope_not_complete")
+        return self._download(db, loaded, actor=_signer_actor(signer), ctx=ctx, audience="signer")
+
+    def sealed_document(self, db: Session, host: Host, envelope_id: UUID, ctx: RequestContext) -> bytes:
+        loaded = self._load(db, envelope_id, host=host, lock=True)
+        if loaded.envelope.status != "sealed":
+            raise Conflict("the envelope is not sealed", code="not_sealed")
+        return self._download(db, loaded, actor=Actor(user_id=None, role="host"), ctx=ctx, audience="host")
+
+    def _download(
+        self, db: Session, loaded: _Loaded, *, actor: Actor, ctx: RequestContext, audience: Literal["signer", "host"]
+    ) -> bytes:
+        sha = loaded.envelope.sealed_sha256
+        if sha is None:
+            raise IntegrityFailure("a sealed envelope has no sealed document", code="missing_sealed_document")
+        pdf = self._blobs.get(db, sha)  # re-hashed on read; IntegrityFailure is never caught here
+        self._append(
+            db,
+            loaded.envelope.id,
+            EventType.DOCUMENT_DOWNLOADED,
+            actor=actor,
+            ctx=ctx,
+            document_sha256=sha,
+            data={"blob_kind": "sealed_pdf", "audience": audience, "size_bytes": len(pdf)},
+        )
+        log.info("document.downloaded", envelope_id=loaded.envelope.id, document_sha256=sha, size_bytes=len(pdf))
+        return pdf
+
     # ----------------------------------------------------------------- signer flow
 
     def present(self, db: Session, session: SessionInfo, ctx: RequestContext) -> bytes:
@@ -336,7 +391,12 @@ class EnvelopeServiceImpl:
             actor=_signer_actor(signer),
             ctx=ctx,
             document_sha256=sha,
-            data={"revision_no": repo.latest_revision_no(db, loaded.envelope.id)},
+            data={
+                "signer_id": signer.id,
+                "revision_no": repo.latest_revision_no(db, loaded.envelope.id),
+                "page_count": self._documents.page_count(pdf),
+                "size_bytes": len(pdf),
+            },
         )
         log.info(
             "document.presented",
@@ -347,7 +407,7 @@ class EnvelopeServiceImpl:
         )
         return pdf
 
-    def record_viewed(self, db: Session, session: SessionInfo, ctx: RequestContext) -> None:
+    def record_viewed(self, db: Session, session: SessionInfo, pages_viewed: int, ctx: RequestContext) -> None:
         loaded, signer = self._load_for_session(db, session)
         transition = self._decide(loaded, Command.VIEW, signer.id)
         now = self._clock.now()
@@ -357,6 +417,12 @@ class EnvelopeServiceImpl:
         presented = repo.session_presented_sha(db, session.id)
         if presented is None:
             raise Conflict("the document has not been served to this session", code="not_presented")
+
+        # The UI's claim is checked against the bytes this session was actually served, not
+        # against a number the UI also supplied.
+        page_count = self._documents.page_count(self._blobs.get(db, presented))
+        if pages_viewed != page_count:
+            raise ValidationFailed("every page must be displayed before continuing", code="pages_not_all_viewed")
 
         self._apply_envelope_transition(db, loaded, transition, now=now)
         repo.update_signer(
@@ -373,16 +439,19 @@ class EnvelopeServiceImpl:
             actor=_signer_actor(signer),
             ctx=ctx,
             document_sha256=presented,
-            data={"revision_no": repo.latest_revision_no(db, loaded.envelope.id)},
+            data={"signer_id": signer.id, "pages_viewed": pages_viewed, "page_count": page_count},
         )
         log.info("document.viewed", envelope_id=loaded.envelope.id, signer_id=signer.id, session_id=session.id)
 
-    def accept_consent(self, db: Session, session: SessionInfo, consent_version: str, ctx: RequestContext) -> None:
+    def accept_consent(
+        self, db: Session, session: SessionInfo, consent_version: str, ctx: RequestContext, *, locale: str | None = None
+    ) -> None:
         loaded, signer = self._load_for_session(db, session)
         transition = self._decide(loaded, Command.CONSENT, signer.id)
         now = self._clock.now()
 
-        current = self._identity.current_consent(db, self._settings.default_locale)
+        # The disclosure recorded is the one in the language the signer read it in.
+        current = self._identity.current_consent(db, locale or self._settings.default_locale)
         if consent_version != current.version:
             # They agreed to a disclosure that is no longer current. Make them read the new one
             # rather than recording consent to text they were not shown.
@@ -404,9 +473,11 @@ class EnvelopeServiceImpl:
             actor=_signer_actor(signer),
             ctx=ctx,
             data={
+                "signer_id": signer.id,
+                "consent_text_id": current.id,
                 "consent_version": current.version,
                 "locale": current.locale,
-                "consent_sha256": current.body_sha256.hex(),
+                "body_sha256": current.body_sha256,
             },
         )
         log.info(
@@ -429,6 +500,7 @@ class EnvelopeServiceImpl:
 
         fields = parse_field_defs(loaded.template.fields)
         mine = tuple(f for f in fields if f.signer_role == signer.role_key)
+        by_id = {f.id: f for f in fields}
         accepted = self._check_captures(fields, mine, captures, signer.role_key)
 
         base_sha = _require_revision(loaded.envelope.current_revision_sha256)
@@ -469,14 +541,21 @@ class EnvelopeServiceImpl:
             ctx=ctx,
             document_sha256=revision.sha256,
             data={
-                "revision_no": revision_no,
-                # Both hashes, always: what this signer was shown, and what they signed on top of.
-                # In a parallel envelope another signer may have moved the document in between,
-                # and that divergence has to be visible in the trail rather than smoothed over.
-                "presented_sha256": presented.hex(),
-                "base_revision_sha256": base_sha.hex(),
-                "capture_count": len(accepted),
+                "signer_id": signer.id,
+                "role_key": signer.role_key,
+                "capacity": signer.capacity,
+                "consent_version": self._consent_version(db, signer),
+                "reauth_used": reauth_method is not None,
                 "reauth_method": reauth_method,
+                # All three hashes, always: what this signer was shown, what they signed on top
+                # of, and what came out. In a parallel envelope another signer may have moved the
+                # document in between, and that has to be visible rather than smoothed over.
+                "presented_sha256": presented,
+                "base_revision_sha256": base_sha,
+                "revision_no": revision_no,
+                "revision_sha256": revision.sha256,
+                "capture_count": len(accepted),
+                "captures": [{"field_id": c.field_id, "kind": c.kind or by_id[c.field_id].type} for c in accepted],
             },
         )
 
@@ -489,13 +568,17 @@ class EnvelopeServiceImpl:
                 actor=_signer_actor(signer),
                 ctx=ctx,
                 document_sha256=revision.sha256,
-                data={"signer_count": len(loaded.signers), "revision_no": revision_no},
+                data={
+                    "signer_count": len(loaded.signers),
+                    "revision_no": revision_no,
+                    "final_revision_sha256": revision.sha256,
+                },
             )
             repo.enqueue_seal_job(db, loaded.envelope.id, now)
 
         # Signing ends this signer's ability to act. The session they signed from survives, for the
         # copy download only (see may_download_copy); every other session they hold is revoked.
-        revoked = repo.revoke_other_sessions(db, signer_id=signer.id, keep_session_id=session.id, at=now)
+        revoked = self._identity.revoke_sessions(db, signer.id, except_session_id=session.id)
 
         log.info(
             "signer.signed",
@@ -509,7 +592,10 @@ class EnvelopeServiceImpl:
             count=revoked,
             envelope_status=transition.envelope_status,
         )
-        return self._view(db, self._reload(db, loaded))
+        view = self._view(db, self._reload(db, loaded))
+        if transition.completes_envelope:
+            self._notify(db, "envelope.completed", view)
+        return view
 
     def decline(self, db: Session, session: SessionInfo, reason_code: str, ctx: RequestContext) -> EnvelopeView:
         loaded, signer = self._load_for_session(db, session)
@@ -526,7 +612,16 @@ class EnvelopeServiceImpl:
             EventType.SIGNER_DECLINED,
             actor=_signer_actor(signer),
             ctx=ctx,
-            data={"decline_reason_code": reason_code},
+            data={"signer_id": signer.id, "role_key": signer.role_key, "reason_code": reason_code},
+        )
+        # The envelope-level fact, stated rather than left to be inferred from the signer's event.
+        self._append(
+            db,
+            loaded.envelope.id,
+            EventType.ENVELOPE_DECLINED,
+            actor=_signer_actor(signer),
+            ctx=ctx,
+            data={"signer_id": signer.id, "reason_code": reason_code},
         )
         repo.revoke_envelope_sessions(db, loaded.envelope.id, now)
         log.info(
@@ -535,7 +630,9 @@ class EnvelopeServiceImpl:
             signer_id=signer.id,
             decline_reason_code=reason_code,
         )
-        return self._view(db, self._reload(db, loaded))
+        view = self._view(db, self._reload(db, loaded))
+        self._notify(db, "envelope.declined", view)
+        return view
 
     # ----------------------------------------------------------------- host actions
 
@@ -563,7 +660,9 @@ class EnvelopeServiceImpl:
         )
         repo.revoke_envelope_sessions(db, envelope_id, now)
         log.info("envelope.voided", envelope_id=envelope_id, host_id=host.id, reason_code=reason_code)
-        return self._view(db, self._reload(db, loaded))
+        view = self._view(db, self._reload(db, loaded))
+        self._notify(db, "envelope.voided", view)
+        return view
 
     def expire_due(self, db: Session) -> int:
         now = self._clock.now()
@@ -586,6 +685,7 @@ class EnvelopeServiceImpl:
             )
             repo.revoke_envelope_sessions(db, envelope_id, now)
             log.info("envelope.expired", envelope_id=envelope_id)
+            self._notify(db, "envelope.expired", self._view(db, self._reload(db, loaded)))
             expired += 1
         return expired
 
@@ -596,11 +696,13 @@ class EnvelopeServiceImpl:
         transition = self._decide(loaded, Command.SEAL, None)
         try:
             return self._seal(db, loaded, transition)
-        except SealUnavailable as exc:
+        except Exception as exc:
             # Nothing of the attempt survives the caller's rollback -- that is the point. The
             # envelope stays completed_pending_seal and the failure is recorded in a step of its
-            # own, so the trail still explains why nothing happened.
-            self._on_seal_failure(envelope_id, exc.code)
+            # own, so the trail still explains why nothing happened. That holds for the retryable
+            # failures (SealUnavailable, StorageUnavailable) and equally for the ones that are
+            # not: an integrity failure or a bug leaves the envelope pending, recorded and loud.
+            self._on_seal_failure(envelope_id, exc.code if isinstance(exc, EsignError) else "internal_error")
             raise
 
     def _seal(self, db: Session, loaded: _Loaded, transition: Transition) -> EnvelopeView:
@@ -674,10 +776,11 @@ class EnvelopeServiceImpl:
             ctx=RequestContext(),
             document_sha256=unsealed.sha256,
             data={
-                "revision_no": unsealed_no,
-                "certificate_sha256": hashlib.sha256(certificate).hexdigest(),
+                "certificate_sha256": hashlib.sha256(certificate).digest(),
+                "page_count": self._documents.page_count(final_unsealed),
+                "size_bytes": unsealed.size_bytes,
                 "audit_event_count": summary.audit_event_count,
-                "audit_head_hash": summary.audit_head_hash.hex(),
+                "audit_head_hash": summary.audit_head_hash,
             },
         )
         self._append(
@@ -687,7 +790,13 @@ class EnvelopeServiceImpl:
             actor=_SYSTEM,
             ctx=RequestContext(),
             document_sha256=sealed.sha256,
-            data={"seal_profile": result.profile, "cert_sha256": result.signer_cert_sha256.hex()},
+            data={
+                "seal_profile": result.profile,
+                "key_backend": self._settings.seal_key_backend,
+                "signer_cert_sha256": result.signer_cert_sha256,
+                "timestamp_time": result.timestamp_time,
+                "size_bytes": sealed.size_bytes,
+            },
         )
         self._append(
             db,
@@ -699,7 +808,7 @@ class EnvelopeServiceImpl:
             data={
                 "blob_kind": "sealed_pdf",
                 "size_bytes": sealed.size_bytes,
-                "retention_years": self._settings.retention_years(envelope.document_type),
+                "retain_until": retain_until,
             },
         )
         repo.complete_seal_job(db, envelope.id, now)
@@ -710,7 +819,9 @@ class EnvelopeServiceImpl:
             sealed_sha256=sealed.sha256,
             size_bytes=sealed.size_bytes,
         )
-        return self._view(db, self._reload(db, loaded))
+        view = self._view(db, self._reload(db, loaded))
+        self._notify(db, "envelope.sealed", view)
+        return view
 
     def _on_seal_failure(self, envelope_id: UUID, error_code: str) -> None:
         """Record ``seal.failed`` so it survives the rollback of the failed attempt.
@@ -744,7 +855,7 @@ class EnvelopeServiceImpl:
                     ctx=RequestContext(),
                     data={
                         "error_code": error_code,
-                        "attempts": attempts,
+                        "attempt": attempts,
                         "retry_in_seconds": int(delay.total_seconds()),
                     },
                 )
@@ -774,6 +885,9 @@ class EnvelopeServiceImpl:
             document_type=envelope.document_type,
             template_key=loaded.template.template_key,
             template_version=loaded.template.version,
+            # The configured profile: the certificate is inside the sealed bytes, so it is written
+            # before the seal exists. The profile actually achieved is in document.sealed.
+            seal_profile=self._settings.seal_profile,
             presented_sha256=_require_revision(envelope.presented_sha256),
             final_revision_sha256=final_revision_sha,
             created_at=envelope.created_at,
@@ -881,12 +995,12 @@ class EnvelopeServiceImpl:
         if field.type == "checkbox":
             if capture.checked is None:
                 raise ValidationFailed("a checkbox field needs a checked value", code="capture_shape_invalid")
-            return Capture(field_id=field.id, kind="click", checked=capture.checked)
+            return Capture(field_id=field.id, checked=capture.checked)
 
         if field.type == "text":
             if capture.text_value is None or not capture.text_value.strip():
                 raise ValidationFailed("a text field needs a value", code="capture_shape_invalid")
-            return Capture(field_id=field.id, kind="typed", text_value=capture.text_value)
+            return Capture(field_id=field.id, text_value=capture.text_value)
 
         raise ValidationFailed("unsupported field type", code="capture_shape_invalid")
 
@@ -923,7 +1037,7 @@ class EnvelopeServiceImpl:
                     typed_text=capture.typed_text,
                     created_at=now,
                 )
-            elif capture.kind == "click" and capture.checked is None:
+            elif capture.kind == "click":
                 repo.insert_capture(
                     db,
                     capture_id=new_id(),
@@ -969,14 +1083,15 @@ class EnvelopeServiceImpl:
             cleaned = replace(
                 signer,
                 display_name=_require_text(signer.display_name, "display_name_required", limit=200),
-                host_user_id=_require_text(signer.host_user_id, "host_user_id_required", limit=200),
+                # Becomes the audit actor: an identifier, never a name (the trail refuses those,
+                # and it is better refused here than at the moment the person signs).
+                host_user_id=_require_opaque(signer.host_user_id, "host_user_id_invalid"),
             )
             _check_on_behalf_of(cleaned, patient_ref)
             planned.append((cleaned, role))
 
-        if [role.key for role in roles if role.key not in used]:
-            # Every declared role signs. SignerRoleDef has no "optional" flag, and guessing one
-            # would mean sealing a document with an empty signature block.
+        if [role.key for role in roles if role.required and role.key not in used]:
+            # Every required role signs; only a role the template marks optional may be left out.
             raise ValidationFailed("the template declares a role with no signer", code="missing_required_role")
         return tuple(planned)
 
@@ -1104,11 +1219,6 @@ class EnvelopeServiceImpl:
         data: dict[str, Any] | None = None,
     ) -> None:
         payload = {key: value for key, value in (data or {}).items() if value is not None}
-        extra = set(payload) - AUDIT_DATA_KEYS.get(event_type, frozenset())
-        if extra:
-            # A programming error, caught before it reaches the trail: this module declares exactly
-            # which keys it emits, and anything else is refused rather than persisted.
-            raise ValidationFailed("audit data key is not declared by this module", code="audit_data_key_unexpected")
         self._audit.append(
             db,
             stream_type="envelope",
@@ -1135,7 +1245,19 @@ class EnvelopeServiceImpl:
             expires_at=envelope.expires_at,
             supersedes_envelope_id=envelope.supersedes_envelope_id,
             superseded_by_envelope_id=repo.superseded_by(db, envelope.id),
+            current_revision_sha256=envelope.current_revision_sha256,
+            created_at=envelope.created_at,
+            host_id=envelope.host_id,
         )
+
+    def _notify(self, db: Session, event: WebhookEvent, view: EnvelopeView) -> None:
+        if self._notifier is not None:
+            self._notifier.envelope_event(db, event=event, envelope=view)
+
+    def _consent_version(self, db: Session, signer: repo.SignerRow) -> str:
+        if signer.consent_text_id is None:  # pragma: no cover - the state machine requires consent first
+            raise IntegrityFailure("a signer has no recorded consent", code="incomplete_signer_evidence")
+        return self._identity.get_consent(db, signer.consent_text_id).version
 
     @staticmethod
     def _signer_view(loaded: _Loaded, row: repo.SignerRow) -> SignerView:
@@ -1154,7 +1276,7 @@ class EnvelopeServiceImpl:
 
 _SYSTEM: Final[Actor] = Actor(user_id=None, role="system")
 
-_ACTOR_ROLE_BY_CAPACITY: Final[dict[Capacity, str]] = {
+_ACTOR_ROLE_BY_CAPACITY: Final[dict[Capacity, ActorRole]] = {
     "self": "patient",
     "guardian": "patient",
     "proxy": "patient",
@@ -1192,6 +1314,13 @@ def _require_text(value: str, code: str, *, limit: int) -> str:
     return text_value
 
 
+def _require_opaque(value: str, code: str) -> str:
+    text_value = (value or "").strip()
+    if not is_opaque_id(text_value):
+        raise ValidationFailed("an identifier must be opaque: no spaces, not a name or a date", code=code)
+    return text_value
+
+
 def _require_revision(sha: bytes | None) -> bytes:
     if sha is None:
         raise IntegrityFailure("the envelope has no current revision", code="missing_revision")
@@ -1208,6 +1337,7 @@ def build_envelope_service(
     identity_service: IdentityService,
     sealer: Sealer,
     new_session: SessionScope | None = None,
+    notifier: EnvelopeNotifier | None = None,
 ) -> EnvelopeServiceImpl:
     """The module's one factory (SPEC section 2).
 
@@ -1224,4 +1354,5 @@ def build_envelope_service(
         identity_service=identity_service,
         sealer=sealer,
         new_session=new_session,
+        notifier=notifier,
     )

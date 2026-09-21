@@ -12,6 +12,7 @@ from esign.contracts import Capture, Conflict, Forbidden, IntegrityFailure, Sess
 from tests.envelopes.conftest import (
     CTX,
     HIPAA_PAIR,
+    PAGES,
     PATIENT_CONSENT,
     PROCEDURE_CONSENT,
     Bench,
@@ -163,7 +164,7 @@ def test_signing_before_consenting_is_a_conflict(bench: Bench, db: Session) -> N
     view = bench.create(db, host, PATIENT_CONSENT)
     session = bench.session(db, bench.signer_id(view, "patient"))
     bench.service.present(db, session, CTX)
-    bench.service.record_viewed(db, session, CTX)
+    bench.service.record_viewed(db, session, PAGES, CTX)
 
     with pytest.raises(Conflict) as seen:
         bench.service.sign(db, session, [sig()], CTX)
@@ -294,7 +295,8 @@ def test_a_signer_whose_role_does_not_need_reauth_is_not_asked(bench: Bench, db:
     result = bench.service.sign(db, session, [sig()], CTX)
 
     signed = next(e for e in bench.audit.list(db, "envelope", result.id) if str(e.event_type) == "signer.signed")
-    assert "reauth_method" not in signed.data
+    assert signed.data["reauth_used"] is False
+    assert signed.data["reauth_method"] is None
 
 
 # --------------------------------------------------------------------------- captures
@@ -428,8 +430,12 @@ def test_checkbox_and_text_fields_carry_their_values(bench: Bench, db: Session) 
         text("SELECT current_revision_sha256 FROM envelopes WHERE id = :id"), {"id": result.id}
     ).scalar_one()
     stamped = bench.blobs.get(db, bytes(sha)).decode(errors="replace")
-    assert "patient_ack:click" in stamped
-    assert "patient_note:typed" in stamped
+    # Checkbox and text captures carry no capture kind (SPEC 9's wire shapes have none).
+    assert "patient_ack:None" in stamped
+    assert "patient_note:None" in stamped
+    signed = next(e for e in bench.audit.list(db, "envelope", result.id) if str(e.event_type) == "signer.signed")
+    assert {"field_id": "patient_ack", "kind": "checkbox"} in signed.data["captures"]
+    assert {"field_id": "patient_note", "kind": "text"} in signed.data["captures"]
 
 
 def test_a_checkbox_without_a_value_is_refused(bench: Bench, db: Session) -> None:

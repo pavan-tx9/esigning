@@ -34,8 +34,8 @@ __all__ = [
 
 _PNG_MAGIC: Final[bytes] = b"\x89PNG\r\n\x1a\n"
 
-#: Widest or tallest a signature canvas may be. Not in ``Settings`` -- see the module docstring in
-#: ``__init__`` and the contract note in the report.
+#: The default per-axis bounds. The operational values live in ``Settings``
+#: (``max_signature_png_dimension`` / ``min_signature_png_dimension``); these mirror its defaults.
 MAX_SIGNATURE_PNG_DIMENSION: Final[int] = 4000
 MIN_SIGNATURE_PNG_DIMENSION: Final[int] = 8
 
@@ -111,9 +111,9 @@ def _decode_and_clean(data: bytes, settings: Settings) -> bytes:
             raise ValidationFailed("signature image is not a PNG", code="signature_image_not_png")
 
         width, height = image.size
-        if width < MIN_SIGNATURE_PNG_DIMENSION or height < MIN_SIGNATURE_PNG_DIMENSION:
+        if width < settings.min_signature_png_dimension or height < settings.min_signature_png_dimension:
             raise ValidationFailed("signature image is too small", code="signature_image_too_small")
-        if width > MAX_SIGNATURE_PNG_DIMENSION or height > MAX_SIGNATURE_PNG_DIMENSION:
+        if width > settings.max_signature_png_dimension or height > settings.max_signature_png_dimension:
             raise ValidationFailed("signature image exceeds the maximum dimensions", code="signature_image_too_large")
         if width * height > settings.max_signature_png_pixels:
             raise ValidationFailed("signature image exceeds the maximum pixel count", code="signature_image_too_large")

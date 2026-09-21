@@ -21,6 +21,7 @@ without sleeping.
 
 from __future__ import annotations
 
+import math
 import threading
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -128,12 +129,14 @@ class SlidingWindowRateLimiter:
             while bucket.times and bucket.times[0] <= cutoff:
                 bucket.times.popleft()
             over_limit = len(bucket.times) >= limit
+            # When the earliest hit still inside the window ages out, one more is allowed.
+            retry_after = max(1, math.ceil(bucket.times[0] + window_seconds - now)) if over_limit else None
             if not over_limit:
                 bucket.times.append(now)
             self._buckets.move_to_end(key)
             self._sweep(now)
             if over_limit:
-                raise RateLimited("too many requests")
+                raise RateLimited("too many requests", retry_after_seconds=retry_after)
 
     def _sweep(self, now: float) -> None:
         """Forget fully elapsed keys, then enforce the hard cap. Called with the lock held."""

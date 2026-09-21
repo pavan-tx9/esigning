@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from esign.contracts import Capture, Conflict, EnvelopeView, SealUnavailable, SessionInfo
 from esign.envelopes import repository as repo
-from tests.envelopes.conftest import CTX, HIPAA_PAIR, PATIENT_CONSENT, Bench
+from tests.envelopes.conftest import CTX, HIPAA_PAIR, PAGES, PATIENT_CONSENT, Bench
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"scribbled signature bytes"
 SessionFactory = Callable[[], AbstractContextManager[Session]]
@@ -317,7 +317,7 @@ def test_an_envelope_past_its_date_refuses_to_be_signed_before_any_sweep(
         assert bench.status(db, view.id) == "in_progress"
         for call in (
             lambda: bench.service.present(db, session, CTX),
-            lambda: bench.service.record_viewed(db, session, CTX),
+            lambda: bench.service.record_viewed(db, session, PAGES, CTX),
             lambda: bench.service.sign(db, session, [sig("patient_sig")], CTX),
             lambda: bench.service.decline(db, session, "prefers_paper", CTX),
             lambda: bench.service.assert_signer_may_start(db, host, view.id, signer_id),

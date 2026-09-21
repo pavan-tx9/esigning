@@ -178,6 +178,7 @@
       "key": "patient",
       "label": "Patient",
       "order_index": 0,
+      "required": true,
       "requires_reauth": false
     },
     {
@@ -187,6 +188,7 @@
       "key": "witness",
       "label": "Witness",
       "order_index": 1,
+      "required": true,
       "requires_reauth": false
     },
     {
@@ -196,6 +198,7 @@
       "key": "clinician",
       "label": "Clinician",
       "order_index": 2,
+      "required": true,
       "requires_reauth": true
     }
   ]

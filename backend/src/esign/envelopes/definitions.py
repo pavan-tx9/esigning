@@ -167,4 +167,5 @@ def _signer_role_def(item: Any, index: int) -> SignerRoleDef:
         allowed_capacities=tuple(capacities),
         requires_reauth=_bool(data, "requires_reauth", "signer_roles", index, default=False),
         order_index=_int(data, "order_index", "signer_roles", index),
+        required=_bool(data, "required", "signer_roles", index, default=True),
     )

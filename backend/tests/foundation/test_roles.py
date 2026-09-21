@@ -138,14 +138,19 @@ def test_owner_cannot_delete_from_the_other_append_only_tables(owner_db: Session
 
 
 @pytest.mark.parametrize("table", sorted(APPEND_ONLY_ROW_MAKERS))
-def test_the_app_role_is_the_only_defence_against_truncating_those_tables(db: Session, table: str) -> None:
-    """A deliberate record of where the two defences differ.
+def test_both_defences_hold_against_truncating_the_other_append_only_tables(
+    db: Session, owner_db: Session, table: str
+) -> None:
+    """SPEC section 12: the app role is denied, and the owner role hits the trigger.
 
-    ``0001`` puts a statement-level TRUNCATE trigger on ``audit_events`` only, so for the other
-    append-only tables the grants are the whole story: the app role has no TRUNCATE privilege, and
-    the owner role -- which runs migrations -- is not stopped. Reported to the architecture owner.
+    ``0001`` put a TRUNCATE trigger on ``audit_events`` only; ``0100`` (blobs) and ``0600`` (the
+    rest) closed the gap, so ``TRUNCATE ... CASCADE`` as the owner no longer erases evidence.
     """
     assert not db.execute(text("SELECT has_table_privilege('esign_app', :t, 'TRUNCATE')"), {"t": table}).scalar_one()
+    with pytest.raises(DBAPIError) as caught, owner_db.begin_nested():
+        owner_db.execute(text(f"TRUNCATE TABLE {table} CASCADE"))
+    assert sqlstate(caught.value) == RAISE_EXCEPTION
+    assert "append-only" in str(caught.value.orig)
 
 
 def test_app_role_is_not_a_superuser_and_cannot_bypass_rls(db: Session) -> None:

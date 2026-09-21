@@ -24,6 +24,7 @@ from esign.clock import FixedClock
 from esign.config import Settings
 from esign.contracts import (
     AuthContext,
+    AuthMethod,
     Capacity,
     EnvelopeView,
     Host,
@@ -32,6 +33,7 @@ from esign.contracts import (
     NewSigner,
     RequestContext,
     SessionInfo,
+    WebhookEvent,
 )
 from esign.envelopes import build_envelope_service
 from esign.envelopes.service import EnvelopeServiceImpl, SessionScope
@@ -46,6 +48,8 @@ from tests.envelopes.fakes import (
 
 CTX = RequestContext(ip="198.51.100.7", user_agent="EsignTest/1.0", auth_method="password")
 CONSENT_VERSION = "2026-09"
+#: Pages in every document the fake document service produces.
+PAGES = 3
 
 
 # --------------------------------------------------------------------------- template definitions
@@ -158,6 +162,7 @@ class Bench:
         *,
         new_session: SessionScope | None = None,
     ) -> None:
+        self.notified: list[tuple[str, EnvelopeView]] = []
         self.settings = settings
         self.clock = clock
         self.blobs = FakeBlobService(blob_dir)
@@ -174,7 +179,13 @@ class Bench:
             identity_service=self.identity,
             sealer=self.sealer,
             new_session=new_session,
+            notifier=self,
         )
+
+    def envelope_event(self, db: Session, *, event: WebhookEvent, envelope: EnvelopeView) -> None:
+        """``EnvelopeNotifier``: remember what the service asked to have announced."""
+        _ = db
+        self.notified.append((event, envelope))
 
     # -- setup -------------------------------------------------------------
 
@@ -277,16 +288,17 @@ class Bench:
         db: Session,
         signer_id: UUID,
         *,
-        method: str = "password",
+        method: AuthMethod = "password",
         kiosk: KioskContext | None = None,
     ) -> SessionInfo:
         auth = AuthContext(method=method, auth_time=self.clock.now() - timedelta(minutes=1))
         _token, info = self.identity.create_session(db, signer_id=signer_id, auth=auth, kiosk=kiosk, ctx=CTX)
         return info
 
-    def reauth(self, db: Session, session: SessionInfo, method: str = "password+mfa") -> None:
+    def reauth(self, db: Session, session: SessionInfo, method: AuthMethod = "password+mfa") -> None:
         self.identity.attest_reauth(
             db,
+            host=Host(id=new_id(), name="unchecked by the fake", allowed_origins=()),
             session_id=session.id,
             auth=AuthContext(method=method, auth_time=self.clock.now()),
         )
@@ -296,7 +308,7 @@ class Bench:
     def ready_to_sign(self, db: Session, session: SessionInfo) -> None:
         """Present, view and consent, which is the precondition ``sign`` insists on."""
         self.service.present(db, session, CTX)
-        self.service.record_viewed(db, session, CTX)
+        self.service.record_viewed(db, session, PAGES, CTX)
         self.service.accept_consent(db, session, CONSENT_VERSION, CTX)
 
     def signer_id(self, view: EnvelopeView, role_key: str) -> UUID:

@@ -108,6 +108,7 @@ class TemplateVersionRow:
     template_id: UUID
     host_id: UUID
     template_key: str
+    template_name: str
     document_type: str
     version: int
     status: str
@@ -445,7 +446,7 @@ def update_signer(
 def load_template_version(db: Session, template_version_id: UUID) -> TemplateVersionRow | None:
     row = db.execute(
         text(
-            "SELECT v.id, v.template_id, t.host_id, t.key AS template_key, t.document_type, "
+            "SELECT v.id, v.template_id, t.host_id, t.key AS template_key, t.name AS template_name, t.document_type, "
             "       v.version, v.status, v.pdf_sha256, v.fields, v.prefill_fields, v.signer_roles "
             "FROM template_versions v JOIN templates t ON t.id = v.template_id WHERE v.id = :id"
         ),
@@ -461,7 +462,7 @@ def find_template_version(db: Session, *, host_id: UUID, key: str, version: int 
     """
     if version is None:
         sql = (
-            "SELECT v.id, v.template_id, t.host_id, t.key AS template_key, t.document_type, "
+            "SELECT v.id, v.template_id, t.host_id, t.key AS template_key, t.name AS template_name, t.document_type, "
             "       v.version, v.status, v.pdf_sha256, v.fields, v.prefill_fields, v.signer_roles "
             "FROM template_versions v JOIN templates t ON t.id = v.template_id "
             "WHERE t.host_id = :host_id AND t.key = :key AND v.status = 'published' "
@@ -470,7 +471,7 @@ def find_template_version(db: Session, *, host_id: UUID, key: str, version: int 
         params: dict[str, Any] = {"host_id": host_id, "key": key}
     else:
         sql = (
-            "SELECT v.id, v.template_id, t.host_id, t.key AS template_key, t.document_type, "
+            "SELECT v.id, v.template_id, t.host_id, t.key AS template_key, t.name AS template_name, t.document_type, "
             "       v.version, v.status, v.pdf_sha256, v.fields, v.prefill_fields, v.signer_roles "
             "FROM template_versions v JOIN templates t ON t.id = v.template_id "
             "WHERE t.host_id = :host_id AND t.key = :key AND v.version = :version"
@@ -486,6 +487,7 @@ def _template_version(row: Any) -> TemplateVersionRow:
         template_id=_uuid(row.template_id),
         host_id=_uuid(row.host_id),
         template_key=str(row.template_key),
+        template_name=str(row.template_name),
         document_type=str(row.document_type),
         version=int(row.version),
         status=str(row.status),

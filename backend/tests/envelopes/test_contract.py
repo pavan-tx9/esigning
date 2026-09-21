@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import inspect
 
+from esign.audit.events import EVENT_DATA_MODELS
 from esign.clock import FixedClock, SystemClock
 from esign.config import Settings
 from esign.contracts import EnvelopeService, EventType
 from esign.envelopes import build_envelope_service
-from esign.envelopes.service import AUDIT_DATA_KEYS, EnvelopeServiceImpl
+from esign.envelopes.service import EnvelopeServiceImpl
 from tests.envelopes.fakes import (
     FakeAuditLog,
     FakeBlobService,
@@ -81,12 +82,16 @@ def test_the_fakes_satisfy_the_protocols_they_stand_in_for() -> None:
     assert all(x is not None for x in (audit, blobs, documents, identity, sealer))
 
 
-def test_declared_audit_data_keys_cover_only_real_event_types() -> None:
-    for event_type in AUDIT_DATA_KEYS:
-        assert isinstance(event_type, EventType)
+def test_the_audit_allowlist_has_one_definition_and_it_is_not_here() -> None:
+    """The envelope module used to keep its own copy of the allowed ``data`` keys, and the copy
+    disagreed with the audit module's. There is now one definition, in ``esign.audit.events``."""
+    import esign.envelopes.service as service_module
+
+    assert not hasattr(service_module, "AUDIT_DATA_KEYS")
+    assert set(EVENT_DATA_MODELS) == set(EventType)
 
 
-def test_may_download_copy_is_offered_alongside_the_protocol() -> None:
-    """The brief asks for it; the Protocol has no room for it, so it is an extra public method."""
-    assert callable(EnvelopeServiceImpl.may_download_copy)
-    assert not hasattr(EnvelopeService, "may_download_copy")
+def test_the_download_gates_are_part_of_the_protocol() -> None:
+    for name in ("may_download_copy", "signer_copy", "sealed_document", "signing_view"):
+        assert callable(getattr(EnvelopeServiceImpl, name))
+        assert hasattr(EnvelopeService, name)

@@ -90,6 +90,7 @@ def certificate_summary(*, signers: int = 2) -> CertificateSummary:
         document_type="procedure_consent",
         template_key="procedure_consent",
         template_version=3,
+        seal_profile="PAdES-B-T",
         presented_sha256=bytes(range(32)),
         final_revision_sha256=bytes(range(32, 64)),
         created_at=datetime(2026, 3, 17, 9, 0, tzinfo=UTC),

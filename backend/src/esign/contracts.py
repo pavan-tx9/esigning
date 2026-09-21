@@ -14,10 +14,11 @@ Conventions:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -69,8 +70,14 @@ class ValidationFailed(EsignError):
 
 
 class RateLimited(EsignError):
+    """``retry_after_seconds`` is set by the limiter when it knows; the API sends it as Retry-After."""
+
     code = "rate_limited"
     http_status = 429
+
+    def __init__(self, message: str = "", *, code: str | None = None, retry_after_seconds: int | None = None) -> None:
+        super().__init__(message, code=code)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class IntegrityFailure(EsignError):
@@ -86,6 +93,32 @@ class SealUnavailable(EsignError):
 
     code = "seal_unavailable"
     http_status = 503
+
+
+class StorageUnavailable(EsignError):
+    """Blob store unreachable, or refusing for a reason that is not about this content.
+    Retryable, exactly like ``SealUnavailable``: nothing may report the document as stored."""
+
+    code = "storage_unavailable"
+    http_status = 503
+
+
+# An identifier the host chose (signer ``host_user_id``, kiosk staff id, ``patient_ref``). It reaches
+# the audit trail as ``actor_user_id`` / ``on_behalf_of``, so it must be opaque: no whitespace (not a
+# name) and not shaped like a date of birth or a social security number. Checked where the value
+# enters the system (envelope creation, session creation) *and* again by the audit log.
+OPAQUE_ID_PATTERN: Final[str] = r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$"
+_OPAQUE_ID_RE: Final = re.compile(OPAQUE_ID_PATTERN)
+_PII_SHAPES: Final = (
+    re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$"),  # a date: 1970-01-01
+    re.compile(r"^\d{1,2}-\d{1,2}-\d{4}$"),  # a date the other way round
+    re.compile(r"^\d{3}-\d{2}-\d{4}$"),  # a US social security number
+)
+
+
+def is_opaque_id(value: str) -> bool:
+    """True when ``value`` looks like an identifier and not like a fact about a person."""
+    return bool(_OPAQUE_ID_RE.match(value)) and not any(shape.match(value) for shape in _PII_SHAPES)
 
 
 # --------------------------------------------------------------------------- template definitions
@@ -132,6 +165,7 @@ class SignerRoleDef:
     allowed_capacities: tuple[Capacity, ...]
     requires_reauth: bool  # True for clinician attestations
     order_index: int  # used when signing_order == "sequential"
+    required: bool = True  # False: an envelope may omit this role (optional witness, interpreter)
 
 
 @dataclass(frozen=True)
@@ -144,12 +178,13 @@ class TemplatePdfInfo:
 # --------------------------------------------------------------------------- documents (esign.documents)
 
 CaptureKind = Literal["drawn", "typed", "click"]
+SealProfile = Literal["PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA"]
 
 
 @dataclass(frozen=True)
 class Capture:
     field_id: str
-    kind: CaptureKind
+    kind: CaptureKind | None = None  # signature and initials fields only; None for checkbox/text
     image_png: bytes | None = None  # sanitized PNG, drawn only
     typed_text: str | None = None  # typed only
     checked: bool | None = None  # checkbox fields
@@ -194,6 +229,7 @@ class CertificateSummary:
     document_type: str
     template_key: str
     template_version: int
+    seal_profile: SealProfile  # the *configured* profile; the one achieved is in document.sealed
     presented_sha256: bytes
     final_revision_sha256: bytes  # last signer-applied revision, before the certificate is appended
     created_at: datetime
@@ -234,14 +270,14 @@ class DocumentService(Protocol):
 
     def build_certificate(self, summary: CertificateSummary) -> bytes: ...
 
+    def page_count(self, pdf: bytes) -> int:
+        """Pages in a PDF this service produced. Raises ValidationFailed if it cannot be read."""
+
     def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
         """Append the certificate pages and return the exact bytes to be sealed."""
 
 
 # --------------------------------------------------------------------------- sealing (esign.sealing)
-
-SealProfile = Literal["PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA"]
-
 
 @dataclass(frozen=True)
 class SealResult:
@@ -264,13 +300,23 @@ class SealValidation:
 
     @property
     def ok(self) -> bool:
-        return self.intact and self.covers_whole_document and self.trusted and self.timestamp_valid
+        # Fail closed: any reported problem denies the seal, whatever the four flags say.
+        return (
+            self.intact
+            and self.covers_whole_document
+            and self.trusted
+            and self.timestamp_valid
+            and not self.problems
+        )
 
 
 class Sealer(Protocol):
     def seal(self, pdf: bytes, *, reason: str, envelope_id: UUID) -> SealResult:
         """Apply the organisation seal as a certification signature that permits no further
-        changes. Raises SealUnavailable for retryable infrastructure failures."""
+        changes. The envelope id is recorded inside the signature dictionary (``/Location``) so
+        the seal is bound to the envelope it completes. Raises ValidationFailed for malformed
+        input and SealUnavailable for retryable infrastructure failures; IntegrityFailure
+        propagates unchanged."""
 
     def validate(self, pdf: bytes) -> SealValidation:
         """Never raises for a bad document: a tampered or unsigned PDF returns a failing result."""
@@ -292,7 +338,10 @@ class BlobRef:
 
 class BlobService(Protocol):
     def put(self, db: Session, data: bytes, *, kind: BlobKind, retain_until: datetime | None = None) -> BlobRef:
-        """Write-once and idempotent by content hash. The backend must refuse to overwrite."""
+        """Write-once and idempotent by content hash. The backend must refuse to overwrite.
+        The caller computes ``retain_until`` (``Settings.retain_until(document_type, now)``); when
+        omitted the configured default retention applies. Raises StorageUnavailable when the
+        backend cannot be reached."""
 
     def get(self, db: Session, sha256: bytes) -> bytes:
         """Re-hashes on read; raises IntegrityFailure on mismatch, NotFound if absent."""
@@ -318,6 +367,7 @@ class EventType(StrEnum):
     REAUTH_ATTESTED = "auth.reauthenticated"
     SIGNER_SIGNED = "signer.signed"
     SIGNER_DECLINED = "signer.declined"
+    ENVELOPE_DECLINED = "envelope.declined"
     ENVELOPE_COMPLETED = "envelope.completed"
     DOCUMENT_FINALIZED = "document.finalized"
     SEAL_FAILED = "seal.failed"
@@ -330,12 +380,15 @@ class EventType(StrEnum):
     VERIFICATION_PERFORMED = "verification.performed"
 
 
+ActorRole = Literal["patient", "clinician", "staff", "host", "system"]
+
+
 @dataclass(frozen=True)
 class Actor:
-    user_id: str | None = None
-    role: str | None = None  # "patient" | "clinician" | "staff" | "host" | "system"
-    capacity: str | None = None
-    on_behalf_of: str | None = None
+    user_id: str | None = None  # opaque (see is_opaque_id)
+    role: ActorRole | None = None
+    capacity: Capacity | None = None
+    on_behalf_of: str | None = None  # opaque
 
 
 @dataclass(frozen=True)
@@ -358,7 +411,7 @@ class AuditEvent:
     actor: Actor
     ctx: RequestContext
     document_sha256: bytes | None
-    data: dict[str, Any]
+    data: dict[str, Any]  # canonical JSON primitives: bytes as lowercase hex, UUIDs and timestamps as strings
     occurred_at: datetime
     prev_event_hash: bytes
     event_hash: bytes
@@ -386,7 +439,12 @@ class AuditLog(Protocol):
         data: dict[str, Any] | None = None,
     ) -> AuditEvent:
         """Serialises writers per stream, assigns the next sequence, chains the hash. ``data`` is
-        validated against a per-event-type allowlist so PHI cannot enter the trail by accident."""
+        validated against a per-event-type allowlist so PHI cannot enter the trail by accident.
+        The allowlist has exactly one definition, ``esign.audit.events.EVENT_DATA_MODELS``; values
+        are passed as Python objects (``bytes`` hashes, ``UUID``, aware ``datetime``) and come back
+        canonicalised. Raises ValidationFailed (``audit_data_invalid``, ``audit_actor_invalid``)
+        for a refused payload, and IntegrityFailure (``audit_clock_regression``) when the clock
+        is behind the head of the stream: a 500-class refusal, not a transient to retry."""
 
     def list(self, db: Session, stream_type: StreamType, stream_id: UUID) -> list[AuditEvent]: ...
 
@@ -403,19 +461,23 @@ class Host:
     allowed_origins: tuple[str, ...]
 
 
+AuthMethod = Literal["password", "password+mfa", "sso", "portal_otp", "pin", "staff_verified"]
+IdentityCheck = Literal["photo_id", "dob_and_name", "known_to_staff", "wristband"]
+
+
 @dataclass(frozen=True)
 class AuthContext:
     """The host's attestation of how the user authenticated. The host backend is trusted because
     it holds the API key; the browser is never the source of these values."""
 
-    method: str  # "password" | "password+mfa" | "sso" | "portal_otp" | "pin" | "staff_verified"
+    method: AuthMethod
     auth_time: datetime
 
 
 @dataclass(frozen=True)
 class KioskContext:
     staff_user_id: str
-    identity_check: str  # "photo_id" | "dob_and_name" | "known_to_staff" | "wristband"
+    identity_check: IdentityCheck
 
 
 @dataclass(frozen=True)
@@ -445,15 +507,24 @@ class IdentityService(Protocol):
         self, db: Session, *, signer_id: UUID, auth: AuthContext, kiosk: KioskContext | None, ctx: RequestContext
     ) -> tuple[str, SessionInfo]:
         """Returns the opaque token exactly once. Revokes any earlier live session for the signer.
-        Rejects an ``auth_time`` older than the configured maximum or in the future."""
+        Rejects an ``auth_time`` older than the configured maximum or in the future. Raises
+        ValidationFailed with code ``auth_too_old``, ``auth_time_in_future``, ``invalid_auth_time``,
+        ``unsupported_auth_method``, ``kiosk_context_required`` or ``invalid_kiosk_context``, and
+        NotFound (``signer_not_found``) for an unknown signer. Writes no audit event: the API
+        layer appends ``session.created`` / ``session.rejected`` (SPEC section 3)."""
 
     def authenticate_session(self, db: Session, bearer: str) -> SessionInfo:
         """Raises Unauthorized for unknown, expired or revoked tokens; all three are indistinguishable
         to the caller."""
 
-    def revoke_sessions(self, db: Session, signer_id: UUID) -> None: ...
+    def revoke_sessions(self, db: Session, signer_id: UUID, *, except_session_id: UUID | None = None) -> int:
+        """Revoke the signer's live sessions, optionally sparing one (the session a signer signed
+        from survives for the copy download). Returns how many were revoked."""
 
-    def attest_reauth(self, db: Session, *, session_id: UUID, auth: AuthContext) -> None: ...
+    def attest_reauth(self, db: Session, *, host: Host, session_id: UUID, auth: AuthContext) -> SessionInfo:
+        """Record the host's re-authentication attestation. A session belonging to another host is
+        NotFound (``session_not_found``), never Forbidden. Returns the session so the caller can
+        append ``auth.reauthenticated`` to the right stream."""
 
     def fresh_reauth(self, db: Session, session_id: UUID) -> AuthContext | None:
         """The most recent attestation if it is within REAUTH_MAX_AGE_SECONDS, else None."""
@@ -474,6 +545,19 @@ EnvelopeStatus = Literal[
     "created", "in_progress", "completed_pending_seal", "sealed", "declined", "voided", "expired"
 ]
 SignerStatus = Literal["pending", "viewed", "consented", "signed", "declined"]
+
+
+#: SPEC section 9: signers decline with one of these, never with free text.
+DECLINE_REASON_CODES: Final[tuple[str, ...]] = (
+    "prefers_paper",
+    "needs_more_time",
+    "disagrees_with_terms",
+    "needs_interpreter",
+    "incorrect_information",
+    "not_the_right_signer",
+    "wants_to_ask_a_question",
+    "other",
+)
 
 
 @dataclass(frozen=True)
@@ -524,6 +608,48 @@ class EnvelopeView:
     expires_at: datetime
     supersedes_envelope_id: UUID | None
     superseded_by_envelope_id: UUID | None
+    current_revision_sha256: bytes | None = None
+    created_at: datetime | None = None
+    host_id: UUID | None = None
+
+
+@dataclass(frozen=True)
+class SigningFieldView:
+    id: str
+    type: FieldType
+    page: int
+    rect: Rect
+    required: bool
+    label: str
+
+
+@dataclass(frozen=True)
+class SigningView:
+    """Everything the signing UI needs for one session (SPEC section 9, ``GET /v1/signing/session``)."""
+
+    envelope_id: UUID
+    envelope_status: EnvelopeStatus
+    document_type: str
+    title: str
+    page_count: int
+    expires_at: datetime
+    signer: SignerView
+    on_behalf_of_label: str | None
+    reauth_valid_until: datetime | None
+    other_signers: tuple[tuple[str, SignerStatus], ...]  # (role_label, status); never a name
+    fields: tuple[SigningFieldView, ...]  # this signer's fields only
+
+
+WebhookEvent = Literal[
+    "envelope.completed", "envelope.sealed", "envelope.declined", "envelope.voided", "envelope.expired"
+]
+
+
+class EnvelopeNotifier(Protocol):
+    def envelope_event(self, db: Session, *, event: WebhookEvent, envelope: EnvelopeView) -> None:
+        """Called by the envelope service inside the transaction that made the change, so a
+        notification is queued if and only if the change commits. Payloads carry ids, statuses
+        and hashes only."""
 
 
 class EnvelopeService(Protocol):
@@ -542,9 +668,16 @@ class EnvelopeService(Protocol):
     def present(self, db: Session, session: SessionInfo, ctx: RequestContext) -> bytes:
         """Returns the current revision bytes and records document.presented with its hash."""
 
-    def record_viewed(self, db: Session, session: SessionInfo, ctx: RequestContext) -> None: ...
+    def signing_view(self, db: Session, session: SessionInfo) -> SigningView: ...
 
-    def accept_consent(self, db: Session, session: SessionInfo, consent_version: str, ctx: RequestContext) -> None: ...
+    def record_viewed(self, db: Session, session: SessionInfo, pages_viewed: int, ctx: RequestContext) -> None:
+        """``pages_viewed`` must equal the page count of the bytes this session was served."""
+
+    def accept_consent(
+        self, db: Session, session: SessionInfo, consent_version: str, ctx: RequestContext, *, locale: str | None = None
+    ) -> None:
+        """``locale`` is the language the signer read the disclosure in; the consent recorded is
+        the current text for that locale (falling back to the default locale)."""
 
     def sign(self, db: Session, session: SessionInfo, captures: list[Capture], ctx: RequestContext) -> EnvelopeView:
         """Requires viewed + consented, and a fresh re-authentication when the role demands it.
@@ -554,11 +687,26 @@ class EnvelopeService(Protocol):
     def decline(self, db: Session, session: SessionInfo, reason_code: str, ctx: RequestContext) -> EnvelopeView: ...
 
     def void(self, db: Session, host: Host, envelope_id: UUID, reason_code: str, ctx: RequestContext) -> EnvelopeView:
-        """Only before sealing. A sealed envelope is corrected by creating a new envelope with
+        """Only while ``created`` or ``in_progress``. An envelope that is complete and waiting for
+        its seal cannot be voided: it stays pending until the seal succeeds (fail closed). A sealed envelope is corrected by creating a new envelope with
         ``supersedes_envelope_id``; the sealed document itself is never touched."""
 
     def expire_due(self, db: Session) -> int: ...
 
     def seal_pending(self, db: Session, envelope_id: UUID) -> EnvelopeView:
         """Build certificate, finalize, seal, validate the result, store, mark sealed. Raises
-        SealUnavailable (after recording seal.failed) so the job runner can back off."""
+        SealUnavailable or StorageUnavailable so the job runner can back off. Before raising it
+        records ``seal.failed`` and the job's backoff in a *separate, committed* transaction
+        (the ``new_session`` factory given at construction), because the caller is about to roll
+        ``db`` back and the evidence of the failure has to survive that."""
+
+    def may_download_copy(self, db: Session, session: SessionInfo) -> bool: ...
+
+    def signer_copy(self, db: Session, session: SessionInfo, ctx: RequestContext) -> bytes | None:
+        """The sealed PDF for a signer who has signed, recording document.downloaded. ``None``
+        while the envelope is ``completed_pending_seal``. Conflict (``envelope_not_complete``)
+        while other signers are outstanding; Forbidden for a signer who has not signed."""
+
+    def sealed_document(self, db: Session, host: Host, envelope_id: UUID, ctx: RequestContext) -> bytes:
+        """The sealed PDF for the host, recording document.downloaded. Conflict (``not_sealed``)
+        until the envelope is sealed."""

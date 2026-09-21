@@ -13,7 +13,6 @@ from a sibling module arrives as a Protocol through the constructor.
 from __future__ import annotations
 
 from esign.envelopes.service import (
-    AUDIT_DATA_KEYS,
     DECLINE_REASON_CODES,
     EnvelopeServiceImpl,
     SessionScope,
@@ -32,7 +31,6 @@ from esign.envelopes.state import (
 )
 
 __all__ = [
-    "AUDIT_DATA_KEYS",
     "DECLINE_REASON_CODES",
     "SEAL_BACKOFF_SCHEDULE",
     "Command",

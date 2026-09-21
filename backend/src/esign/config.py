@@ -115,7 +115,26 @@ class Settings(BaseSettings):
     max_template_pages: int = 50
     max_signature_png_bytes: int = 1024 * 1024
     max_signature_png_pixels: int = 4_000_000
+    #: Per-axis bounds. A 4000x1 image passes the byte and pixel limits and is not a signature,
+    #: and a per-axis bound is the cheapest guard against a header-declared bomb.
+    max_signature_png_dimension: int = 4000
+    min_signature_png_dimension: int = 8
     max_request_bytes: int = 8 * 1024 * 1024
+    #: Everything except a template upload is small JSON.
+    max_json_body_bytes: int = 2 * 1024 * 1024
+
+    # ----------------------------------------------------------------- api and worker
+    #: The built signing UI (``bun run build``). Served at /sign when the directory exists.
+    frontend_dist_dir: Path = _REPO_BACKEND_DIR.parent / "frontend" / "dist"
+    #: Hosts' ``templates/`` directory for ``esign templates import``.
+    templates_dir: Path = _REPO_BACKEND_DIR.parent / "templates"
+    worker_poll_seconds: float = 5.0
+    #: A seal job claimed longer ago than this is assumed abandoned by a dead worker.
+    seal_job_lock_timeout_seconds: int = 600
+    webhook_timeout_seconds: float = 10.0
+    webhook_max_attempts: int = 12
+    #: Idempotency keys are kept this long; a replay after that is treated as a new request.
+    idempotency_ttl_hours: int = 48
 
     # ----------------------------------------------------------------- validators
     @field_validator("trusted_proxy_cidrs", "approved_document_types", mode="before")

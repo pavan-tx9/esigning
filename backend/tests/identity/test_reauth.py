@@ -19,10 +19,10 @@ from sqlalchemy.orm import Session
 
 from esign.clock import FixedClock
 from esign.config import Settings
-from esign.contracts import AuthContext, Conflict, NotFound, RequestContext, ValidationFailed
+from esign.contracts import AuthContext, Conflict, Host, NotFound, RequestContext, ValidationFailed
 from esign.identity import SqlIdentityService
 from esign.ids import new_id
-from tests.identity.factories import SignerFixture, make_signer
+from tests.identity.factories import SignerFixture, host_of, make_signer
 
 CTX = RequestContext(ip="203.0.113.9", user_agent="test-agent")
 
@@ -54,7 +54,9 @@ def test_an_attestation_is_fresh_inside_the_window(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture, settings: Settings
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
 
     fresh = identity.fresh_reauth(db, session_id)
     assert fresh is not None
@@ -72,9 +74,11 @@ def test_the_newest_usable_attestation_wins(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("pin", clock.now()))
+    identity.attest_reauth(db, host=host_of(signer), session_id=session_id, auth=AuthContext("pin", clock.now()))
     clock.advance(30)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
 
     fresh = identity.fresh_reauth(db, session_id)
     assert fresh is not None
@@ -87,7 +91,10 @@ def test_an_attestation_in_the_future_is_refused(
     session_id = _session_id(db, clock, identity, signer)
     with pytest.raises(ValidationFailed) as caught:
         identity.attest_reauth(
-            db, session_id=session_id, auth=AuthContext("password+mfa", clock.now() + timedelta(seconds=1))
+            db,
+            host=host_of(signer),
+            session_id=session_id,
+            auth=AuthContext("password+mfa", clock.now() + timedelta(seconds=1)),
         )
     assert caught.value.code == "auth_time_in_future"
 
@@ -99,7 +106,7 @@ def test_an_attestation_older_than_the_window_is_refused_at_the_door(
     session_id = _session_id(db, clock, identity, signer)
     stale = clock.now() - timedelta(seconds=settings.reauth_max_age_seconds + 1)
     with pytest.raises(ValidationFailed) as caught:
-        identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", stale))
+        identity.attest_reauth(db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", stale))
     assert caught.value.code == "auth_too_old"
 
 
@@ -111,7 +118,9 @@ def test_an_attestation_that_predates_the_session_is_refused(
     session_id = _session_id(db, clock, identity, signer)
     earlier = clock.now() - timedelta(seconds=30)
     with pytest.raises(ValidationFailed) as caught:
-        identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", earlier))
+        identity.attest_reauth(
+            db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", earlier)
+        )
     assert caught.value.code == "reauth_predates_session"
 
 
@@ -159,7 +168,9 @@ def test_a_future_row_does_not_hide_a_good_one(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
     db.execute(
         text(
             "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at) "
@@ -197,13 +208,18 @@ def test_an_unrecognised_method_is_refused(
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
     with pytest.raises(ValidationFailed) as caught:
-        identity.attest_reauth(db, session_id=session_id, auth=AuthContext(method, clock.now()))
+        identity.attest_reauth(db, host=host_of(signer), session_id=session_id, auth=AuthContext(method, clock.now()))  # type: ignore[arg-type]  # deliberately outside the Literal
     assert caught.value.code == "unsupported_auth_method"
 
 
 def test_an_unknown_session_cannot_be_attested(db: Session, clock: FixedClock, identity: SqlIdentityService) -> None:
     with pytest.raises(NotFound) as caught:
-        identity.attest_reauth(db, session_id=new_id(), auth=AuthContext("password+mfa", clock.now()))
+        identity.attest_reauth(
+            db,
+            host=Host(id=new_id(), name="x", allowed_origins=()),
+            session_id=new_id(),
+            auth=AuthContext("password+mfa", clock.now()),
+        )
     assert caught.value.code == "session_not_found"
 
 
@@ -217,7 +233,9 @@ def test_a_revoked_session_cannot_be_refreshed(
     session_id = _session_id(db, clock, identity, signer)
     identity.revoke_sessions(db, signer.signer_id)
     with pytest.raises(Conflict) as caught:
-        identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+        identity.attest_reauth(
+            db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+        )
     assert caught.value.code == "session_not_live"
 
 
@@ -227,7 +245,9 @@ def test_an_expired_session_cannot_be_refreshed(
     session_id = _session_id(db, clock, identity, signer)
     clock.advance(settings.session_ttl_seconds)
     with pytest.raises(Conflict) as caught:
-        identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+        identity.attest_reauth(
+            db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+        )
     assert caught.value.code == "session_not_live"
 
 
@@ -238,7 +258,7 @@ def test_an_attestation_belongs_to_one_session_only(
     first = _session_id(db, clock, identity, signer)
     second = _session_id(db, clock, identity, other)
 
-    identity.attest_reauth(db, session_id=first, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(db, host=host_of(signer), session_id=first, auth=AuthContext("password+mfa", clock.now()))
 
     assert identity.fresh_reauth(db, first) is not None
     assert identity.fresh_reauth(db, second) is None
@@ -248,7 +268,7 @@ def test_a_new_session_does_not_inherit_the_old_sessions_attestation(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     first = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=first, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(db, host=host_of(signer), session_id=first, auth=AuthContext("password+mfa", clock.now()))
     clock.advance(10)
     second = _session_id(db, clock, identity, signer)
     assert identity.fresh_reauth(db, second) is None
@@ -258,7 +278,9 @@ def test_the_stored_attestation_is_timed_by_the_clock(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
     attested_at = db.execute(
         text("SELECT attested_at FROM reauth_attestations WHERE session_id = :id"), {"id": session_id}
     ).scalar_one()
@@ -269,7 +291,9 @@ def test_the_app_role_cannot_rewrite_an_attestation(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
 
     for statement in (
         "UPDATE reauth_attestations SET auth_time = now() WHERE session_id = :id",
@@ -315,7 +339,9 @@ def test_a_revoked_session_has_no_fresh_reauth(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
     assert identity.fresh_reauth(db, session_id) is not None
 
     identity.revoke_sessions(db, signer.signer_id)
@@ -330,7 +356,9 @@ def test_an_expired_session_has_no_fresh_reauth(
         settings.model_copy(update={"reauth_max_age_seconds": settings.session_ttl_seconds * 10}), clock
     )
     session_id = _session_id(db, clock, long_window, signer)
-    long_window.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    long_window.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
 
     clock.advance(settings.session_ttl_seconds)
     assert long_window.fresh_reauth(db, session_id) is None
@@ -340,7 +368,9 @@ def test_an_unusable_row_does_not_mask_an_earlier_good_one(
     db: Session, clock: FixedClock, identity: SqlIdentityService, signer: SignerFixture
 ) -> None:
     session_id = _session_id(db, clock, identity, signer)
-    identity.attest_reauth(db, session_id=session_id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(
+        db, host=host_of(signer), session_id=session_id, auth=AuthContext("password+mfa", clock.now())
+    )
     clock.advance(10)
     db.execute(
         text(

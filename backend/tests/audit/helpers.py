@@ -105,6 +105,7 @@ _SAMPLES: dict[EventType, Callable[[], dict[str, Any]]] = {
         "consent_version": "2026-09",
         "reauth_used": False,
         "presented_sha256": DIGEST_A,
+        "base_revision_sha256": DIGEST_A,
         "revision_no": 2,
         "revision_sha256": DIGEST_B,
         "capture_count": 2,
@@ -116,6 +117,10 @@ _SAMPLES: dict[EventType, Callable[[], dict[str, Any]]] = {
     EventType.SIGNER_DECLINED: lambda: {
         "signer_id": UUID_A,
         "role_key": "patient",
+        "reason_code": "prefers_paper",
+    },
+    EventType.ENVELOPE_DECLINED: lambda: {
+        "signer_id": UUID_A,
         "reason_code": "prefers_paper",
     },
     EventType.ENVELOPE_COMPLETED: lambda: {

@@ -166,7 +166,7 @@ def signer_roles_from_json(value: Any, path: str = "signer_roles") -> list[Signe
     out: list[SignerRoleDef] = []
     for index, item in enumerate(_sequence(value, path)):
         here = f"{path}[{index}]"
-        raw = _mapping(item, here, _ROLE_KEYS, _ROLE_KEYS)
+        raw = _mapping(item, here, _ROLE_KEYS | {"required"}, _ROLE_KEYS)
         capacities: list[Capacity] = []
         for position, capacity in enumerate(_sequence(raw["allowed_capacities"], f"{here}.allowed_capacities")):
             name = _string(capacity, f"{here}.allowed_capacities[{position}]")
@@ -180,6 +180,7 @@ def signer_roles_from_json(value: Any, path: str = "signer_roles") -> list[Signe
                 allowed_capacities=tuple(capacities),
                 requires_reauth=_boolean(raw["requires_reauth"], f"{here}.requires_reauth"),
                 order_index=_integer(raw["order_index"], f"{here}.order_index"),
+                required=_boolean(raw["required"], f"{here}.required") if "required" in raw else True,
             )
         )
     return out
@@ -240,6 +241,7 @@ def signer_roles_to_json(signer_roles: list[SignerRoleDef]) -> list[dict[str, An
             "allowed_capacities": list(role.allowed_capacities),
             "requires_reauth": role.requires_reauth,
             "order_index": role.order_index,
+            "required": role.required,
         }
         for role in signer_roles
     ]

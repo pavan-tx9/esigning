@@ -34,6 +34,7 @@ VECTOR_FIELDS: dict[str, Any] = {
             "consent_version": "2026-09",
             "reauth_used": False,
             "presented_sha256": bytes.fromhex("3b1f8c2d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e"),
+            "base_revision_sha256": bytes.fromhex("3b1f8c2d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e"),
             "revision_no": 2,
             "revision_sha256": bytes.fromhex("9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f"),
             "capture_count": 1,

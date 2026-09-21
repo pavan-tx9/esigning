@@ -35,9 +35,11 @@ from esign.identity.consent_texts import (
 from esign.identity.hosts import (
     create_host,
     disable_host,
+    embedding_origins,
     normalise_origin,
     rotate_host_key,
     rotate_webhook_secret,
+    webhook_target,
 )
 from esign.identity.ratelimit import Limit, RateLimits, SlidingWindowRateLimiter, host_key, ip_key, session_key
 from esign.identity.service import AUTH_METHODS, IDENTITY_CHECKS, SqlIdentityService
@@ -61,6 +63,7 @@ __all__ = [
     "client_ip",
     "create_host",
     "disable_host",
+    "embedding_origins",
     "host_key",
     "ip_key",
     "normalise_locale",
@@ -70,6 +73,7 @@ __all__ = [
     "rotate_webhook_secret",
     "seed_default_consent",
     "session_key",
+    "webhook_target",
 ]
 
 

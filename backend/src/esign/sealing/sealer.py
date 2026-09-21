@@ -83,7 +83,7 @@ _FUTURE_TIMESTAMP_TOLERANCE: Final = timedelta(minutes=5)
 _LONG_TERM_PROFILES: Final[frozenset[str]] = frozenset({"PAdES-B-LT", "PAdES-B-LTA"})
 
 #: Problems that mean "this document is not locked down", which is what ``covers_whole_document``
-#: asserts. See the note where it is set: the contract's ``ok`` reads the flags, not the problems.
+#: asserts. See the note where it is set.
 _STRUCTURAL: Final[frozenset[str]] = frozenset(
     {
         Problem.MULTIPLE_SIGNATURES,
@@ -119,6 +119,8 @@ class PadesSealer:
                 field_name=SEAL_FIELD_NAME,
                 md_algorithm=_MD_ALGORITHM,
                 reason=clean_reason,
+                # Binds the seal to the envelope it completes: the id is inside the signed bytes.
+                location=f"envelope:{envelope_id}",
                 subfilter=SigSeedSubFilter.PADES,
                 certify=True,
                 docmdp_permissions=MDPPerm.NO_CHANGES,
@@ -240,10 +242,10 @@ class PadesSealer:
 
         return SealValidation(
             intact=intact,
-            # ``SealValidation.ok`` is computed from the four flags alone, so a problem that has
-            # no flag of its own would come back "ok" with a complaint attached. The problems in
-            # _STRUCTURAL all say the same thing -- the document is not locked against further
-            # change -- so they clear this flag rather than being reported and ignored.
+            # ``SealValidation.ok`` already refuses any result that carries a problem. The problems
+            # in _STRUCTURAL additionally clear this flag, because they all say the same thing --
+            # the document is not locked against further change -- and a reader of the flags alone
+            # should see that too.
             covers_whole_document=covers and not any(problem in _STRUCTURAL for problem in problems),
             trusted=trusted,
             timestamp_valid=timestamp_valid,

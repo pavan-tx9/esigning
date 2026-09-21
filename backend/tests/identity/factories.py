@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from esign.clock import FixedClock
+from esign.contracts import Host
 from esign.ids import new_id
 
 #: Deliberately recognisable: several tests assert this string never reaches a log line.
@@ -138,3 +139,8 @@ def live_session_count(db: Session, signer_id: UUID) -> int:
             {"id": signer_id},
         ).scalar_one()
     )
+
+
+def host_of(fixture: SignerFixture) -> Host:
+    """The ``Host`` the API would have authenticated for this fixture's envelope."""
+    return Host(id=fixture.host_id, name="Test EHR", allowed_origins=())

@@ -20,7 +20,6 @@ allowed to reach a log and the value is exactly the thing we suspect of being PH
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any, Final, Literal, get_args
@@ -30,7 +29,15 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from pydantic.functional_validators import AfterValidator
 
 from esign.audit.canonical import canonical_value
-from esign.contracts import BlobKind, Capacity, EventType, SealProfile, ValidationFailed
+from esign.contracts import (
+    OPAQUE_ID_PATTERN,
+    BlobKind,
+    Capacity,
+    EventType,
+    SealProfile,
+    ValidationFailed,
+    is_opaque_id,
+)
 
 __all__ = [
     "ACTOR_ROLES",
@@ -71,24 +78,9 @@ VersionLabel = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9
 Locale = Annotated[str, StringConstraints(pattern=r"^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$")]
 
 #: An identifier the host chose: a signer's host user id, a staff user id, a patient reference.
-#: Opaque to us, and -- because whitespace is forbidden -- not a human name.
-OPAQUE_ID_PATTERN: Final[str] = r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$"
-
-#: Shapes that are never an identifier. The pattern above allows digits and hyphens, which is what
-#: a date of birth and a US social security number are made of, so those two shapes are named and
-#: refused outright. A numeric id (``1187``) is still perfectly acceptable.
-_PII_SHAPES: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$"),  # a date: 1970-01-01
-    re.compile(r"^\d{1,2}-\d{1,2}-\d{4}$"),  # a date the other way round: 01-01-1970
-    re.compile(r"^\d{3}-\d{2}-\d{4}$"),  # a US social security number
-)
-
-_OPAQUE_ID_RE: Final[re.Pattern[str]] = re.compile(OPAQUE_ID_PATTERN)
-
-
-def is_opaque_id(value: str) -> bool:
-    """True when ``value`` looks like an identifier and not like a fact about a person."""
-    return bool(_OPAQUE_ID_RE.match(value)) and not any(shape.match(value) for shape in _PII_SHAPES)
+#: Opaque to us, and -- because whitespace is forbidden -- not a human name. The pattern and the
+#: refused shapes (dates, social security numbers) have one definition, in ``esign.contracts``, so
+#: the modules that accept these values check them the same way the trail does.
 
 
 def _check_opaque(value: str) -> str:
@@ -121,7 +113,9 @@ Seconds = Annotated[int, Field(ge=0, le=31_536_000)]
 AuthMethod = Literal["password", "password+mfa", "sso", "portal_otp", "pin", "staff_verified"]
 IdentityCheck = Literal["photo_id", "dob_and_name", "known_to_staff", "wristband"]
 SigningOrder = Literal["sequential", "parallel"]
-CaptureKindName = Literal["drawn", "typed", "click"]
+#: How a field was filled: the three signature capture kinds, or the field type for the two
+#: non-signature fields (which carry no capture kind on the wire).
+CaptureKindName = Literal["drawn", "typed", "click", "checkbox", "text"]
 RevisionKind = Literal["presented", "signer_applied", "final_unsealed", "sealed"]
 Audience = Literal["signer", "host"]
 KeyBackend = Literal["local", "aws_kms"]
@@ -240,7 +234,11 @@ class SignerSignedData(EventData):
     capacity: Capacity
     consent_version: VersionLabel
     reauth_used: bool
+    reauth_method: AuthMethod | None = None
+    #: What this signer was shown, what they signed on top of, and what came out. In a parallel
+    #: envelope another signer may move the document between the first two; that has to be visible.
     presented_sha256: Sha256
+    base_revision_sha256: Sha256
     revision_no: Ordinal
     revision_sha256: Sha256
     capture_count: Ordinal
@@ -252,6 +250,13 @@ class SignerSignedData(EventData):
 class SignerDeclinedData(EventData):
     signer_id: UUID
     role_key: Slug
+    reason_code: Slug
+
+
+class EnvelopeDeclinedData(EventData):
+    """The envelope-level fact that follows a signer's decline: the envelope itself is over."""
+
+    signer_id: UUID
     reason_code: Slug
 
 
@@ -338,6 +343,7 @@ EVENT_DATA_MODELS: Final[Mapping[EventType, type[EventData]]] = {
     EventType.REAUTH_ATTESTED: ReauthAttestedData,
     EventType.SIGNER_SIGNED: SignerSignedData,
     EventType.SIGNER_DECLINED: SignerDeclinedData,
+    EventType.ENVELOPE_DECLINED: EnvelopeDeclinedData,
     EventType.ENVELOPE_COMPLETED: EnvelopeCompletedData,
     EventType.DOCUMENT_FINALIZED: DocumentFinalizedData,
     EventType.SEAL_FAILED: SealFailedData,

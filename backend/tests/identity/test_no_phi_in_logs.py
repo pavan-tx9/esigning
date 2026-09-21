@@ -17,7 +17,7 @@ from esign.clock import FixedClock
 from esign.contracts import AuthContext, KioskContext, RequestContext, Unauthorized
 from esign.identity import SqlIdentityService, add_consent_text, create_host
 from esign.logging import configure_logging
-from tests.identity.factories import SIGNER_DISPLAY_NAME, make_signer
+from tests.identity.factories import SIGNER_DISPLAY_NAME, host_of, make_signer
 
 STAFF_ID = "nurse-priya-raman"
 
@@ -41,7 +41,7 @@ def test_a_full_identity_flow_logs_no_name_token_or_key(
         ctx=RequestContext(ip="203.0.113.9", user_agent="Mozilla/5.0 (iPad)"),
     )
     identity.authenticate_session(db, token)
-    identity.attest_reauth(db, session_id=info.id, auth=AuthContext("password+mfa", clock.now()))
+    identity.attest_reauth(db, host=host_of(signer), session_id=info.id, auth=AuthContext("password+mfa", clock.now()))
     identity.fresh_reauth(db, info.id)
     identity.current_consent(db, "en-US")
     with pytest.raises(Unauthorized):

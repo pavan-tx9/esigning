@@ -27,9 +27,11 @@ __all__ = [
     "authenticate_host",
     "create_host",
     "disable_host",
+    "embedding_origins",
     "normalise_origin",
     "rotate_host_key",
     "rotate_webhook_secret",
+    "webhook_target",
 ]
 
 _MAX_NAME_CHARS: Final = 200
@@ -178,6 +180,33 @@ def rotate_webhook_secret(db: Session, host_id: UUID) -> bytes:
     if updated is None:
         raise NotFound("host", code="host_not_found")
     return secret
+
+
+def webhook_target(db: Session, host_id: UUID) -> tuple[str, bytes] | None:
+    """Where, and with which secret, to deliver this host's webhooks. ``None`` when the host has no
+    webhook configured or has been disabled: nothing is sent to a host that can no longer call us."""
+    row = (
+        db.execute(
+            text("SELECT webhook_url, webhook_secret FROM hosts WHERE id = :id AND disabled_at IS NULL"),
+            {"id": host_id},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None or row["webhook_url"] is None or row["webhook_secret"] is None:
+        return None
+    return str(row["webhook_url"]), bytes(row["webhook_secret"])
+
+
+def embedding_origins(db: Session, host_id: UUID) -> tuple[str, ...] | None:
+    """The origins allowed to frame the signing UI for this host; ``None`` for an unknown or
+    disabled host (the API then answers ``frame-ancestors 'none'``)."""
+    row = (
+        db.execute(text("SELECT allowed_origins FROM hosts WHERE id = :id AND disabled_at IS NULL"), {"id": host_id})
+        .mappings()
+        .first()
+    )
+    return None if row is None else tuple(str(origin) for origin in row["allowed_origins"] or ())
 
 
 def disable_host(db: Session, host_id: UUID, *, clock: Clock) -> None:

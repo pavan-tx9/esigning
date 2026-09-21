@@ -252,7 +252,7 @@ def test_an_unknown_actor_role_is_refused(db: Session, audit: AuditLog) -> None:
             stream_type="envelope",
             stream_id=uuid4(),
             event_type=EventType.ENVELOPE_CREATED,
-            actor=Actor(role="administrator"),
+            actor=Actor(role="administrator"),  # type: ignore[arg-type]  # deliberately outside the Literal
             data=_created(),
         )
 
@@ -264,7 +264,7 @@ def test_an_unknown_capacity_is_refused(db: Session, audit: AuditLog) -> None:
             stream_type="envelope",
             stream_id=uuid4(),
             event_type=EventType.ENVELOPE_CREATED,
-            actor=Actor(capacity="power_of_attorney"),
+            actor=Actor(capacity="power_of_attorney"),  # type: ignore[arg-type]  # deliberately outside the Literal
             data=_created(),
         )
 

@@ -96,6 +96,7 @@
       "key": "patient",
       "label": "Patient or guardian",
       "order_index": 0,
+      "required": true,
       "requires_reauth": false
     }
   ]
