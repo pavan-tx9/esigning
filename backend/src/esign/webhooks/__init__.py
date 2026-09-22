@@ -186,12 +186,30 @@ class HttpSender:
     """POSTs with httpx. No redirects: a webhook URL that redirects is a URL we were not given."""
 
     def __init__(self, settings: Settings, *, transport: httpx.BaseTransport | None = None) -> None:
-        self._client = httpx.Client(
-            timeout=settings.webhook_timeout_seconds, follow_redirects=False, transport=transport
+        # Explicit per-phase timeouts. ``webhook_timeout_seconds`` alone is a per-operation bound,
+        # which says nothing about how many operations a trickling response may take.
+        timeout = httpx.Timeout(
+            connect=min(5.0, settings.webhook_timeout_seconds),
+            read=settings.webhook_timeout_seconds,
+            write=settings.webhook_timeout_seconds,
+            pool=5.0,
         )
+        self._client = httpx.Client(timeout=timeout, follow_redirects=False, transport=transport)
 
     def __call__(self, url: str, body: bytes, headers: dict[str, str]) -> int:
-        return self._client.post(url, content=body, headers=headers).status_code
+        """The status code, without reading the response body.
+
+        ``Client.post`` reads the whole body into memory before it returns, and only the status is
+        ever used. A host endpoint answering with gigabytes, or one chunk every few seconds, would
+        otherwise hold the worker's single delivery loop -- delaying seal retries and expiries for
+        every host in the same tick -- and grow its heap while doing it.
+        """
+        request = self._client.build_request("POST", url, content=body, headers=headers)
+        response = self._client.send(request, stream=True)
+        try:
+            return response.status_code
+        finally:
+            response.close()
 
     def close(self) -> None:
         self._client.close()

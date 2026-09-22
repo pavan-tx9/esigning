@@ -445,8 +445,15 @@ def test_checkbox_and_text_fields_carry_their_values(bench: Bench, db: Session) 
     assert "patient_ack:None" in stamped
     assert "patient_note:None" in stamped
     signed = next(e for e in bench.audit.list(db, "envelope", result.id) if str(e.event_type) == "signer.signed")
-    assert {"field_id": "patient_ack", "kind": "checkbox"} in signed.data["captures"]
-    assert {"field_id": "patient_note", "kind": "text"} in signed.data["captures"]
+    by_field = {str(c["field_id"]): c for c in signed.data["captures"]}
+    assert by_field["patient_ack"]["kind"] == "checkbox"
+    assert by_field["patient_note"]["kind"] == "text"
+    # A value field has nothing to digest: the value itself is in the PDF and under the revision hash.
+    for field_id in ("patient_ack", "patient_note"):
+        assert by_field[field_id]["image_sha256"] is None
+        assert by_field[field_id]["typed_text_sha256"] is None
+    # The drawn signature's image, on the other hand, is tied to the chain by its digest.
+    assert by_field["patient_sig"]["image_sha256"] is not None
 
 
 def test_a_checkbox_without_a_value_is_refused(bench: Bench, db: Session) -> None:

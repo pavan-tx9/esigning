@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 from datetime import timedelta
 
 import structlog
@@ -111,12 +112,26 @@ def test_no_log_line_in_a_full_run_contains_a_name_or_a_prefill_value(ehr: Ehr, 
         refuser = ehr.open_session(declined, "patient")
         refuser.get("/document")
         assert refuser.post("/decline", {"reason_code": "prefers_paper"}).status_code == 200
+
+        # Records that arrive through the *stdlib* logger -- SQLAlchemy, httpx, pypdf, uvicorn --
+        # used to be rendered verbatim by ``logging.basicConfig(format="%(message)s")``, with no
+        # allowlist at all. They go through the same chain now.
+        logging.getLogger("sqlalchemy.engine.Engine").warning(
+            "third party line", extra={"patient_name": PATIENT_NAME, "envelope_id": envelope["id"]}
+        )
+        # And the echo, which is the one that would carry bound parameters, is held at WARNING.
+        assert logging.getLogger("sqlalchemy.engine").getEffectiveLevel() >= logging.WARNING
+        logging.getLogger("sqlalchemy.engine").info("SELECT ... %s", PATIENT_NAME)
     finally:
         structlog.reset_defaults()
         configure_logging(level="INFO", app_env="test")
 
     lines = [json.loads(line) for line in buffer.getvalue().splitlines() if line.startswith("{")]
     events = {str(line["event"]) for line in lines}
+    # The stdlib line arrived, through the same allowlist, with its unlisted key dropped.
+    foreign = next(line for line in lines if line["event"] == "third party line")
+    assert "patient_name" not in foreign
+    assert foreign["envelope_id"] == envelope["id"]
     assert {
         "envelope.created",
         "signer.signed",
@@ -145,6 +160,10 @@ def test_no_log_line_in_a_full_run_contains_a_name_or_a_prefill_value(ehr: Ehr, 
     for secret in forbidden:
         assert secret not in rendered, f"a log line carried {secret[:6]}..."
     for line in lines:
+        if line["event"] == "third party line":
+            # The one line here that deliberately tried: it says so and the value is gone.
+            assert line["dropped_fields"] == ["patient_name"]
+            continue
         assert "dropped_fields" not in line, line  # nothing even *tried* to log an unlisted key
         assert set(line) <= LOGGABLE_KEYS | RESERVED_KEYS, line
 

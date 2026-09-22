@@ -22,10 +22,20 @@ const tokenSchema = z
   .max(512)
   .regex(/^est_[A-Za-z0-9._~-]+$/);
 
+/**
+ * A BCP 47 language tag, which is all `?locale=` on the Signer API will take (the server refuses
+ * anything else). A host that sends junk here loses its choice of disclosure language, not its
+ * session: the tag is dropped and the default locale is served.
+ */
+const localeSchema = z
+  .string()
+  .max(35)
+  .regex(/^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$/);
+
 const initSchema = z.object({
   type: z.literal("esign:init"),
   token: tokenSchema,
-  locale: z.string().max(35).optional(),
+  locale: localeSchema.optional().catch(undefined),
 });
 
 const reauthDoneSchema = z.object({ type: z.literal("esign:reauth_done") });

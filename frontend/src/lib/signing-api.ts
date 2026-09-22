@@ -94,10 +94,20 @@ export const signingKeys = {
   copy: ["signing", "copy"] as const,
 };
 
-export const sessionQueryOptions = () =>
+/**
+ * The session, in the language the host page asked for (SPEC section 9: `?locale=` picks the
+ * disclosure language, falling back to the default locale). The locale is part of the key, so the
+ * disclosure the signer read and the one the cache holds can never be two different texts.
+ */
+export const sessionQueryOptions = (locale?: string | null) =>
   queryOptions({
-    queryKey: signingKeys.session,
-    queryFn: ({ signal }) => api("/signing/session", sessionSchema, { signal }),
+    queryKey: locale ? [...signingKeys.session, locale] : signingKeys.session,
+    queryFn: ({ signal }) =>
+      api(
+        locale ? `/signing/session?locale=${encodeURIComponent(locale)}` : "/signing/session",
+        sessionSchema,
+        { signal },
+      ),
   });
 
 // --------------------------------------------------------------------------- document
@@ -179,9 +189,13 @@ export function postViewed(pagesViewed: number) {
   return api("/signing/viewed", ackSchema, { body: { pages_viewed: pagesViewed } });
 }
 
-export function postConsent(consentVersion: string) {
+/**
+ * `locale` is the language of the disclosure as the *server served it* (`consent.locale` in the
+ * session payload), never the host's raw request: the trail has to say which text was accepted.
+ */
+export function postConsent(consentVersion: string, locale: string) {
   return api("/signing/consent", ackSchema, {
-    body: { consent_version: consentVersion, accepted: true },
+    body: { consent_version: consentVersion, accepted: true, locale },
   });
 }
 
@@ -229,6 +243,18 @@ export function isSessionGone(error: unknown): boolean {
 
 export function isNetworkError(error: unknown): boolean {
   return error instanceof ApiNetworkError;
+}
+
+/**
+ * The server will not take this signature because the bytes this session was served are not the
+ * bytes the signer confirmed reading: another signer signed in between, so the document moved on
+ * (SPEC section 3, `signers.viewed_sha256`). It is not a failure and nothing is wrong with the
+ * submission -- the way out is to read the document as it stands now and say so, which is a fresh
+ * `POST /signing/viewed`. The flow has to send the signer back to the review step for that: their
+ * signer status is still `consented`, so nothing else would.
+ */
+export function mustReadAgain(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409 && error.code === "not_viewed";
 }
 
 /** Retry what might work next time (network, 5xx, 429); never a 4xx the server meant. */

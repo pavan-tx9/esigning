@@ -65,11 +65,18 @@ export function DeclinedScreen() {
     <StepScreen
       testId="screen-declined"
       title="You chose not to sign here"
-      lead={<p>That's been noted, and nothing was signed. The clinic has been told.</p>}
+      lead={
+        <>
+          <p>That's been noted, and nothing was signed. The clinic has been told.</p>
+          <p className="mt-2" data-testid="declined-consequence">
+            This document is now closed, so it can't be signed on this screen any more.
+          </p>
+        </>
+      }
     >
       <NextStep>
-        Let a member of staff know you'd like a paper copy, or that you have questions. You can
-        close this page.
+        If you still want to sign, ask a member of staff for a paper copy or for a new one to sign
+        on screen. You can close this page.
       </NextStep>
     </StepScreen>
   );
@@ -131,7 +138,7 @@ export function HandBackScreen({ outcome }: { outcome: "signed" | "declined" }) 
         <p>
           {outcome === "signed"
             ? "Your signature has been recorded. The clinic will give you a copy of the signed document."
-            : "We've let the clinic know you'd like to do this another way."}
+            : "We've let the clinic know you'd like to do this another way. This document is now closed, and staff can give you a new one to sign."}
         </p>
       }
     >

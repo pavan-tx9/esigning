@@ -153,9 +153,42 @@ def test_an_origin_that_is_not_an_origin_is_refused(db: Session, clock: FixedClo
     assert caught.value.code == "invalid_origin"
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        pytest.param("https://ehr.example.org;script-src evil.com", id="a second CSP directive"),
+        pytest.param("https://ehr.example.org'", id="a quote"),
+        pytest.param('https://ehr.example.org"', id="a double quote"),
+        pytest.param("https://ehr.example.org\ttab", id="a tab, which urlsplit silently drops"),
+        pytest.param("https://ehr.example.org%20x", id="a percent escape"),
+        pytest.param("https://ehr.example.org x", id="a bare space"),
+        pytest.param("https://ehr.example.org\nx", id="a newline"),
+        pytest.param("https://ehr.example.org\x00", id="a null byte"),
+        pytest.param("https://-ehr.example.org", id="a label starting with a hyphen"),
+        pytest.param("https://ehr..example.org", id="an empty label"),
+    ],
+)
+def test_an_origin_with_csp_breaking_characters_is_refused(origin: str) -> None:
+    """This value is interpolated verbatim into ``frame-ancestors`` and into a meta tag.
+
+    ``urlsplit`` will happily put ``;``, quotes and ``%`` in a netloc, and it drops a tab -- which
+    yields a *different* origin than the operator typed, stored and trusted. Refused, not stripped.
+    """
+    with pytest.raises(ValidationFailed) as caught:
+        normalise_origin(origin)
+    assert caught.value.code == "invalid_origin"
+
+
 def test_loopback_may_use_http_for_development() -> None:
     assert normalise_origin("http://localhost:5273") == "http://localhost:5273"
     assert normalise_origin("http://127.0.0.1:5273") == "http://127.0.0.1:5273"
+
+
+def test_the_origins_a_real_host_uses_still_pass() -> None:
+    assert normalise_origin("https://EHR.Example.org/") == "https://ehr.example.org"
+    assert normalise_origin("https://ehr.example.org:8443") == "https://ehr.example.org:8443"
+    assert normalise_origin("https://[2001:db8::1]:8443") == "https://[2001:db8::1]:8443"
+    assert normalise_origin("https://203.0.113.10") == "https://203.0.113.10"
 
 
 @pytest.mark.parametrize("url", ["http://ehr.example.org/hooks", "not-a-url", "ftp://x/y", "https://" + "a" * 600])

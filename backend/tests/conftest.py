@@ -187,6 +187,9 @@ def settings(test_database: tuple[URL, URL], tmp_path: Path, blob_dir: Path) -> 
         blob_fs_root=blob_dir,
         dev_pki_dir=tmp_path / "dev-pki",
         trust_roots_path=tmp_path / "dev-pki" / "trust-roots.pem",
+        # Explicit, because B-T is never a default: the dev PKI cannot supply revocation data
+        # offline, so tests ask for B-T by name (SPEC section 5).
+        seal_profile="PAdES-B-T",
         tsa_url="",
         log_level="DEBUG",
     )
@@ -201,6 +204,7 @@ def settings_no_db(tmp_path: Path) -> Settings:
         blob_fs_root=tmp_path / "blobstore",
         dev_pki_dir=tmp_path / "dev-pki",
         trust_roots_path=tmp_path / "dev-pki" / "trust-roots.pem",
+        seal_profile="PAdES-B-T",
         tsa_url="",
     )
 

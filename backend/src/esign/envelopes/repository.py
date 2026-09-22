@@ -28,7 +28,7 @@ from esign.contracts import BlobKind, Capacity, EnvelopeStatus, SignerStatus
 
 __all__ = [
     "EnvelopeRow",
-    "SessionEvidence",
+    "SessionAttestation",
     "SignerRow",
     "TemplateVersionRow",
     "complete_seal_job",
@@ -40,7 +40,6 @@ __all__ = [
     "insert_envelope",
     "insert_revision",
     "insert_signer",
-    "latest_reauth_method",
     "latest_revision_no",
     "load_envelope",
     "load_signer",
@@ -51,7 +50,7 @@ __all__ = [
     "revoke_envelope_sessions",
     "revoke_other_sessions",
     "seal_job_attempts",
-    "session_evidence",
+    "session_attestation",
     "set_session_presented",
     "superseded_by",
     "update_envelope",
@@ -100,6 +99,8 @@ class SignerRow:
     signed_at: datetime | None
     declined_at: datetime | None
     decline_reason_code: str | None
+    #: The revision this signer last confirmed they had read every page of (``0501``).
+    viewed_sha256: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -116,25 +117,6 @@ class TemplateVersionRow:
     fields: Any
     prefill_fields: Any
     signer_roles: Any
-
-
-@dataclass(frozen=True)
-class SessionEvidence:
-    """What the signing session recorded about how this person got here.
-
-    Used only to build the certificate of completion. ``ip`` comes back as a plain address string
-    rather than a network object so the certificate and the audit trail agree character for
-    character.
-    """
-
-    session_id: UUID
-    auth_method: str
-    auth_time: datetime
-    ip: str | None
-    user_agent: str | None
-    kiosk_staff_user_id: str | None
-    kiosk_identity_check: str | None
-    presented_sha256: bytes | None
 
 
 # --------------------------------------------------------------------------- coercion
@@ -213,6 +195,7 @@ def _signer(row: Any) -> SignerRow:
         signed_at=_opt_utc(row.signed_at),
         declined_at=_opt_utc(row.declined_at),
         decline_reason_code=None if row.decline_reason_code is None else str(row.decline_reason_code),
+        viewed_sha256=_opt_bytes(row.viewed_sha256),
     )
 
 
@@ -225,7 +208,7 @@ _ENVELOPE_COLUMNS = (
 _SIGNER_COLUMNS = (
     "id, envelope_id, role_key, host_user_id, display_name, capacity, on_behalf_of, order_index, "
     "requires_reauth, status, consent_text_id, viewed_at, consented_at, signed_at, declined_at, "
-    "decline_reason_code"
+    "decline_reason_code, viewed_sha256"
 )
 
 
@@ -410,12 +393,15 @@ def update_signer(
     signed_at: datetime | None = None,
     declined_at: datetime | None = None,
     decline_reason_code: str | None = None,
+    viewed_sha256: bytes | None = None,
     only_if_unset: frozenset[str] = frozenset(),
 ) -> None:
     """Write back a signer transition.
 
     ``only_if_unset`` names timestamp columns that must keep their first value: a second
-    ``viewed`` must not rewrite when the signer first saw the document.
+    ``viewed`` must not rewrite when the signer first saw the document. ``viewed_sha256`` is the
+    exception among the view columns: it names the bytes *most recently* confirmed, because that is
+    what ``sign`` checks the session's presented hash against.
     """
     assignments: list[str] = []
     params: dict[str, Any] = {"id": signer_id}
@@ -427,6 +413,7 @@ def update_signer(
         ("signed_at", signed_at),
         ("declined_at", declined_at),
         ("decline_reason_code", decline_reason_code),
+        ("viewed_sha256", viewed_sha256),
     ):
         if value is None:
             continue
@@ -600,13 +587,29 @@ def revoke_envelope_sessions(db: Session, envelope_id: UUID, at: datetime) -> in
     return len(revoked)
 
 
-def session_evidence(db: Session, *, signer_id: UUID, at_or_before: datetime | None) -> SessionEvidence | None:
-    """The session this signer actually used, for the certificate of completion."""
+@dataclass(frozen=True)
+class SessionAttestation:
+    """What the *host* attested when it opened the signing session, server to server.
+
+    Deliberately not ``ip``/``user_agent``: those columns are written from the host's own request,
+    so they describe the EHR backend, not the person signing. The certificate takes the signer's
+    address and client from the ``signer.signed`` event instead. These three are the host's
+    attestation, and the append-only ``session.created`` event is their primary record; this row is
+    the fallback for a trail written before that event existed.
+    """
+
+    session_id: UUID
+    auth_method: str
+    kiosk_staff_user_id: str | None
+    kiosk_identity_check: str | None
+
+
+def session_attestation(db: Session, *, signer_id: UUID, at_or_before: datetime | None) -> SessionAttestation | None:
+    """The session this signer used, as the host described it."""
     clause = "AND created_at <= :at " if at_or_before is not None else ""
     row = db.execute(
         text(
-            "SELECT id, auth_method, auth_time, host(ip) AS ip, user_agent, kiosk_staff_user_id, "  # noqa: S608 - see the note on SQL construction above
-            "       kiosk_identity_check, presented_sha256 "
+            "SELECT id, auth_method, kiosk_staff_user_id, kiosk_identity_check "  # noqa: S608 - see the note on SQL construction above
             f"FROM signing_sessions WHERE signer_id = :signer {clause}"
             "ORDER BY created_at DESC LIMIT 1"
         ),
@@ -614,24 +617,12 @@ def session_evidence(db: Session, *, signer_id: UUID, at_or_before: datetime | N
     ).one_or_none()
     if row is None:
         return None
-    return SessionEvidence(
+    return SessionAttestation(
         session_id=_uuid(row.id),
         auth_method=str(row.auth_method),
-        auth_time=_utc(row.auth_time),
-        ip=None if row.ip is None else str(row.ip),
-        user_agent=None if row.user_agent is None else str(row.user_agent),
         kiosk_staff_user_id=None if row.kiosk_staff_user_id is None else str(row.kiosk_staff_user_id),
         kiosk_identity_check=None if row.kiosk_identity_check is None else str(row.kiosk_identity_check),
-        presented_sha256=_opt_bytes(row.presented_sha256),
     )
-
-
-def latest_reauth_method(db: Session, session_id: UUID) -> str | None:
-    row = db.execute(
-        text("SELECT method FROM reauth_attestations WHERE session_id = :id ORDER BY attested_at DESC LIMIT 1"),
-        {"id": session_id},
-    ).one_or_none()
-    return None if row is None else str(row.method)
 
 
 def insert_capture(

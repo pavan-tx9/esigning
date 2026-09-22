@@ -360,6 +360,10 @@ class PadesSealer:
             has_document_timestamp = bool(reader.embedded_timestamp_signatures)
             has_dss = "/DSS" in reader.root
             timestamp_time = _signature_timestamp(signatures[0]) if signatures else None
+            # Read the envelope binding back out of the signed bytes rather than trusting that we
+            # asked for it: SPEC section 5 makes ``/Location`` the link between this seal and the
+            # envelope it completes, and a binding nobody ever checks is not evidence.
+            location = signatures[0].sig_object.get("/Location") if signatures else None
         except (PdfError, ValueError, KeyError, IndexError) as exc:
             raise SealUnavailable("the sealed output could not be re-read", code="seal_unavailable") from exc
 
@@ -370,6 +374,8 @@ class PadesSealer:
             has_dss=has_dss,
             has_document_timestamp=has_document_timestamp,
             profile=profile,
+            location=None if location is None else str(location),
+            envelope_id=envelope_id,
         )
         if failure is not None or timestamp_time is None:
             log.error(
@@ -396,6 +402,8 @@ def _post_condition_failure(
     has_dss: bool,
     has_document_timestamp: bool,
     profile: SealProfile,
+    location: str | None,
+    envelope_id: UUID,
 ) -> str | None:
     if signatures != 1:
         return Problem.MULTIPLE_SIGNATURES if signatures > 1 else Problem.NOT_SIGNED
@@ -403,6 +411,8 @@ def _post_condition_failure(
         return Problem.NOT_A_CERTIFICATION_SIGNATURE
     if certification_permission != MDPPerm.NO_CHANGES:
         return Problem.CERTIFICATION_PERMITS_CHANGES
+    if location != f"envelope:{envelope_id}":
+        return Problem.LOCATION_MISMATCH
     if timestamp_time is None:
         return Problem.TIMESTAMP_MISSING
     if profile in _LONG_TERM_PROFILES and not has_dss:

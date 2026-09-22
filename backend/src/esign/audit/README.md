@@ -101,17 +101,17 @@ An `signer.signed` event, the seventh on its stream. These are the stored column
 | `prev_event_hash` | `\x5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90` |
 | `data` | the object below |
 
-The canonical JSON is 1156 bytes, on one line (wrapped here only for the page; there is no
+The canonical JSON is 1263 bytes, on one line (wrapped here only for the page; there is no
 whitespace in the real thing):
 
 ```json
-{"actor_capacity":"self","actor_role":"patient","actor_user_id":"host-user-1187","auth_method":"portal_otp","data":{"base_revision_sha256":"3b1f8c2d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e","capacity":"self","capture_count":1,"captures":[{"field_id":"patient_sig","kind":"drawn"}],"consent_version":"2026-09","presented_sha256":"3b1f8c2d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e","reauth_method":null,"reauth_used":false,"revision_no":2,"revision_sha256":"9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f","role_key":"patient","signer_id":"7c3f1d2e-5a64-4b8f-9c10-2e4a6b8d0f31"},"document_sha256":"9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f","event_type":"signer.signed","id":"0f2c9a44-1d3b-4e57-8a66-b1c2d3e4f5a6","ip":"198.51.100.24","occurred_at":"2026-03-17T14:31:02.481073Z","on_behalf_of":null,"prev_event_hash":"5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90","sequence":7,"session_id":"b4d5e6f7-8a9b-4c0d-9e1f-2a3b4c5d6e7f","stream_id":"1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9","stream_type":"envelope","user_agent":"Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)"}
+{"actor_capacity":"self","actor_role":"patient","actor_user_id":"host-user-1187","auth_method":"portal_otp","data":{"base_revision_sha256":"3b1f8c2d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e","capacity":"self","capture_count":1,"captures":[{"field_id":"patient_sig","image_sha256":"c1d2e3f405162738495a6b7c8d9eaf0112233445566778899aabbccddeeff001","kind":"drawn","typed_text_sha256":null}],"consent_version":"2026-09","presented_sha256":"3b1f8c2d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e","reauth_method":null,"reauth_used":false,"revision_no":2,"revision_sha256":"9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f","role_key":"patient","signer_id":"7c3f1d2e-5a64-4b8f-9c10-2e4a6b8d0f31"},"document_sha256":"9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f","event_type":"signer.signed","id":"0f2c9a44-1d3b-4e57-8a66-b1c2d3e4f5a6","ip":"198.51.100.24","occurred_at":"2026-03-17T14:31:02.481073Z","on_behalf_of":null,"prev_event_hash":"5d41402abc4b2a76b9719d911017c592a1b2c3d4e5f60718293a4b5c6d7e8f90","sequence":7,"session_id":"b4d5e6f7-8a9b-4c0d-9e1f-2a3b4c5d6e7f","stream_id":"1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9","stream_type":"envelope","user_agent":"Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)"}
 ```
 
 SHA-256 of those bytes:
 
 ```
-835e56e81e48a2a91517faea1dd9fb83372f7826cbb5a5d82d20217663bb36d5
+a9dbdc657ce901145f97860f9258ec2de28d39f280d508fba2b425fb1c2eb90e
 ```
 
 which is what `audit_events.event_hash` holds for this row, and what the eighth event's

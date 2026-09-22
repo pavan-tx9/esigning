@@ -34,12 +34,17 @@ function bridgeAbortSignals(): void {
       return intercepted(input, init);
     }
     const { signal: _dropped, ...rest } = init ?? {};
-    const aborted = () => new DOMException("The operation was aborted.", "AbortError");
+    // Real `fetch` rejects with the signal's own reason, and the seam tells a caller's abort from
+    // its deadline (a `TimeoutError`) by that reason, so the bridge has to carry it through.
+    const reason = () =>
+      signal.reason instanceof DOMException
+        ? signal.reason
+        : new DOMException("The operation was aborted.", "AbortError");
     if (signal.aborted) {
-      return Promise.reject(aborted());
+      return Promise.reject(reason());
     }
     return new Promise((resolve, reject) => {
-      signal.addEventListener("abort", () => reject(aborted()), { once: true });
+      signal.addEventListener("abort", () => reject(reason()), { once: true });
       intercepted(input, rest).then(resolve, reject);
     });
   };

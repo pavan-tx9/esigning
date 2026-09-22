@@ -12,7 +12,7 @@ so an attempt is a 422 rather than a value quietly ignored.
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -29,7 +29,7 @@ from esign.api.schemas import (
     signing_session_json,
 )
 from esign.contracts import RequestContext, SessionInfo, ValidationFailed
-from esign.identity import RateLimits, ip_key, session_key
+from esign.identity import Limit, RateLimits, ip_key, session_key
 from esign.runtime import Runtime
 from esign.worker import claim_seal_job, seal_one
 
@@ -40,9 +40,19 @@ router = APIRouter(prefix="/v1/signing", tags=["signer"])
 _PDF_HEADERS = {"Cache-Control": "no-store", "Content-Disposition": 'inline; filename="document.pdf"'}
 
 
+#: Which rule each limited scope uses. ``sign`` and ``consent`` are SPEC section 8's; ``present``
+#: and ``copy`` cover the two GETs that append an audit event or re-hash a revision on every call.
+_LIMITS: Final[dict[str, Limit]] = {
+    "sign": RateLimits.SIGN,
+    "consent": RateLimits.CONSENT,
+    "present": RateLimits.PRESENT,
+    "copy": RateLimits.COPY,
+}
+
+
 def _limit(rt: Runtime, scope: str, session: SessionInfo, ctx: RequestContext) -> None:
     """Per session and per IP, as SPEC section 8 asks for sign and consent."""
-    limit = RateLimits.SIGN if scope == "sign" else RateLimits.CONSENT
+    limit = _LIMITS[scope]
     rt.limiter.hit(session_key(scope, session.id), limit=limit.limit, window_seconds=limit.window_seconds)
     # One clinic is one IP for many patients: the per-IP allowance is wider than the per-session one.
     rt.limiter.hit(ip_key(scope, ctx.ip), limit=limit.limit * 20, window_seconds=limit.window_seconds)
@@ -65,7 +75,10 @@ def get_session(
     default locale); it is a language tag, never anything about the signer."""
     rt = runtime_of(request)
     with rt.transaction() as db:
-        session, _ctx = authenticate_signer(request, rt, db)
+        session, ctx = authenticate_signer(request, rt, db)
+        # Cheap-looking but not cheap: ``signing_view`` fetches and parses the current revision to
+        # count its pages.
+        _limit(rt, "present", session, ctx)
         view = rt.envelopes.signing_view(db, session)
         consent = rt.identity.current_consent(db, locale or rt.settings.default_locale)
     return JSONResponse(signing_session_json(view, consent, session))
@@ -78,6 +91,8 @@ def get_document(request: Request) -> Response:
     rt = runtime_of(request)
     with rt.transaction() as db:
         session, ctx = authenticate_signer(request, rt, db)
+        # Serving the document appends an audit event, and there is no delete path for those.
+        _limit(rt, "present", session, ctx)
         pdf = rt.envelopes.present(db, session, ctx)
     return Response(pdf, media_type="application/pdf", headers=_PDF_HEADERS)
 
@@ -171,6 +186,8 @@ def get_copy(request: Request) -> Response:
     rt = runtime_of(request)
     with rt.transaction() as db:
         session, ctx = authenticate_signer(request, rt, db)
+        # Handing over the copy appends ``document.downloaded``; the UI polls this while sealing.
+        _limit(rt, "copy", session, ctx)
         pdf = rt.envelopes.signer_copy(db, session, ctx)
     if pdf is None:
         return JSONResponse({"status": "sealing"}, status_code=202)

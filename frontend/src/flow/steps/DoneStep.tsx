@@ -11,8 +11,14 @@ import {
 
 const SLOW_AFTER_MS = 60_000;
 
-export function DoneStep({ session: initial }: { session: SigningSession }) {
-  const live = useQuery(sessionQueryOptions());
+export function DoneStep({
+  session: initial,
+  locale,
+}: {
+  session: SigningSession;
+  locale?: string | null;
+}) {
+  const live = useQuery(sessionQueryOptions(locale));
   const session = live.data ?? initial;
   const waitingOn = session.other_signers.filter((other) => other.status !== "signed");
   const everyoneSigned =

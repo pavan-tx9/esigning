@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button, CheckRow, Dots, Notice, Sheet, StepScreen, useAnnounce } from "@/components/ui";
 import { useHostLink, useNow } from "@/flow/context";
 import { buildCaptures, type Draft } from "@/flow/draft";
@@ -7,6 +7,7 @@ import { ApiError } from "@/lib/api";
 import {
   isNetworkError,
   isSessionGone,
+  mustReadAgain,
   postSign,
   type SigningSession,
   type SignRequest,
@@ -27,33 +28,49 @@ type Reauth =
 
 interface ConfirmStepProps {
   session: SigningSession;
+  locale?: string | null;
   draft: Draft;
   submissionKeys: SubmissionKeys;
   onBack: () => void;
   onSigned: () => void;
+  /** The document moved on under this signer: they have to read it again before they can sign. */
+  onReadAgain: () => void;
 }
 
 export function ConfirmStep({
   session,
+  locale,
   draft,
   submissionKeys,
   onBack,
   onSigned,
+  onReadAgain,
 }: ConfirmStepProps) {
   const queryClient = useQueryClient();
   const host = useHostLink();
   const announce = useAnnounce();
   const now = useNow(1_000);
-  const live = useQuery(sessionQueryOptions());
+  const live = useQuery(sessionQueryOptions(locale));
   const signer = live.data?.signer ?? session.signer;
   const [reauth, setReauth] = useState<Reauth>({ status: "idle" });
   const [intent, setIntent] = useState(false);
   const [nudge, setNudge] = useState(false);
+  const [reauthNudge, setReauthNudge] = useState(false);
   const intentHint = useId();
+  const reauthHint = useId();
+  const reauthButton = useRef<HTMLButtonElement>(null);
 
+  /**
+   * Whether the server holds a live re-authentication for this signer. The answer is the server's,
+   * not this device's: `reauth_valid_until` is server time plus the maximum age, so a tablet whose
+   * clock runs two minutes fast would read every successful confirmation as already lapsed and
+   * refuse to let anyone sign. The countdown below is advisory; the server's 403 is what decides,
+   * and it is handled as `reauth: lapsed`.
+   */
   const validUntil = signer.reauth_valid_until ? Date.parse(signer.reauth_valid_until) : 0;
   const secondsLeft = Math.floor((validUntil - now) / 1000);
-  const verified = !signer.requires_reauth || secondsLeft > 3;
+  const serverVouches = !signer.requires_reauth || signer.reauth_valid_until !== null;
+  const verified = serverVouches && reauth.status !== "lapsed";
 
   const request = useMemo<SignRequest>(
     () => ({ intent_confirmed: true, captures: buildCaptures(session.fields, draft) }),
@@ -74,10 +91,18 @@ export function ConfirmStep({
     onError: (error) => {
       if (error instanceof ApiError && error.status === 403 && signer.requires_reauth) {
         setReauth({ status: "lapsed" });
+        // The server has stopped vouching for them; the cached session still says otherwise.
+        void queryClient.invalidateQueries({ queryKey: signingKeys.session });
       }
       if (error instanceof ApiError && error.status === 409) {
         // Already signed from another attempt, or the envelope moved on. The session knows.
         void queryClient.invalidateQueries({ queryKey: signingKeys.session });
+      }
+      if (mustReadAgain(error)) {
+        // The bytes held in the cache are last revision's; the review step must show what is
+        // actually being signed now, so they are dropped rather than invalidated.
+        queryClient.removeQueries({ queryKey: signingKeys.document });
+        onReadAgain();
       }
     },
   });
@@ -96,13 +121,14 @@ export function ConfirmStep({
       return;
     }
     let cancelled = false;
-    queryClient.fetchQuery({ ...sessionQueryOptions(), staleTime: 0 }).then(
+    queryClient.fetchQuery({ ...sessionQueryOptions(locale), staleTime: 0 }).then(
       (fresh) => {
         if (cancelled) {
           return;
         }
-        const until = fresh.signer.reauth_valid_until;
-        if (until !== null && Date.parse(until) > Date.now()) {
+        // An attestation the server is still willing to vouch for. Comparing it against this
+        // device's clock would turn a fast tablet into an endless "try again".
+        if (fresh.signer.reauth_valid_until !== null) {
           setReauth({ status: "idle" });
           announce("Thank you. We've confirmed it's you.");
         } else {
@@ -118,7 +144,14 @@ export function ConfirmStep({
     return () => {
       cancelled = true;
     };
-  }, [reauth.status, queryClient, announce]);
+  }, [reauth.status, queryClient, announce, locale]);
+
+  // Once the server vouches for them, the block on signing is gone and so is the message about it.
+  useEffect(() => {
+    if (verified) {
+      setReauthNudge(false);
+    }
+  }, [verified]);
 
   useEffect(() => {
     if (reauth.status === "waiting" && now - reauth.since > REAUTH_TIMEOUT_MS) {
@@ -128,6 +161,7 @@ export function ConfirmStep({
 
   const startReauth = () => {
     sign.reset();
+    setReauthNudge(false);
     setReauth({ status: "waiting", since: Date.now() });
     host.post({ type: "esign:reauth_required", session_id: session.session.id });
   };
@@ -162,7 +196,7 @@ export function ConfirmStep({
             <p className="mt-2 text-ink-700" data-testid="reauth-verified">
               <span aria-hidden="true">✓ </span>Confirmed, thank you. For security this lasts about
               two minutes, so please sign now.
-              {secondsLeft <= 30 ? ` About ${Math.max(0, secondsLeft)} seconds left.` : ""}
+              {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
             </p>
           ) : reauth.status === "waiting" || reauth.status === "checking" ? (
             <div role="status" className="mt-2 text-ink-700" data-testid="reauth-waiting">
@@ -193,7 +227,7 @@ export function ConfirmStep({
                   We couldn't confirm that. Nothing has been signed. Please try again.
                 </Notice>
               ) : null}
-              {reauth.status === "lapsed" || (reauth.status === "idle" && validUntil > 0) ? (
+              {reauth.status === "lapsed" ? (
                 <Notice tone="warn" alert className="mt-3">
                   The confirmation ran out before the document was signed. Please confirm once more.
                 </Notice>
@@ -202,7 +236,7 @@ export function ConfirmStep({
                 Because you're signing in a professional role, your records system will ask you to
                 sign in again. It takes a moment.
               </p>
-              <Button className="mt-4 w-full sm:w-auto" onClick={startReauth}>
+              <Button ref={reauthButton} className="mt-4 w-full sm:w-auto" onClick={startReauth}>
                 {reauth.status === "idle" && validUntil === 0 ? "Confirm it's me" : "Try again"}
               </Button>
             </>
@@ -256,6 +290,14 @@ export function ConfirmStep({
         </Notice>
       ) : null}
 
+      {/* Every other blocked action in the flow says so on screen; this one used to speak only to
+          the live region, so a clinician tapping the greyed button saw nothing happen at all. */}
+      {reauthNudge && !verified ? (
+        <p id={reauthHint} role="alert" className="mt-5 font-medium text-danger-600">
+          Confirm it's you first, using the button above, then you can sign.
+        </p>
+      ) : null}
+
       <div className="mt-6 flex flex-wrap justify-between gap-3">
         <Button variant="secondary" onClick={onBack} inert={sign.isPending}>
           Back
@@ -264,9 +306,11 @@ export function ConfirmStep({
           className="min-h-14 flex-1 text-lg sm:flex-none sm:px-10"
           inert={!verified || !intent}
           busy={sign.isPending}
+          aria-describedby={reauthNudge && !verified ? reauthHint : undefined}
           onClick={() => {
             if (!verified) {
-              announce("Please confirm it's you first.");
+              setReauthNudge(true);
+              reauthButton.current?.focus();
               return;
             }
             submit();

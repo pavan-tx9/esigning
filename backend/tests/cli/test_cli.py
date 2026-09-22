@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from sqlalchemy import text
 from esign.cli import main
 from esign.clock import FixedClock
 from esign.config import Settings
-from esign.runtime import build_runtime
+from esign.runtime import ConfigurationError, build_runtime
 from tests.conftest import FROZEN_NOW
 from tests.e2e.conftest import PATIENT_NAME, Ehr, World
 
@@ -120,5 +121,43 @@ def test_dev_pki_refuses_to_overwrite_and_refuses_production(
     assert "already holds a dev PKI" in capsys.readouterr().err
     assert main(["dev-pki", "--force"], runtime=rt) == 0
 
-    prod = build_runtime(target.model_copy(update={"app_env": "prod"}), clock=FixedClock(FROZEN_NOW))
+    # A prod runtime cannot even be built with a dev profile and the local key backend, so the
+    # settings have to be swapped onto an existing one to reach the dev-pki refusal itself.
+    prod = replace(rt, settings=target.model_copy(update={"app_env": "prod"}))
     assert main(["dev-pki", "--force"], runtime=prod) == 2
+
+
+def test_the_worker_refuses_a_production_configuration_before_touching_the_database(
+    settings_no_db: Settings, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker is the process that seals, and it used to be gated by nothing at all.
+
+    ``check_production_settings`` ran only in ``create_app``, so a prod worker with ``TSA_URL`` set
+    but ``SEAL_PROFILE``/``SEAL_KEY_BACKEND`` left at their defaults and a ``.dev-pki`` directory
+    present would seal real documents at B-T with the dev key while the API container beside it
+    refused to start. SPEC section 5: B-T is an explicit setting, never a silent downgrade.
+    """
+    prod = settings_no_db.model_copy(
+        update={
+            "app_env": "prod",
+            "seal_profile": "PAdES-B-T",
+            "seal_key_backend": "local",
+            "tsa_url": "https://tsa.example/rfc3161",
+            # A DSN that would not connect from here anyway; the point is that nothing tries.
+            "database_url": "postgresql+psycopg://esign_app:nope@127.0.0.1:1/esign",
+        }
+    )
+    monkeypatch.setattr("esign.cli.get_settings", lambda: prod)
+
+    assert main(["worker", "--once"]) == 2
+    message = capsys.readouterr().err
+    assert "SEAL_PROFILE" in message
+    assert "SEAL_KEY_BACKEND" in message
+
+
+def test_building_a_runtime_refuses_a_production_dev_profile(settings_no_db: Settings) -> None:
+    """Every entry point goes through ``build_runtime``; every one of them is gated by it."""
+    prod = settings_no_db.model_copy(update={"app_env": "prod", "seal_profile": "PAdES-B-T"})
+    with pytest.raises(ConfigurationError) as refused:
+        build_runtime(prod, clock=FixedClock(FROZEN_NOW))
+    assert "SEAL_PROFILE" in str(refused.value)

@@ -27,9 +27,12 @@ uv run esign worker                      # seal retries, expiries, webhooks (run
 uv run esign verify <envelope id>        # re-check seal, stored hashes and audit chain; exit 1 on failure
 ```
 
-`SEAL_PROFILE` defaults to `PAdES-B-T`; set `PAdES-B-LT` for embedded validation data (the dev PKI
-supports it). `APP_ENV=prod` refuses to start without `aws_kms`, `s3`, a long-term profile, a TSA
-URL and an existing trust-roots file.
+`SEAL_PROFILE` defaults to `PAdES-B-LT`; `PAdES-B-T` is a deliberate dev/test choice and is set by
+name in `.env.example` and `tests/conftest.py`, never fallen back to. `APP_ENV=prod` refuses to
+start without `aws_kms` (with its key id and certificate), `s3`, a long-term profile, a TSA URL, an
+existing trust-roots file, real database credentials and `DB_ECHO` off. The check lives in
+`esign/runtime.py` and runs in `build_runtime`, so the API, `esign worker`, `esign verify` and every
+other command are gated identically -- the worker is the process that seals.
 
 ## Layout of the integration layer
 

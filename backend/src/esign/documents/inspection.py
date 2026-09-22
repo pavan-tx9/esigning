@@ -78,6 +78,7 @@ _CODE_MESSAGES: Final[dict[str, str]] = {
     "embedded_stream": "template contains an embedded file stream",
     "forbidden_annotation": "template contains a multimedia or attachment annotation",
     "unreadable_object": "template contains an unreadable object",
+    "content_unreadable": "template has a page whose content stream cannot be decoded",
     "too_complex": "template object graph is too large to inspect",
 }
 
@@ -153,6 +154,24 @@ def _walk(root: Any, problems: set[str]) -> None:
             stack.extend(node)
 
 
+def _content_streams_decode(reader: Any) -> bool:
+    """Whether every page's content stream can actually be decoded.
+
+    pypdf caps zlib output, so a stream that inflates past the cap raises ``LimitReachedError``
+    here rather than returning something huge -- which is what makes this a cheap check and not a
+    decompression bomb of its own.
+    """
+    try:
+        for page in reader.pages:
+            contents = page.get_contents()
+            if contents is not None:
+                contents.get_data()
+    except Exception:
+        # Any failure to decode is the same answer to the host: this template cannot be drawn on.
+        return False
+    return True
+
+
 def inspect_template(pdf: bytes, settings: Settings) -> TemplatePdfInfo:
     """Implements ``DocumentService.inspect_template_pdf``."""
     if len(pdf) > settings.max_template_bytes:
@@ -173,6 +192,12 @@ def inspect_template(pdf: bytes, settings: Settings) -> TemplatePdfInfo:
         _walk(reader.trailer, problems)
     except RecursionError:  # pragma: no cover - the walk is iterative; belt and braces
         problems.add("too_complex")
+    if not _content_streams_decode(reader):
+        # The walk never decodes a content stream, so a page whose compressed content inflates past
+        # pypdf's output cap used to publish happily and then fail at ``POST /v1/envelopes``, where
+        # stamping is the first thing that decodes it. Refuse the template at upload instead: it is
+        # the host's file and the host can fix it.
+        problems.add("content_unreadable")
 
     if problems:
         ranked = [code for code in _CODE_MESSAGES if code in problems]

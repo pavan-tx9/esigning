@@ -72,11 +72,14 @@ and grants. A module that truly needs a change adds a file in its range (evidenc
 ### Database roles
 - `esign_owner` runs migrations.
 - `esign_app` is the runtime role. It gets `SELECT, INSERT` only on `audit_events`, `blobs`,
-  `document_revisions`, `consent_texts`, `reauth_attestations`; full DML on the rest; no DDL, no
-  `TRUNCATE`. The append-only triggers are the second line of defence: `BEFORE UPDATE OR DELETE`
-  in `0001`, and `BEFORE TRUNCATE` on all five tables (`audit_events` in `0001`, `blobs` in `0100`,
-  the other three in `0600`). Tests must prove both: the app role is denied, and the owner role
-  hits the trigger.
+  `document_revisions`, `consent_texts`, `reauth_attestations`; `SELECT, INSERT, UPDATE` on the
+  rest; `DELETE` on `idempotency_keys` alone; no DDL, no `TRUNCATE`. The append-only triggers are
+  the second line of defence: `BEFORE UPDATE OR DELETE` in `0001`, and `BEFORE TRUNCATE` on all
+  five tables (`audit_events` in `0001`, `blobs` in `0100`, the other three in `0600`). Tests must
+  prove both: the app role is denied, and the owner role hits the trigger.
+  `DELETE` is granted nowhere else because the application issues it nowhere else, and `signers`,
+  `signing_sessions` and `signature_captures` are the rows the certificate of completion is built
+  from: `0602` revokes it and stops `ALTER DEFAULT PRIVILEGES` handing it to new tables.
 
 ## 3. The pipeline
 
@@ -450,3 +453,52 @@ Second round, from the envelopes module's review of the integrated system:
 - **`EnvelopeService.seal_pending` docstring** now lists `IntegrityFailure` among the exceptions
   that escape and says what a worker must do with it: the envelope stays pending, `seal.failed`
   is recorded, and no retry can fix it.
+
+Third round, from the review of the integrated system:
+
+- **The certificate of completion is built from the audit trail** (section 3 step 7), not from the
+  mutable rows. Each signer's `viewed_at`, `consented_at`, `signed_at` and `consent_version` come
+  from `document.viewed` / `consent.accepted` / `signer.signed`; the signer's `ip` and `user_agent`
+  come from the `signer.signed` event's context, because `signing_sessions.ip`/`user_agent` are the
+  *host backend's* (it opens the session server to server) and printing them attributed the EHR's
+  address and HTTP client to the patient. `auth_method` and the kiosk details come from
+  `session.created`. The rows are kept as a cross-check: a disagreement raises `IntegrityFailure`
+  (`certificate_evidence_mismatch`), which leaves the envelope pending with `seal.failed` recorded.
+  `reauth_method` is the method `signer.signed` says was used, and `None` for a role that does not
+  require re-authentication.
+- **`EnvelopeService.assert_reauth_allowed(db, envelope_id, signer_id)`**: the API calls it after
+  `attest_reauth`, so an attestation cannot be recorded for a signer who has already signed
+  (`signer_finished`), for a role with `requires_reauth: false` (`reauth_not_required`), or on an
+  envelope that is no longer being signed (`envelope_not_live`). Declared on
+  `runtime.GatedEnvelopeService` until it can move into `contracts.EnvelopeService`.
+- **`sign` requires the bytes to have been viewed, not just presented**: `signers.viewed_sha256`
+  (`0501`) records the revision `record_viewed` confirmed, and signing refuses with
+  `not_viewed` unless the session's presented hash equals it. The signing UI owns the way out of
+  that refusal, because nothing else can offer it: the signer's status is still `consented`, so
+  the step the flow derives from the server never goes back to Review. On 409 `not_viewed` the UI
+  drops the document it holds, returns to Review saying another signer signed while they were
+  reading, and the fresh `POST /signing/viewed` that step already sends is what lets the signature
+  through. The draft is kept, so nothing they filled in is lost.
+- **Audit allowlist**: `CaptureRef` gained `image_sha256` and `typed_text_sha256`, so the raw drawn
+  PNG and the typed text are tied to the hash chain rather than only to a mutable row.
+  `signature_captures` is append-only from `0502` (grant plus trigger, like every other piece of
+  evidence). `audit/README.md`'s worked vector was regenerated.
+- **`Sealer`**: `seal` now reads `/Location` back out of its own output and refuses with
+  `location_mismatch` if it is not `envelope:<id>`; `Verifier` checks the same thing
+  (`seal_bound_to_envelope`), so the binding section 5 requires is evidence rather than intent.
+- **`check_production_settings` moved into `esign.runtime`** and is called from `build_runtime`, so
+  the API, `esign worker`, `esign verify` and every other command are gated identically -- the
+  worker is the process that seals, and it was gated by nothing. It raises
+  `runtime.ConfigurationError` (a `RuntimeError`) and additionally refuses dev database passwords,
+  `DB_ECHO`, and `aws_kms` with no key id or certificate. `Settings.seal_profile` now defaults to
+  `PAdES-B-LT`: `PAdES-B-T` is set explicitly by `.env.example` and `tests/conftest.py`.
+- **Bounds**: the documents module's private 80/500 copies are gone; `stamping.apply_signer_marks`
+  takes `Settings` and uses `max_typed_signature_chars` / `max_text_field_chars`.
+- **Verification** gained `signer_rows_match_trail`, `captures_match_trail`,
+  `capture_images_intact`, `sealed_pages_match_final_revision` and `seal_bound_to_envelope`, and
+  looks for the certificate's head hash on every page rather than the last four.
+- **Rate limits**: `RateLimits.PRESENT`, `COPY` and `VERIFY` cover the GETs that append an audit
+  event or re-hash a revision (`/signing/session`, `/signing/document`, `/signing/copy`,
+  `/envelopes/{id}/verification`).
+- **Consent**: `en-US.2026-10` replaces `2026-09` from 1 October. `2026-09` promised a download
+  "from this screen", which is false on a kiosk (section 11 hands the tablet back and wipes state).

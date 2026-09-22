@@ -1,12 +1,14 @@
 import { delay, HttpResponse, http } from "msw";
 import {
   documentFor,
+  LOCALE_PATTERN,
   MockHttpError,
   type MockRecord,
   mockDb,
   pollCopy,
   recordConsent,
   recordDecline,
+  recordPresented,
   recordSign,
   recordViewed,
   sessionBody,
@@ -57,9 +59,21 @@ export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
   return [
     http.get(
       "/v1/signing/session",
-      signerRoute(latency, (record) =>
-        record.scenario === "error" ? serverError() : HttpResponse.json(sessionBody(record)),
-      ),
+      signerRoute(latency, (record, request) => {
+        if (record.scenario === "error") {
+          return serverError();
+        }
+        // `?locale=` picks the disclosure language, and only en-US is seeded, so anything else
+        // falls back to it -- exactly as the real service does.
+        const requested = new URL(request.url).searchParams.get("locale");
+        if (requested !== null && !LOCALE_PATTERN.test(requested)) {
+          return errorResponse(
+            new MockHttpError(422, "validation_failed", "The locale is not a language tag."),
+          );
+        }
+        record.requestedLocale = requested;
+        return HttpResponse.json(sessionBody(record));
+      }),
     ),
 
     http.get(
@@ -68,7 +82,7 @@ export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
         if (record.scenario === "document-error") {
           return serverError();
         }
-        record.presented += 1;
+        recordPresented(record);
         return pdfResponse(documentFor(record));
       }),
     ),
@@ -85,8 +99,12 @@ export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
     http.post(
       "/v1/signing/consent",
       signerRoute(latency, async (record, request) => {
-        const body = (await request.json()) as { consent_version?: unknown; accepted?: unknown };
-        recordConsent(record, body.consent_version, body.accepted);
+        const body = (await request.json()) as {
+          consent_version?: unknown;
+          accepted?: unknown;
+          locale?: unknown;
+        };
+        recordConsent(record, body.consent_version, body.accepted, body.locale);
         return ack(record);
       }),
     ),

@@ -138,8 +138,20 @@ export interface MockRecord {
   signRequests: { key: string | null; body: string }[];
   revisions: number;
   presented: number;
+  /**
+   * The revision this session was last served (`document.presented`), and the revision the signer
+   * said they had read (`signers.viewed_sha256`). Signing needs them to be the same one: a signer
+   * whose co-signer signed while they were reading is served newer bytes than the ones they
+   * confirmed, and the service refuses with `not_viewed` until they read again.
+   */
+  presentedRevision: number | null;
+  viewedRevision: number | null;
   downloads: number;
   declineReason: string | null;
+  /** The last `?locale=` the UI asked the session for; null when it asked for none. */
+  requestedLocale: string | null;
+  /** The locale the UI said the signer read the disclosure in, as posted with consent. */
+  consentLocale: string | null;
   sessionExpiresAt: number;
   createdAt: number;
 }
@@ -156,6 +168,15 @@ export class MockHttpError extends Error {
 
 const records = new Map<string, MockRecord>();
 
+/**
+ * How far ahead of this fake server the browser's clock runs. Real deadlines (`expires_at`,
+ * `reauth_valid_until`) are server time, and a clinic tablet's clock is its own business, so the
+ * mock keeps a clock of its own: nothing in the UI may depend on the two agreeing.
+ */
+let deviceClockSkewMs = 0;
+
+const serverNow = () => Date.now() - deviceClockSkewMs;
+
 function scenarioOf(token: string): Scenario | null {
   const name = token.replace(/^est_mock_/, "");
   return token.startsWith("est_mock_") && name in SCENARIOS ? (name as Scenario) : null;
@@ -164,6 +185,12 @@ function scenarioOf(token: string): Scenario | null {
 export const mockDb = {
   reset(): void {
     records.clear();
+    deviceClockSkewMs = 0;
+  },
+
+  /** Run the fake server `ms` behind the browser: the device's clock is fast by that much. */
+  setDeviceClockSkew(ms: number): void {
+    deviceClockSkewMs = ms;
   },
 
   /** Unknown, expired and revoked tokens are indistinguishable, as in the real service. */
@@ -175,7 +202,7 @@ export const mockDb = {
     }
     let record = records.get(token);
     if (record === undefined) {
-      const now = Date.now();
+      const now = serverNow();
       record = {
         scenario,
         signerStatus: "pending",
@@ -185,14 +212,18 @@ export const mockDb = {
         signRequests: [],
         revisions: 1,
         presented: 0,
+        presentedRevision: null,
+        viewedRevision: null,
         downloads: 0,
         declineReason: null,
+        requestedLocale: null,
+        consentLocale: null,
         sessionExpiresAt: now + (scenario === "ending-soon" ? 100_000 : 1_800_000),
         createdAt: now,
       };
       records.set(token, record);
     }
-    if (Date.now() >= record.sessionExpiresAt) {
+    if (serverNow() >= record.sessionExpiresAt) {
       throw new MockHttpError(401, "unauthorized", "The session is not valid.");
     }
     return record;
@@ -202,7 +233,18 @@ export const mockDb = {
   attestReauth(scenario: Scenario = "clinician"): void {
     const record = records.get(tokenFor(scenario));
     if (record !== undefined) {
-      record.reauthValidUntil = Date.now() + REAUTH_MAX_AGE_MS;
+      record.reauthValidUntil = serverNow() + REAUTH_MAX_AGE_MS;
+    }
+  },
+
+  /**
+   * Another signer on the same envelope signs, so the current revision moves on. Nothing about
+   * this signer changes -- which is the point: what they read is no longer what they would sign.
+   */
+  otherSignerSigned(scenario: Scenario): void {
+    const record = records.get(tokenFor(scenario));
+    if (record !== undefined) {
+      record.revisions += 1;
     }
   },
 
@@ -277,18 +319,26 @@ export function sessionBody(record: MockRecord) {
       reauth_valid_until: record.reauthValidUntil === null ? null : iso(record.reauthValidUntil),
     },
     other_signers: others,
-    fields: fieldsFor(record).map(({ role: _role, ...field }) => field),
-    consent: CONSENT,
+    fields: fieldsFor(record).map(({ role: _role, ...field }) => ({
+      ...field,
+      rect: { ...field.rect },
+    })),
+    // Copies: a caller that pokes at the body it was handed (a schema test corrupting a field to
+    // prove it is rejected) must not leave the mock's own disclosure broken for everyone after it.
+    consent: { ...CONSENT },
     session: {
       id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
       expires_at: iso(record.sessionExpiresAt),
       kiosk: record.scenario === "kiosk",
     },
-    decline_reasons: DECLINE_REASONS,
+    decline_reasons: DECLINE_REASONS.map((reason) => ({ ...reason })),
   };
 }
 
 // --------------------------------------------------------------------------- transitions
+
+/** What `GET /v1/signing/session?locale=` and `ConsentBody.locale` accept on the real service. */
+export const LOCALE_PATTERN = /^[A-Za-z0-9-]{1,35}$/;
 
 const conflict = (message: string) => new MockHttpError(409, "conflict", message);
 const invalid = (message: string) => new MockHttpError(422, "validation_failed", message);
@@ -299,17 +349,34 @@ function assertLive(record: MockRecord): void {
   }
 }
 
+/** `GET /v1/signing/document`: the current revision, recorded against this session. */
+export function recordPresented(record: MockRecord): void {
+  record.presented += 1;
+  record.presentedRevision = record.revisions;
+}
+
 export function recordViewed(record: MockRecord, pagesViewed: unknown): void {
   assertLive(record);
+  if (record.presentedRevision === null) {
+    throw new MockHttpError(409, "not_presented", "The document has not been opened.");
+  }
   if (pagesViewed !== pageCountFor(record)) {
     throw invalid("Every page must be viewed.");
   }
+  // The bytes this session was served are the ones now confirmed as read. A repeat view moves it
+  // on, which is how a signer recovers from `not_viewed`.
+  record.viewedRevision = record.presentedRevision;
   if (record.signerStatus === "pending") {
     record.signerStatus = "viewed";
   }
 }
 
-export function recordConsent(record: MockRecord, version: unknown, accepted: unknown): void {
+export function recordConsent(
+  record: MockRecord,
+  version: unknown,
+  accepted: unknown,
+  locale: unknown,
+): void {
   assertLive(record);
   if (record.signerStatus === "pending") {
     throw conflict("The document has not been viewed.");
@@ -317,6 +384,17 @@ export function recordConsent(record: MockRecord, version: unknown, accepted: un
   if (version !== CONSENT.version || accepted !== true) {
     throw invalid("The consent version is not current.");
   }
+  // SPEC 9: `locale` is optional, and is the locale as shown in the session payload -- what the
+  // server served. A client that echoes back a language it was never given is refused.
+  if (locale !== undefined && locale !== null) {
+    if (typeof locale !== "string" || !LOCALE_PATTERN.test(locale)) {
+      throw invalid("The locale is not a language tag.");
+    }
+    if (locale !== CONSENT.locale) {
+      throw invalid("That is not the locale this disclosure was served in.");
+    }
+  }
+  record.consentLocale = typeof locale === "string" ? locale : null;
   if (record.signerStatus === "viewed") {
     record.signerStatus = "consented";
   }
@@ -399,12 +477,22 @@ export function recordSign(
   if (record.signerStatus !== "consented") {
     throw conflict("Consent has not been given.");
   }
+  if (record.presentedRevision === null) {
+    throw new MockHttpError(409, "not_presented", "The document has not been opened.");
+  }
+  if (record.viewedRevision !== record.presentedRevision) {
+    throw new MockHttpError(
+      409,
+      "not_viewed",
+      "The document has changed. Please look through every page again before you sign.",
+    );
+  }
   if (body.intent_confirmed !== true) {
     throw invalid("Intent must be confirmed.");
   }
   if (
     record.scenario === "clinician" &&
-    (record.reauthValidUntil === null || record.reauthValidUntil < Date.now())
+    (record.reauthValidUntil === null || record.reauthValidUntil < serverNow())
   ) {
     throw new MockHttpError(403, "forbidden", "Re-authentication is required.");
   }

@@ -9,8 +9,10 @@ embed the signing UI, so it is validated here rather than wherever it is later i
 
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime
+from ipaddress import ip_address
 from typing import Final
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -41,6 +43,24 @@ _MAX_WEBHOOK_URL_CHARS: Final = 500
 _LOOPBACK_HOSTS: Final = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
 _WEBHOOK_SECRET_BYTES: Final = 32
 
+#: Everything an origin's netloc may contain: host characters, the IPv6 brackets and a port colon.
+#: No whitespace, no control characters, no ``;``, no quotes, no ``%``.
+_NETLOC_RE: Final = re.compile(r"^[A-Za-z0-9.\-\[\]:]+$")
+
+#: A DNS name: labels of letters, digits and inner hyphens.
+_DNS_NAME_RE: Final = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+
+
+def _is_host(hostname: str) -> bool:
+    """A DNS name or an IP literal, and nothing else. ``*`` fails both, which is the point."""
+    if _DNS_NAME_RE.match(hostname):
+        return True
+    try:
+        ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
 
 def _row_to_host(row: RowMapping) -> Host:
     return Host(id=req_uuid(row, "id"), name=req_str(row, "name"), allowed_origins=str_tuple(row, "allowed_origins"))
@@ -51,17 +71,30 @@ def normalise_origin(origin: str) -> str:
 
     ``https://ehr.example.org`` is an origin. ``https://ehr.example.org/sign`` is not, and neither
     is ``*``: a wildcard here would let any page on the internet frame a signing session.
+
+    The host part is matched against a pattern rather than merely parsed. ``urlsplit`` is happy to
+    put ``;``, quotes, ``%`` and control characters in a netloc, and this value is interpolated
+    verbatim into ``Content-Security-Policy: frame-ancestors ...`` and into the
+    ``esign-allowed-origins`` meta tag: a ``;`` there starts a new CSP directive, and a tab is
+    silently dropped, leaving a different origin than the operator typed. Anything unexpected is
+    refused rather than stripped, because a stripped value is still stored and still trusted.
     """
     candidate = origin.strip().rstrip("/")
     if not candidate or len(candidate) > _MAX_ORIGIN_CHARS:
         raise ValidationFailed("origin is empty or too long", code="invalid_origin")
+    if any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in candidate):
+        # Checked before ``urlsplit``, which *deletes* tabs and newlines: `https://ehr.example\ttab`
+        # would otherwise normalise to `https://ehr.exampletab`, a different origin than was typed.
+        raise ValidationFailed("origin must be http(s)://host[:port]", code="invalid_origin")
     parts = urlsplit(candidate)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise ValidationFailed("origin must be http(s)://host[:port]", code="invalid_origin")
     if parts.path or parts.query or parts.fragment or parts.username or parts.password:
         raise ValidationFailed("origin must not carry a path, query or credentials", code="invalid_origin")
+    if not _NETLOC_RE.match(parts.netloc):
+        raise ValidationFailed("origin must be http(s)://host[:port]", code="invalid_origin")
     hostname = (parts.hostname or "").lower()
-    if not hostname or "*" in hostname:
+    if not hostname or not _is_host(hostname):
         raise ValidationFailed("origin must name one host", code="invalid_origin")
     if parts.scheme == "http" and hostname not in _LOOPBACK_HOSTS:
         raise ValidationFailed("only loopback origins may use http", code="invalid_origin")

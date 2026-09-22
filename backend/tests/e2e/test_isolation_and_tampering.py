@@ -237,3 +237,54 @@ def test_a_removed_audit_row_is_caught(ehr: Ehr, world: World, owner_engine: Eng
     failed = {c["name"]: c["detail"] for c in report["checks"] if c["status"] == "failed"}
     assert "gap" in failed["audit_chain"]
     assert "certificate_head_hash" in failed  # the certificate counted an event that is gone
+
+
+def test_reauthentication_cannot_be_attested_after_the_signature(ehr: Ehr, world: World) -> None:
+    """The session a signer signed from stays live for the copy download, and used to accept
+    ``POST /v1/sessions/{id}/reauth`` for ever afterwards.
+
+    ``reauth_attestations`` is append-only, so every such call wrote an ``auth.reauthenticated``
+    event that can never be corrected -- and the certificate used to print the newest attestation
+    on the session rather than the one the signature actually used.
+    """
+    envelope = ehr.create_envelope("procedure_consent")
+    ehr.sign_everyone(envelope, ("patient", "witness"))
+
+    clinician = ehr.open_session(envelope, "clinician", method="password+mfa")
+    payload = clinician.review_and_consent()
+    assert ehr.reauth(clinician).status_code == 200
+    assert clinician.sign(payload, key="sign-clinician").status_code == 200
+    assert ehr.envelope(envelope["id"])["status"] == "sealed"
+
+    # That session is still live, for the copy download only. It must not accept a fresh
+    # attestation now that the signature is inside the sealed bytes.
+    assert clinician.get("/copy").status_code == 200
+    refused = ehr.reauth(clinician)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["code"] == "envelope_not_live"
+
+    assert ehr.audit_types(envelope["id"]).count("auth.reauthenticated") == 1
+
+
+def test_reauthentication_is_refused_once_that_signer_has_signed(ehr: Ehr, world: World) -> None:
+    """Parallel order, so the envelope is still live while this signer is finished."""
+    envelope = ehr.create_envelope("procedure_consent", signing_order="parallel")
+    clinician = ehr.open_session(envelope, "clinician", method="password+mfa")
+    payload = clinician.review_and_consent()
+    assert ehr.reauth(clinician).status_code == 200
+    assert clinician.sign(payload, key="sign-clinician-first").status_code == 200
+    assert ehr.envelope(envelope["id"])["status"] == "in_progress"
+
+    refused = ehr.reauth(clinician)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["code"] == "signer_finished"
+    assert ehr.audit_types(envelope["id"]).count("auth.reauthenticated") == 1
+
+
+def test_reauthentication_is_refused_for_a_role_that_does_not_need_it(ehr: Ehr, world: World) -> None:
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    refused = ehr.reauth(patient)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["error"]["code"] == "reauth_not_required"
+    assert "auth.reauthenticated" not in ehr.audit_types(envelope["id"])

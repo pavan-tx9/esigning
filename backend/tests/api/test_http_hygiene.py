@@ -12,7 +12,8 @@ from sqlalchemy import Engine
 from esign.api import check_production_settings, create_app
 from esign.clock import FixedClock
 from esign.config import Settings
-from esign.runtime import build_runtime
+from esign.identity import RateLimits
+from esign.runtime import ConfigurationError, build_runtime
 from tests.e2e.conftest import PATIENT_NAME, Ehr, Sessions, World, build_world
 
 
@@ -138,6 +139,39 @@ def test_session_creation_is_rate_limited_per_host_with_a_retry_hint(ehr: Ehr, w
     assert ehr.open_session_response(envelope, "patient").status_code == 201
 
 
+def test_presenting_the_document_is_rate_limited_per_session(ehr: Ehr, world: World) -> None:
+    """``GET /v1/signing/document`` appends ``document.presented`` and re-hashes the revision.
+
+    ``audit_events`` has no delete path, so a loop with one live token used to grow the trail
+    without bound -- and every later ``audit.verify``, which ``seal_pending`` runs, with it.
+    """
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    limit = RateLimits.PRESENT.limit
+    statuses = [patient.get("/document").status_code for _ in range(limit + 1)]
+    assert statuses[:limit] == [200] * limit
+    assert statuses[limit] == 429
+    limited = patient.get("/document")
+    assert limited.json()["error"]["code"] == "rate_limited"
+    assert 1 <= int(limited.headers["retry-after"]) <= RateLimits.PRESENT.window_seconds
+
+    world.clock.advance(RateLimits.PRESENT.window_seconds + 1)
+    assert patient.get("/document").status_code == 200
+
+
+def test_running_a_verification_is_rate_limited_per_host(ehr: Ehr, world: World) -> None:
+    """Every call re-hashes every revision, validates the seal and appends an audit event."""
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    limit = RateLimits.VERIFY.limit
+    statuses = [ehr.get(f"/envelopes/{envelope['id']}/verification").status_code for _ in range(limit + 1)]
+    assert statuses[:limit] == [200] * limit
+    assert statuses[limit] == 429
+
+    # Another host is unaffected, and the window passes.
+    world.clock.advance(RateLimits.VERIFY.window_seconds + 1)
+    assert ehr.get(f"/envelopes/{envelope['id']}/verification").status_code == 200
+
+
 def test_guessing_tokens_is_rate_limited_per_ip(world: World) -> None:
     headers = {"Authorization": "Bearer est_" + "A" * 43}
     statuses = [world.client.get("/v1/signing/session", headers=headers).status_code for _ in range(21)]
@@ -175,9 +209,74 @@ def test_the_recorded_ip_honours_trusted_proxies_only(
 def test_production_refuses_to_start_half_configured(e2e_settings: Settings) -> None:
     check_production_settings(e2e_settings)  # test/dev: nothing to insist on
     prod = e2e_settings.model_copy(update={"app_env": "prod", "seal_profile": "PAdES-B-T"})
-    with pytest.raises(RuntimeError) as refused:
+    with pytest.raises(ConfigurationError) as refused:
         check_production_settings(prod)
     message = str(refused.value)
     assert "SEAL_PROFILE" in message and "BLOB_BACKEND" in message and "SEAL_KEY_BACKEND" in message
     with pytest.raises(ValueError, match="does not appear to be"):
         check_production_settings(e2e_settings.model_copy(update={"trusted_proxy_cidrs": ("not-a-network",)}))
+
+
+def test_production_refuses_dev_database_credentials_and_sql_echo(e2e_settings: Settings, tmp_path: Path) -> None:
+    """The seal and the blob store were covered; the database was not.
+
+    ``DATABASE_URL`` and ``DATABASE_OWNER_URL`` default to DSNs carrying the passwords
+    ``0002_roles.sql`` sets when it has to create the roles itself, and ``DB_ECHO`` would log every
+    statement -- with its bound parameters: display names, prefill, typed signatures -- through the
+    stdlib logger. SPEC section 10.
+    """
+    roots = tmp_path / "roots.pem"
+    roots.write_text("-- not a real bundle\n")
+    prod = e2e_settings.model_copy(
+        update={
+            "app_env": "prod",
+            "seal_profile": "PAdES-B-LT",
+            "seal_key_backend": "aws_kms",
+            "seal_kms_key_id": "alias/esign-seal",
+            "seal_cert_path": roots,
+            "blob_backend": "s3",
+            "trust_roots_path": roots,
+            "tsa_url": "https://tsa.example/rfc3161",
+            "database_url": "postgresql+psycopg://esign_app:esign_app_dev@db/esign",
+            "database_owner_url": "postgresql+psycopg://esign_owner:esign_owner_dev@db/esign",
+            "db_echo": True,
+        }
+    )
+    with pytest.raises(ConfigurationError) as refused:
+        check_production_settings(prod)
+    message = str(refused.value)
+    assert "DATABASE_URL" in message and "DATABASE_OWNER_URL" in message and "DB_ECHO" in message
+
+    # With real credentials and the echo off, that configuration is accepted.
+    check_production_settings(
+        prod.model_copy(
+            update={
+                "database_url": "postgresql+psycopg://esign_app:s3cret@db/esign",
+                "database_owner_url": "postgresql+psycopg://esign_owner:0ther@db/esign",
+                "db_echo": False,
+            }
+        )
+    )
+
+
+def test_production_refuses_a_kms_backend_with_no_key_or_certificate(e2e_settings: Settings, tmp_path: Path) -> None:
+    """``keys.py`` only noticed these at the first seal, by which time a document is signed and
+    waiting and the failure looks like an outage rather than a misconfiguration."""
+    roots = tmp_path / "roots.pem"
+    roots.write_text("-- not a real bundle\n")
+    prod = e2e_settings.model_copy(
+        update={
+            "app_env": "prod",
+            "seal_profile": "PAdES-B-LT",
+            "seal_key_backend": "aws_kms",
+            "blob_backend": "s3",
+            "trust_roots_path": roots,
+            "tsa_url": "https://tsa.example/rfc3161",
+            "database_url": "postgresql+psycopg://esign_app:s3cret@db/esign",
+            "database_owner_url": "postgresql+psycopg://esign_owner:0ther@db/esign",
+        }
+    )
+    with pytest.raises(ConfigurationError) as refused:
+        check_production_settings(prod)
+    message = str(refused.value)
+    assert "SEAL_KMS_KEY_ID" in message and "SEAL_CERT_PATH" in message

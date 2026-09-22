@@ -21,15 +21,29 @@ export function DeclineStep({ session, onDeclined, onBack }: DeclineStepProps) {
     onSuccess: onDeclined,
   });
 
+  /**
+   * A decline is final: it ends the envelope for everyone, and the clinic has to issue a
+   * replacement document to be signed at all (SPEC section 3). Several of the reasons on offer
+   * read like "not now", so the screen has to say what actually happens before the button is
+   * pressed -- it is the one irreversible action in the flow.
+   */
+  const pausing = reason === "needs_more_time" || reason === "wants_to_ask_a_question";
+
   return (
     <StepScreen
       testId="step-decline"
       title="Stop signing on this screen"
       lead={
-        <p>
-          That's fine. Nothing has been signed. Tell us why, and we'll let the clinic know so they
-          can help you another way.
-        </p>
+        <>
+          <p>
+            Nothing has been signed, and nothing you do here is held against you. Tell us why, and
+            we'll let the clinic know so they can help you another way.
+          </p>
+          <p className="mt-2" data-testid="decline-consequence">
+            This closes the document, so it can't be signed here later. If you only need more time,
+            you can leave this page open, or come back to it from your records, instead.
+          </p>
+        </>
       }
     >
       <fieldset className="m-0 border-0 p-0">
@@ -64,6 +78,14 @@ export function DeclineStep({ session, onDeclined, onBack }: DeclineStepProps) {
           Please choose a reason first.
         </p>
       ) : null}
+      {pausing ? (
+        <Notice tone="warn" className="mt-4" alert>
+          <p data-testid="decline-pause-hint">
+            You don't have to close the document for that. Going back leaves it ready to sign
+            whenever you are; closing it means the clinic has to send a new one.
+          </p>
+        </Notice>
+      ) : null}
       {decline.isError ? (
         <Notice tone="error" alert className="mt-5">
           {isNetworkError(decline.error)
@@ -85,7 +107,7 @@ export function DeclineStep({ session, onDeclined, onBack }: DeclineStepProps) {
             decline.mutate(reason);
           }}
         >
-          Stop and tell the clinic
+          Close this document and tell the clinic
         </Button>
         <Button className="min-h-14" onClick={onBack}>
           Go back to signing

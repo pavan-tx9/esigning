@@ -17,36 +17,21 @@ from esign.api.middleware import AccessLog, BodySizeLimit, SecurityHeaders
 from esign.api.ui import install_ui
 from esign.config import Settings
 from esign.db import ping
-from esign.identity import parse_trusted_proxies
 from esign.logging import configure_logging, get_logger
-from esign.runtime import Runtime, build_runtime
+
+# ``check_production_settings`` lives in ``esign.runtime`` so that the worker, ``esign verify`` and
+# every other CLI command are gated by exactly the same function the API is. It is re-exported here
+# because that is where callers and tests have always imported it from.
+from esign.runtime import Runtime, build_runtime, check_production_settings
 
 __all__ = ["check_production_settings", "create_app"]
 
 log = get_logger(__name__)
 
 
-def check_production_settings(settings: Settings) -> None:
-    """Fail at startup, not at the first signature. Production only."""
-    parse_trusted_proxies(settings.trusted_proxy_cidrs)  # a typo here silently changes every recorded IP
-    if settings.app_env != "prod":
-        return
-    problems: list[str] = []
-    if settings.seal_profile == "PAdES-B-T":
-        problems.append("SEAL_PROFILE must be PAdES-B-LT or PAdES-B-LTA in production")
-    if settings.seal_key_backend != "aws_kms":
-        problems.append("SEAL_KEY_BACKEND must be aws_kms in production (the local dev PKI is not a production key)")
-    if settings.blob_backend != "s3":
-        problems.append("BLOB_BACKEND must be s3 in production (the fs backend cannot enforce retention)")
-    if not settings.trust_roots_path.is_file():
-        problems.append("TRUST_ROOTS_PATH does not exist; every verification would fail")
-    if not settings.tsa_url:
-        problems.append("TSA_URL is required in production")
-    if problems:
-        raise RuntimeError("refusing to start: " + "; ".join(problems))
-
-
 def create_app(settings: Settings | None = None, *, runtime: Runtime | None = None) -> FastAPI:
+    # ``build_runtime`` checks the settings; repeated here for the ``runtime=`` path, which does not
+    # go through it.
     rt = runtime or build_runtime(settings)
     check_production_settings(rt.settings)
 

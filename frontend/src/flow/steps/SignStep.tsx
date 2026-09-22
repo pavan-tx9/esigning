@@ -12,6 +12,7 @@ import {
   isMarkField,
   remainingRequired,
   serverFilledFields,
+  TEXT_FIELD_HINT_AT,
   TEXT_FIELD_MAX,
   withAdopted,
   withValue,
@@ -176,9 +177,12 @@ function FieldScreen({
   const nextButton = useRef<HTMLButtonElement>(null);
   const focusNext = useRef(false);
   const inputId = useId();
+  const textCountId = useId();
   const label = labelOf(field);
   const isLast = index + 1 === total;
   const applied = value?.type === "mark";
+  const text = value?.type === "text" ? value.text : "";
+  const textLeft = text.length >= TEXT_FIELD_HINT_AT ? TEXT_FIELD_MAX - text.length : null;
 
   useEffect(() => {
     if (focusNext.current && applied) {
@@ -300,7 +304,8 @@ function FieldScreen({
               id={inputId}
               rows={field.rect.h > 30 ? 3 : 1}
               maxLength={TEXT_FIELD_MAX}
-              value={value?.type === "text" ? value.text : ""}
+              aria-describedby={textLeft === null ? undefined : textCountId}
+              value={text}
               onChange={(event) => {
                 onValue(
                   event.target.value === "" ? null : { type: "text", text: event.target.value },
@@ -309,6 +314,20 @@ function FieldScreen({
               }}
               className="block min-h-12 w-full resize-y rounded-lg bg-sheet px-4 py-2.5 text-ink-900 text-lg ring-[1.5px] ring-edge-strong ring-inset"
             />
+            {/* Typing that simply stops is the one thing a text box must never do without
+                saying so, so the room left is announced as it runs out. */}
+            {textLeft !== null ? (
+              <p
+                id={textCountId}
+                role="status"
+                data-testid="text-chars-left"
+                className={`mt-2 text-sm ${textLeft === 0 ? "font-medium text-danger-600" : "text-ink-700"}`}
+              >
+                {textLeft === 0
+                  ? "That's as much as this box will take."
+                  : `${textLeft} ${textLeft === 1 ? "character" : "characters"} left.`}
+              </p>
+            ) : null}
           </div>
         ) : null}
       </div>

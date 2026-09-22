@@ -281,6 +281,11 @@ def attest_reauth(request: Request, session_id: UUID, body: ReauthBody) -> JSONR
         limit = RateLimits.REAUTH
         rt.limiter.hit(host_key("reauth", host.id), limit=limit.limit, window_seconds=limit.window_seconds)
         info = rt.identity.attest_reauth(db, host=host, session_id=session_id, auth=body.to_contract())
+        # The identity module only knows the session is live, and the session a signer signed from
+        # stays live for the copy download. Only the envelope service can say whether an
+        # attestation could still belong to a signature: it takes the envelope row lock and checks
+        # the signer has not finished and the role re-authenticates at all.
+        rt.envelopes.assert_reauth_allowed(db, info.envelope_id, info.signer_id)
         rt.audit.append(
             db,
             stream_type="envelope",
@@ -321,6 +326,10 @@ def verify_envelope(request: Request, envelope_id: UUID) -> JSONResponse:
     verifier = Verifier(audit=rt.audit, blobs=rt.blobs, sealer=rt.sealer)
     with rt.transaction() as db:
         host, ctx = authenticate_host(request, rt, db)
+        # Every call re-hashes every revision, validates the seal with pyHanko and appends
+        # ``verification.performed`` to an append-only trail that has no delete path.
+        limit = RateLimits.VERIFY
+        rt.limiter.hit(host_key("verify", host.id), limit=limit.limit, window_seconds=limit.window_seconds)
         report = verifier.verify_envelope(db, envelope_id, host=host, actor=_HOST_ACTOR, ctx=ctx)
     return JSONResponse(report.to_json())
 

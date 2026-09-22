@@ -252,7 +252,8 @@ test("choosing paper ends the envelope and tells the clinic", async ({ page }) =
   await expect(frame.getByRole("radio", { name: "I would rather sign on paper" })).toBeChecked();
   await shot(page, "30-decline");
 
-  await frame.getByRole("button", { name: "Stop and tell the clinic" }).click();
+  await expect(frame.getByTestId("decline-consequence")).toContainText("closes the document");
+  await frame.getByRole("button", { name: "Close this document and tell the clinic" }).click();
   await expect(frame.getByTestId("screen-declined")).toBeVisible();
   await expect(page.getByText("Signed on paper instead")).toBeVisible();
   expect(await heard(page)).toContain("esign:declined");

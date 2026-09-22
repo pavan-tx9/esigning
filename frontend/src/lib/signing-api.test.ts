@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ApiError, ApiNetworkError, ApiValidationError, setSessionToken } from "@/lib/api";
 import {
   copyPollDelay,
+  postConsent,
   postSign,
   type SignRequest,
   SubmissionKeys,
@@ -10,6 +11,7 @@ import {
   sessionSchema,
   shouldRetryQuery,
   signedCopyQueryOptions,
+  signingKeys,
 } from "@/lib/signing-api";
 import { mockDb, sessionBody, tokenFor } from "@/mocks/db";
 import { signerApiHandlers } from "@/mocks/handlers";
@@ -124,6 +126,57 @@ describe("the session schema is SPEC 9, exactly", () => {
   });
 });
 
+/**
+ * The host page may embed the UI with a locale, and SPEC section 9 gives that locale two jobs:
+ * `?locale=` picks the disclosure language, and consent records the locale as shown in the session
+ * payload. Neither had a client, so a host asking for one language got the default text and the
+ * trail recorded the default locale.
+ */
+describe("the disclosure language the host asked for", () => {
+  beforeEach(() => {
+    mockDb.reset();
+    setSessionToken(null);
+  });
+
+  it("asks the session for that locale, and keeps it in the query key", async () => {
+    server.use(...signerApiHandlers());
+    setSessionToken(tokenFor("single"));
+
+    const options = sessionQueryOptions("es-MX");
+    expect(options.queryKey).toEqual(["signing", "session", "es-MX"]);
+    expect(sessionQueryOptions().queryKey).toEqual(["signing", "session"]);
+    // Still under the key the flow invalidates after every mutation.
+    expect(options.queryKey.slice(0, 2)).toEqual([...signingKeys.session]);
+
+    await options.queryFn?.(context);
+
+    expect(mockDb.peek("single")?.requestedLocale).toBe("es-MX");
+  });
+
+  it("asks for no locale when the host named none, rather than guessing one", async () => {
+    server.use(...signerApiHandlers());
+    setSessionToken(tokenFor("single"));
+
+    await sessionQueryOptions().queryFn?.(context);
+
+    expect(mockDb.peek("single")?.requestedLocale).toBeNull();
+  });
+
+  it("records consent in the locale the server served, not the one the host asked for", async () => {
+    server.use(...signerApiHandlers());
+    const token = tokenFor("single");
+    setSessionToken(token);
+    const record = mockDb.authenticate(`Bearer ${token}`);
+    record.signerStatus = "viewed";
+    const served = sessionBody(record).consent;
+
+    await postConsent(served.version, served.locale);
+
+    expect(record.consentLocale).toBe("en-US");
+    expect(record.signerStatus).toBe("consented");
+  });
+});
+
 describe("the signed copy", () => {
   beforeEach(() => {
     mockDb.reset();
@@ -195,7 +248,8 @@ describe("idempotent signing", () => {
     const token = tokenFor("flaky-sign");
     setSessionToken(token);
     const record = mockDb.authenticate(`Bearer ${token}`);
-    record.signerStatus = "consented";
+    // Mid-flow, as the service sees it: served the current revision, and told it was read.
+    Object.assign(record, { signerStatus: "consented", presentedRevision: 1, viewedRevision: 1 });
 
     const keys = new SubmissionKeys();
     await expect(postSign(request, keys.keyFor(request))).rejects.toBeInstanceOf(ApiNetworkError);
@@ -210,7 +264,11 @@ describe("idempotent signing", () => {
     server.use(...signerApiHandlers());
     const token = tokenFor("single");
     setSessionToken(token);
-    mockDb.authenticate(`Bearer ${token}`).signerStatus = "consented";
+    Object.assign(mockDb.authenticate(`Bearer ${token}`), {
+      signerStatus: "consented",
+      presentedRevision: 1,
+      viewedRevision: 1,
+    });
     await postSign(request, "fixed-key");
     const different: SignRequest = { ...request, captures: [...request.captures].reverse() };
     const failure = await postSign(different, "fixed-key").catch((error: unknown) => error);

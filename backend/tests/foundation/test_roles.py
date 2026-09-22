@@ -19,7 +19,15 @@ from tests.foundation.helpers import (
     sqlstate,
 )
 
-APPEND_ONLY_TABLES = ["audit_events", "blobs", "document_revisions", "consent_texts", "reauth_attestations"]
+APPEND_ONLY_TABLES = [
+    "audit_events",
+    "blobs",
+    "document_revisions",
+    "consent_texts",
+    "reauth_attestations",
+    # `0502`: the raw signer input. Nothing in the codebase updates or deletes one.
+    "signature_captures",
+]
 
 
 def test_app_role_may_insert_and_read_audit_events(db: Session) -> None:
@@ -64,34 +72,53 @@ def test_app_role_has_no_update_delete_or_truncate_grant(db: Session, table: str
     assert not row.can_truncate
 
 
-@pytest.mark.parametrize(
-    "table",
-    [
-        "hosts",
-        "templates",
-        "template_versions",
-        "envelopes",
-        "signers",
-        "signing_sessions",
-        "signature_captures",
-        "idempotency_keys",
-        "seal_jobs",
-        "webhook_deliveries",
-    ],
-)
-def test_app_role_has_full_dml_but_never_truncate(db: Session, table: str) -> None:
+#: Mutable, but still evidence: the certificate of completion is built from `signers`,
+#: `signing_sessions` and `signature_captures`, and nothing in the codebase deletes from any of
+#: these. `0602` took DELETE away (SPEC section 2).
+NO_DELETE_TABLES = [
+    "hosts",
+    "templates",
+    "template_versions",
+    "envelopes",
+    "signers",
+    "signing_sessions",
+    "signature_captures",
+    "seal_jobs",
+    "webhook_deliveries",
+]
+
+#: Append-only from `0502`: the raw signer input, insert-only like every other piece of evidence.
+UPDATABLE_TABLES = [t for t in NO_DELETE_TABLES if t != "signature_captures"]
+
+
+@pytest.mark.parametrize("table", [*UPDATABLE_TABLES, "idempotency_keys"])
+def test_app_role_may_read_write_and_update_but_never_truncate(db: Session, table: str) -> None:
     row = db.execute(
         text(
             "SELECT has_table_privilege('esign_app', :t, 'SELECT') AS can_select, "
             "       has_table_privilege('esign_app', :t, 'INSERT') AS can_insert, "
             "       has_table_privilege('esign_app', :t, 'UPDATE') AS can_update, "
-            "       has_table_privilege('esign_app', :t, 'DELETE') AS can_delete, "
             "       has_table_privilege('esign_app', :t, 'TRUNCATE') AS can_truncate"
         ),
         {"t": table},
     ).one()
-    assert row.can_select and row.can_insert and row.can_update and row.can_delete
+    assert row.can_select and row.can_insert and row.can_update
     assert not row.can_truncate
+
+
+@pytest.mark.parametrize("table", NO_DELETE_TABLES)
+def test_app_role_cannot_delete_from_the_evidence_bearing_tables(db: Session, table: str) -> None:
+    """No code path deletes from these, and three of them are what the certificate is built from."""
+    assert not db.execute(text("SELECT has_table_privilege('esign_app', :t, 'DELETE')"), {"t": table}).scalar_one()
+    with pytest.raises(DBAPIError) as caught, db.begin_nested():
+        db.execute(text(f"DELETE FROM {table}"))
+    assert sqlstate(caught.value) == INSUFFICIENT_PRIVILEGE
+
+
+def test_app_role_may_still_delete_expired_idempotency_keys(db: Session) -> None:
+    """The one DELETE the application issues: a cache with a TTL, not evidence."""
+    assert db.execute(text("SELECT has_table_privilege('esign_app', 'idempotency_keys', 'DELETE')")).scalar_one()
+    db.execute(text("DELETE FROM idempotency_keys WHERE created_at < now() - interval '1 day'"))
 
 
 def test_app_role_cannot_create_tables(db: Session) -> None:

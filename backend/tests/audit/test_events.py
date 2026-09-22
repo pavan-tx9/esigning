@@ -158,9 +158,10 @@ def test_hashes_and_ids_are_canonicalised_on_the_way_in() -> None:
 
 def test_captures_accept_plain_dicts_so_callers_need_no_import_from_this_package() -> None:
     result = validate_event_data(EventType.SIGNER_SIGNED, sample_data(EventType.SIGNER_SIGNED))
+    # Every declared field is written, absent ones as null, exactly as for a top-level payload.
     assert result["captures"] == [
-        {"field_id": "patient_sig", "kind": "drawn"},
-        {"field_id": "patient_initials", "kind": "typed"},
+        {"field_id": "patient_sig", "kind": "drawn", "image_sha256": None, "typed_text_sha256": None},
+        {"field_id": "patient_initials", "kind": "typed", "image_sha256": None, "typed_text_sha256": None},
     ]
 
 

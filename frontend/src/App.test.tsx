@@ -304,6 +304,70 @@ describe("the whole flow for one patient", () => {
   }, 20_000);
 });
 
+describe("when the document moves on under the signer", () => {
+  /**
+   * The service refuses a signature unless the bytes this session was served are the bytes the
+   * signer said they had read (SPEC section 3, `signers.viewed_sha256`): 409 `not_viewed`. Their
+   * signer status is still `consented`, so nothing in `placeFor` would send them back to the
+   * review step -- without this, the refusal is a dead "Try again" button.
+   */
+  it("sends them back to read it again, and then the signature stands", async () => {
+    // A first visit, in which the patient reads and agrees to the document as it stood.
+    const before = embed();
+    const firstVisit = render(<App channel={before.channel} />);
+    await before.send({ type: "esign:init", token: tokenFor("multi") });
+    await throughConsent();
+
+    // The witness signs, so the current revision moves on.
+    mockDb.otherSignerSigned("multi");
+
+    // The tablet is reloaded: a fresh page with the same token, so the UI is served the *new*
+    // revision, and nothing on the server says this signer has read it.
+    firstVisit.unmount();
+    setSessionToken(null);
+    const host = embed();
+    render(<App channel={host.channel} />);
+    await host.send({ type: "esign:init", token: tokenFor("multi") });
+
+    // The server says "consented", so the flow resumes at the signing step.
+    await screen.findByTestId("step-sign-adopt");
+    await adoptPrintedName();
+    await click("Add my initials here");
+    await click("Next");
+    await click("Skip");
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    // Refused, and the signer is put where they can do something about it.
+    await screen.findByTestId("review-again");
+    expect(screen.getByTestId("step-review")).toBeInTheDocument();
+    expect(mockDb.peek("multi")?.signerStatus).toBe("consented");
+
+    // Reading it again is all it takes. The answers they already gave are still there, so the
+    // signing step goes straight to the summary.
+    await user.click(await screen.findByRole("button", { name: "test: display every page" }));
+    await click("Continue");
+    await screen.findByTestId("step-consent");
+    await user.click(screen.getByRole("checkbox", { name: /I agree to sign electronically/ }));
+    await click("Agree and continue");
+    await screen.findByTestId("step-sign-summary");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    await screen.findByTestId("waiting-on-others");
+    const record = mockDb.peek("multi");
+    expect(record?.signerStatus).toBe("signed");
+    expect(record?.viewedRevision).toBe(2);
+    expect(types(host)).toContain("esign:signed");
+  }, 30_000);
+});
+
 describe("re-authentication", () => {
   async function toConfirm() {
     const host = await start("clinician");
@@ -320,11 +384,15 @@ describe("re-authentication", () => {
     const host = await toConfirm();
     await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
 
-    // Signing is not possible before re-authentication.
+    // Signing is not possible before re-authentication, and pressing the greyed button says so
+    // on screen -- not only to the live region, where a sighted clinician never sees it.
     await click("Sign document");
     expect(mockDb.peek("clinician")?.signRequests).toHaveLength(0);
+    expect(screen.getByRole("alert")).toHaveTextContent("Confirm it's you first");
+    expect(screen.getByRole("button", { name: "Confirm it's me" })).toHaveFocus();
 
     await click("Confirm it's me");
+    expect(screen.queryByText(/Confirm it's you first/)).toBeNull();
     // The host is told *which* session to re-authenticate: its backend needs the id for the
     // server-to-server call, and it can refuse a message about a session it did not start.
     expect(host.posted.at(-1)).toEqual({
@@ -359,6 +427,131 @@ describe("re-authentication", () => {
   }, 20_000);
 });
 
+/**
+ * Both deadlines in the flow -- the session's and the re-authentication's -- are server time.
+ * The clock on a clinic tablet is nobody's promise: a device a few minutes fast used to read every
+ * successful re-authentication as lapsed (so "Sign document" stayed inert for ever), and one more
+ * than the session TTL fast landed the signer on "this session has ended" as the session loaded,
+ * wiping the draft. The server enforces both limits itself, and says so with 403 and 401.
+ */
+/**
+ * The host embeds the UI with a locale (SPEC section 9: `?locale=` picks the disclosure language,
+ * and consent carries the locale as shown in the session payload). It used to be used for one
+ * thing only -- stamping `<html lang>` -- so a host asking for Spanish got the English disclosure
+ * on a page that told assistive technology it was Spanish.
+ */
+describe("the locale the host asked for", () => {
+  it("asks the server for it, and declares the language actually served", async () => {
+    document.documentElement.lang = "en";
+    const host = embed();
+    render(<App channel={host.channel} />);
+    await host.send({ type: "esign:init", token: tokenFor("single"), locale: "es-MX" });
+
+    await screen.findByTestId("step-review");
+    expect(mockDb.peek("single")?.requestedLocale).toBe("es-MX");
+    // Only en-US is seeded, so that is what was served -- and what the page declares. Claiming
+    // "es-MX" over English copy would have a screen reader pronounce it with Spanish rules.
+    expect(document.documentElement.lang).toBe("en-US");
+  });
+
+  it("posts consent in the locale the disclosure was served in", async () => {
+    await start("single");
+    await user.click(await screen.findByRole("button", { name: "test: display every page" }));
+    await click("Continue");
+    await screen.findByTestId("step-consent");
+    await user.click(screen.getByRole("checkbox", { name: /I agree to sign electronically/ }));
+    await click("Agree and continue");
+
+    await screen.findByTestId("step-sign-adopt");
+    expect(mockDb.peek("single")?.consentLocale).toBe("en-US");
+  }, 15_000);
+});
+
+describe("reading the document", () => {
+  it("tells a screen reader what the zoom is, and when a press changed nothing", async () => {
+    await start("single");
+    await screen.findByTestId("step-review");
+
+    const readout = await screen.findByTestId("zoom-level");
+    expect(readout).toHaveTextContent("Zoom 100%");
+    expect(readout).toHaveAttribute("role", "status");
+    expect(readout).not.toHaveAttribute("aria-hidden");
+    const smaller = screen.getByRole("button", { name: "Make the document smaller" });
+    const larger = screen.getByRole("button", { name: "Make the document larger" });
+    expect(smaller).toHaveAttribute("aria-describedby", readout.id);
+    expect(larger).toHaveAttribute("aria-describedby", readout.id);
+
+    // At the smallest size the press is a no-op, and silence would leave a blind user guessing.
+    await user.click(smaller);
+    await waitFor(() =>
+      expect(screen.getByTestId("announcer")).toHaveTextContent("already at the smallest size"),
+    );
+    expect(readout).toHaveTextContent("Zoom 100%");
+
+    await user.click(larger);
+    expect(readout).toHaveTextContent("Zoom 150%");
+    await waitFor(() =>
+      expect(screen.getByTestId("announcer")).toHaveTextContent("Zoom 150 percent"),
+    );
+  }, 15_000);
+});
+
+describe("a device whose clock is wrong", () => {
+  it("does not end a live session because the tablet is running fast", async () => {
+    mockDb.setDeviceClockSkew(45 * 60_000);
+    const host = await start("single");
+
+    // The session (30 minutes) looks long over by this device's clock; the server disagrees.
+    expect(await screen.findByTestId("step-review")).toBeInTheDocument();
+    expect(screen.queryByTestId("screen-expired")).toBeNull();
+    expect(types(host)).not.toContain("esign:expired");
+    // The warning is advisory, and it says what it does not know.
+    expect(screen.getByTestId("deadline-banner")).toHaveTextContent("due to close");
+
+    // And the flow still works: the server is the one that decides.
+    await user.click(await screen.findByRole("button", { name: "test: display every page" }));
+    await click("Continue");
+    expect(await screen.findByTestId("step-consent")).toBeInTheDocument();
+    expect(mockDb.peek("single")?.signerStatus).toBe("viewed");
+  }, 15_000);
+
+  it("lets a clinician sign on a fast tablet once the server has confirmed them", async () => {
+    mockDb.setDeviceClockSkew(10 * 60_000);
+    const host = await start("clinician");
+    await throughConsent();
+    await adoptPrintedName();
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+
+    await click("Confirm it's me");
+    mockDb.attestReauth("clinician");
+    await host.send({ type: "esign:reauth_done" });
+    // The attestation is good for two minutes of *server* time, ten minutes behind this device.
+    await screen.findByTestId("reauth-verified");
+
+    await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+    await screen.findByTestId("step-done");
+    expect(mockDb.peek("clinician")?.signerStatus).toBe("signed");
+  }, 20_000);
+});
+
+describe("the session-deadline warning", () => {
+  it("stays on screen while the patient reads, rather than scrolling off the top", async () => {
+    await start("ending-soon");
+    const banner = await screen.findByTestId("deadline-banner");
+
+    expect(banner).toHaveTextContent(/this session closes in about \d+ minutes?/);
+    expect(banner.className).toContain("sticky");
+    // Above the document pages and the review step's own sticky footer (z-10).
+    expect(banner.className).toMatch(/\bz-30\b/);
+    // Announced when it first appears, not only when someone happens to look up.
+    expect(within(banner).getByRole("alert")).toBeInTheDocument();
+  });
+});
+
 describe("endings", () => {
   it("an expired token gets its own screen, tells the host, and forgets the token", async () => {
     const host = await start("expired");
@@ -388,12 +581,50 @@ describe("endings", () => {
     await click("Go back to signing");
     await screen.findByTestId("step-consent");
     await click("I'd rather sign on paper");
-    await click("Stop and tell the clinic");
+    await click("Close this document and tell the clinic");
     expect(await screen.findByTestId("screen-declined")).toBeInTheDocument();
     expect(mockDb.peek("single")?.declineReason).toBe("prefers_paper");
     expect(types(host)).toContain("esign:declined");
     expect(hasSessionToken()).toBe(false);
   });
+
+  /**
+   * A decline ends the envelope for everyone and can only be undone by issuing a new document
+   * (SPEC section 3). It is the only irreversible action in the flow, and several of the reasons
+   * on offer read like "not now", so both the screen that does it and the screen after it have to
+   * say what it costs.
+   */
+  it("says that declining closes the document, before and after it happens", async () => {
+    await start("single");
+    await user.click(await screen.findByRole("button", { name: "test: display every page" }));
+    await click("Continue");
+    await screen.findByTestId("step-consent");
+    await click("I'd rather sign on paper");
+    await screen.findByTestId("step-decline");
+
+    expect(screen.getByTestId("decline-consequence")).toHaveTextContent(
+      "closes the document, so it can't be signed here later",
+    );
+    expect(
+      screen.getByRole("button", { name: "Close this document and tell the clinic" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop and tell the clinic" })).toBeNull();
+
+    // "I need more time" is not a reason to end the envelope, and the screen says so.
+    await user.click(screen.getByRole("radio", { name: "I need more time to read this" }));
+    expect(screen.getByTestId("decline-pause-hint")).toHaveTextContent(
+      "You don't have to close the document for that",
+    );
+
+    await user.click(screen.getByRole("radio", { name: "I would rather sign on paper" }));
+    expect(screen.queryByTestId("decline-pause-hint")).toBeNull();
+    await click("Close this document and tell the clinic");
+
+    expect(await screen.findByTestId("declined-consequence")).toHaveTextContent(
+      "This document is now closed",
+    );
+    expect(screen.getByText(/ask a member of staff for a paper copy/)).toBeInTheDocument();
+  }, 15_000);
 
   it("a kiosk session ends on hand-back with every trace of the patient gone", async () => {
     const host = await start("kiosk");

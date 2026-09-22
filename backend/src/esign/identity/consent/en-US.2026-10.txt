@@ -1,0 +1,63 @@
+version: 2026-10
+locale: en-US
+effective_at: 2026-10-01T00:00:00Z
+---
+# Agreement to sign electronically
+
+Before you sign, please read this. It explains what you are agreeing to, and how to sign on paper
+instead if you would rather.
+
+## What you are agreeing to
+
+You are agreeing to receive this document electronically and to sign it with an electronic
+signature. Your electronic signature has the same legal effect as a signature in ink.
+
+This agreement covers only the document in front of you now. If you are asked to sign something
+else later, you will be asked again.
+
+## You can sign on paper instead
+
+You do not have to sign electronically. At any point before you sign, you can choose to sign on
+paper instead. Select "I would rather sign on paper", or tell a member of staff, and this signing
+session will end. No one will treat you differently for asking, and your care is not affected.
+
+## Withdrawing your agreement
+
+You can withdraw this agreement at any time before you sign, by choosing to sign on paper or by
+closing this window without signing. Withdrawing costs nothing.
+
+Once you have signed, the signed document is part of your record and cannot be withdrawn. If you
+believe you signed something in error, tell your care team: they can correct the record by issuing
+a replacement document.
+
+## Getting a copy
+
+When everyone has signed, you can download a copy of the signed document from this screen. If you
+are signing on a clinic device, the screen is handed back to staff instead, and staff will give you
+your copy. Either way the copy stays available through your patient record. The copy includes a
+certificate showing who signed, when, and how their identity was established.
+
+You can also ask for a paper copy at any time, at no charge, by contacting the clinic or health
+system that asked you to sign.
+
+## What you need to sign electronically
+
+To read and sign this document, you need:
+
+- a device with an up-to-date web browser and internet access,
+- the ability to display and read a PDF document,
+- a screen and either a touchscreen, a mouse or a keyboard, so you can draw or type your
+  signature, and
+- somewhere to save or print a copy, if you would like to keep one yourself.
+
+If you are signing on a clinic device, staff provide all of these; ask them for a paper copy if you
+would rather have one.
+
+## Keeping your details current
+
+If your contact details change, update them with the clinic or health system in the usual way.
+This service does not hold your contact details separately, and does not send you email.
+
+## Questions
+
+If anything here is unclear, ask a member of staff before you sign. You can stop at any point.

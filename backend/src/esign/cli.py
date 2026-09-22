@@ -32,7 +32,7 @@ from esign.api.template_service import TemplateService
 from esign.config import Settings, get_settings
 from esign.contracts import Actor, Clock, EsignError, Host, NotFound, RequestContext
 from esign.logging import configure_logging
-from esign.runtime import Runtime, build_runtime
+from esign.runtime import ConfigurationError, Runtime, build_runtime
 
 __all__ = ["main"]
 
@@ -300,6 +300,10 @@ def main(argv: list[str] | None = None, *, runtime: Runtime | None = None) -> in
 
             return _dev_pki(args, rt_factory, settings=settings, clock=runtime.clock if runtime else SystemClock())
         return int(args.run(args, rt_factory))
+    except ConfigurationError as exc:
+        # Settings this process must not run with. ``build_runtime`` raises before it opens a
+        # connection, so nothing has been touched; the message names settings, never data.
+        return _fail(f"error: {exc}")
     except EsignError as exc:
         # The code only: a module's message may quote what it was given.
         return _fail(f"error: {exc.code}")

@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from tests.documents.test_content_streams import over_cap_pdf
 from tests.e2e.conftest import TEMPLATES_DIR, Ehr, World
 
 
@@ -89,3 +90,17 @@ def test_bad_uploads_are_refused(world: World) -> None:
     )
     assert garbage.status_code == 422 and garbage.json()["error"]["code"] == "definitions_invalid"
     assert ehr.get("/templates").json() == {"templates": []}
+
+
+def test_a_template_whose_content_cannot_be_decoded_is_refused_at_upload(world: World) -> None:
+    """It used to publish cleanly and then 500 at ``POST /v1/envelopes``.
+
+    ``inspect_template_pdf`` never decoded a page's content stream, so a file whose FlateDecode
+    content inflates past pypdf's output cap passed inspection; stamping is the first thing that
+    decodes it, and ``draw_overlay`` had no ``except`` of its own.
+    """
+    ehr = world.host()
+    refused = _upload(ehr, "/templates", "patient_consent", pdf=over_cap_pdf())
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["error"]["code"] == "template_content_unreadable"
+    assert ehr.get("/templates").json()["templates"] == []

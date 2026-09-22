@@ -7,6 +7,7 @@ import {
   initialsFrom,
   isFieldComplete,
   remainingRequired,
+  TEXT_FIELD_MAX,
   withAdopted,
   withValue,
 } from "@/flow/draft";
@@ -111,6 +112,22 @@ describe("the signing draft", () => {
     draft = withValue(draft, "ack", { type: "checkbox", checked: true });
     const changed = withAdopted(draft, { kind: "typed", text: "Maria" }, "MA");
     expect(changed.values).toEqual({ ack: { type: "checkbox", checked: true } });
+  });
+
+  /**
+   * SPEC section 9 bounds a text field at `MAX_TEXT_FIELD_CHARS` (2000). The UI used to cut it at
+   * 200 -- the typed-signature bound -- so a long answer was silently truncated on its way to the
+   * server, and the textarea simply stopped accepting keystrokes at a tenth of the real limit.
+   */
+  it("carries a text answer up to the limit the server accepts, and no further", () => {
+    expect(TEXT_FIELD_MAX).toBe(2000);
+    const long = "a".repeat(TEXT_FIELD_MAX);
+    const draft = withValue(emptyDraft, "note", { type: "text", text: long });
+    expect(buildCaptures(fields, draft)).toEqual([{ field_id: "note", text_value: long }]);
+
+    const tooLong = withValue(emptyDraft, "note", { type: "text", text: "b".repeat(2500) });
+    const capture = buildCaptures(fields, tooLong)[0] as { text_value: string };
+    expect(capture.text_value).toHaveLength(TEXT_FIELD_MAX);
   });
 
   it("derives initials from a name, skipping titles", () => {

@@ -62,7 +62,13 @@ window.addEventListener("message", (event) => {
     }
     initialised = true;
     note("in", data.type);
-    send({ type: "esign:init", token: tokenFor(scenario), locale: "en-US" });
+    // `?locale=` on the harness stands in for a host that embeds in another language: the UI
+    // should ask the API for it and then declare whatever the API actually served.
+    send({
+      type: "esign:init",
+      token: tokenFor(scenario),
+      locale: params.get("locale") ?? "en-US",
+    });
     return;
   }
   if (data.type === "esign:resize") {

@@ -79,6 +79,16 @@ class RateLimits:
     CONSENT = Limit(limit=10, window_seconds=60)
     #: Per session: signing attempts.
     SIGN = Limit(limit=10, window_seconds=60)
+    #: Per session: fetching the document or the session payload. Both re-read and re-hash the
+    #: current revision, and presenting the document *appends* ``document.presented``. There is no
+    #: delete path for audit events, so an unbounded loop with one live token would grow the trail
+    #: for ever and slow every later ``audit.verify`` -- which ``seal_pending`` runs.
+    PRESENT = Limit(limit=60, window_seconds=60)
+    #: Per session: downloading the signed copy, which appends ``document.downloaded``.
+    COPY = Limit(limit=30, window_seconds=60)
+    #: Per host: running a verification, which re-hashes every revision, validates the seal with
+    #: pyHanko and appends ``verification.performed``.
+    VERIFY = Limit(limit=30, window_seconds=60)
 
 
 def host_key(scope: str, host_id: object) -> str:

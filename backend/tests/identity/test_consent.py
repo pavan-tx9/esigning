@@ -47,6 +47,31 @@ def test_the_shipped_disclosure_covers_what_esign_requires() -> None:
     assert "!" not in body
 
 
+def test_the_newest_disclosure_does_not_promise_a_kiosk_patient_a_download() -> None:
+    """SPEC section 11: on a kiosk the flow ends on a hand-back screen with no copy to download.
+
+    ``2026-09`` said flatly "you can download a copy of the signed document from this screen", and
+    the patient's acceptance of those exact words is hashed into ``consent.accepted``. Consent texts
+    are immutable, so the fix is a new version rather than an edit.
+    """
+    newest = [item for item in bundled_consent_texts() if item.locale == "en-US"][-1]
+    body = newest.body.lower()
+    assert "clinic device" in body
+    assert "staff will give you" in body
+    # The download is still offered, but no longer as the only way a copy arrives.
+    assert "from this screen" in body
+    assert "patient record" in body
+
+
+def test_every_bundled_disclosure_covers_what_esign_requires() -> None:
+    """A new version must not drop what the old one promised."""
+    for bundled in bundled_consent_texts():
+        body = bundled.body.lower()
+        for phrase in ("sign on paper", "withdraw", "browser", "copy", "no charge"):
+            assert phrase in body, f"{bundled.locale}.{bundled.version} does not mention {phrase!r}"
+        assert "!" not in body
+
+
 def test_the_shipped_disclosure_hashes_the_same_every_time() -> None:
     body = next(item for item in bundled_consent_texts() if item.locale == "en-US").body
     assert body_sha256(body) == body_sha256(body.replace("\n", "\r\n"))

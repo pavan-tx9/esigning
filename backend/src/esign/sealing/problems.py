@@ -64,6 +64,10 @@ class Problem:
     #: A timestamp is present but does not verify, or its TSA is not trusted.
     TIMESTAMP_INVALID: Final = "timestamp_invalid"
 
+    #: The signature dictionary's ``/Location`` is not ``envelope:<id>`` for the envelope this seal
+    #: was meant to complete. The binding SPEC section 5 requires is absent or names something else.
+    LOCATION_MISMATCH: Final = "location_mismatch"
+
     #: Validation itself broke in a way we did not anticipate. Never a pass.
     VALIDATION_ERROR: Final = "validation_error"
 

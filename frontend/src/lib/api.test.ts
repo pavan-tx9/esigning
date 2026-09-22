@@ -1,12 +1,14 @@
-import { HttpResponse, http } from "msw";
-import { beforeEach, describe, expect, it } from "vitest";
+import { delay, HttpResponse, http } from "msw";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   ApiError,
   ApiNetworkError,
   ApiValidationError,
   api,
+  apiBytes,
   hasSessionToken,
+  JSON_TIMEOUT_MS,
   setSessionToken,
 } from "@/lib/api";
 import { server } from "@/test/server";
@@ -133,5 +135,69 @@ describe("the fetch seam", () => {
     server.use(http.get("/v1/signing/session", () => new HttpResponse("<html>")));
 
     await expect(api("/signing/session", sessionSchema)).rejects.toBeInstanceOf(ApiValidationError);
+  });
+});
+
+/**
+ * A connection that stalls rather than fails -- Wi-Fi dropped mid-request, a captive portal --
+ * used to leave the signer on a busy button until the browser's own TCP timeout minutes later,
+ * with no error and no way to retry. Every call has a deadline, and passing it is a network
+ * failure: the copy and the retry the flow already has for one apply to the other.
+ */
+describe("a request that never finishes", () => {
+  const stalls = (path: string) => server.use(http.get(path, async () => delay("infinite")));
+
+  beforeEach(() => {
+    setSessionToken(null);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("fails as a network error once its deadline passes", async () => {
+    stalls("/v1/signing/session");
+
+    const failure = await api("/signing/session", sessionSchema, { timeoutMs: 20 }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(ApiNetworkError);
+  });
+
+  it("gives every JSON call a deadline without being asked", async () => {
+    vi.useFakeTimers();
+    stalls("/v1/signing/session");
+
+    const call = api("/signing/session", sessionSchema).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(JSON_TIMEOUT_MS + 1);
+
+    expect(await call).toBeInstanceOf(ApiNetworkError);
+  });
+
+  it("gives a PDF longer than a JSON call, since it is megabytes on clinic wifi", async () => {
+    vi.useFakeTimers();
+    stalls("/v1/signing/document");
+
+    const call = apiBytes("/signing/document").catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(JSON_TIMEOUT_MS + 1);
+    expect(await Promise.race([call, Promise.resolve("still waiting")])).toBe("still waiting");
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await call).toBeInstanceOf(ApiNetworkError);
+  });
+
+  it("keeps a caller's own abort recognisable as a cancellation, not a failure", async () => {
+    stalls("/v1/signing/session");
+    const controller = new AbortController();
+
+    const call = api("/signing/session", sessionSchema, { signal: controller.signal }).catch(
+      (error: unknown) => error,
+    );
+    controller.abort();
+
+    const failure = await call;
+    expect(failure).toBeInstanceOf(DOMException);
+    expect((failure as DOMException).name).toBe("AbortError");
   });
 });

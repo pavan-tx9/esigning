@@ -97,12 +97,27 @@ def seal_one(rt: Runtime, envelope_id: UUID, *, claimed_at: datetime | None = No
     except Conflict as exc:
         # Not in completed_pending_seal. Sealed already (another worker, or the inline attempt)
         # means the job is simply finished; anything else must not be retried every tick.
-        return _settle_refused_job(rt, envelope_id, exc.code)
+        #
+        # Both recovery helpers open a transaction of their own, and an exception raised inside an
+        # ``except`` clause is not caught by its sibling: without these guards a database error
+        # while settling the job would escape ``seal_one``, which promises never to raise for an
+        # expected failure. That answer reaches the signer as a 500 for a signature that *was*
+        # recorded, and in the worker it aborts the whole tick.
+        try:
+            return _settle_refused_job(rt, envelope_id, exc.code)
+        except Exception:
+            log.error("worker.seal_settle_failed", envelope_id=envelope_id, error_code=exc.code)
+            return False
     except Exception as exc:
         code = exc.code if isinstance(exc, EsignError) else "internal_error"
         log.warning("worker.seal_attempt_failed", envelope_id=envelope_id, error_code=code)
         if claimed_at is not None:
-            _ensure_backed_off(rt, envelope_id, claimed_at, code)
+            try:
+                _ensure_backed_off(rt, envelope_id, claimed_at, code)
+            except Exception:
+                # The claim stays ours until it goes stale, which the next worker takes over. The
+                # envelope is still completed_pending_seal and nothing reports it complete.
+                log.error("worker.seal_backoff_failed", envelope_id=envelope_id, error_code=code)
         return False
 
 

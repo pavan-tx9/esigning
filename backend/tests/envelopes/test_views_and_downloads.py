@@ -196,6 +196,9 @@ def test_storage_being_down_leaves_the_envelope_pending_like_a_kms_outage(bench:
         raise StorageUnavailable("the blob store did not answer")
 
     bench.blobs.put = refusing_put  # type: ignore[method-assign, assignment]
+    # ``seal_pending`` rolls its own transaction back before recording the failure, so the
+    # setup this assertion reads has to be committed first.
+    db.commit()
     with pytest.raises(StorageUnavailable):
         bench.service.seal_pending(db, view.id)
     assert bench.status(db, view.id) == "completed_pending_seal"

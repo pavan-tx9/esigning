@@ -220,12 +220,22 @@ class ReauthAttestedData(EventData):
 
 
 class CaptureRef(BaseModel):
-    """Which field was filled and how. No captured value -- the mark itself is in the PDF."""
+    """Which field was filled and how, and a digest of what was captured.
+
+    No captured *value*: the mark itself is in the PDF, and a typed signature is a name. The two
+    digests are what tie the row in ``signature_captures`` -- the raw drawn PNG, the typed text --
+    to the append-only, hash-chained trail. Without them the only record of the raw input was a
+    mutable row that no check could contradict.
+    """
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     field_id: Slug
     kind: CaptureKindName
+    #: The drawn PNG as stored (content-addressed), for a ``drawn`` capture.
+    image_sha256: Sha256 | None = None
+    #: SHA-256 of the typed text as stored, for a ``typed`` capture. A digest, never the name.
+    typed_text_sha256: Sha256 | None = None
 
 
 class SignerSignedData(EventData):

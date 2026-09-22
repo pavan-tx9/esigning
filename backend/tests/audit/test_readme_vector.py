@@ -38,7 +38,15 @@ VECTOR_FIELDS: dict[str, Any] = {
             "revision_no": 2,
             "revision_sha256": bytes.fromhex("9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f"),
             "capture_count": 1,
-            "captures": [{"field_id": "patient_sig", "kind": "drawn"}],
+            # A drawn capture carries the digest of the image that was stored, which is what ties
+            # the row in `signature_captures` to this chain.
+            "captures": [
+                {
+                    "field_id": "patient_sig",
+                    "kind": "drawn",
+                    "image_sha256": bytes.fromhex("c1d2e3f405162738495a6b7c8d9eaf0112233445566778899aabbccddeeff001"),
+                }
+            ],
         },
     ),
     "document_sha256": bytes.fromhex("9a8b7c6d5e4f30211203f4e5d6c7b8a9f0e1d2c3b4a59687786950413223145f"),

@@ -57,7 +57,7 @@ export function ConsentStep({ session, onContinue, onPreferPaper }: ConsentStepP
   const hintId = useId();
 
   const consent = useMutation({
-    mutationFn: () => postConsent(session.consent.version),
+    mutationFn: () => postConsent(session.consent.version, session.consent.locale),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: signingKeys.session });
       onContinue();

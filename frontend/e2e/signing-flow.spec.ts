@@ -306,7 +306,8 @@ test("choosing paper leads to decline, and the host is told", async ({ page }) =
   await expect(ui.getByTestId("step-decline")).toBeVisible();
   await expect(ui.getByRole("radio", { name: "I would rather sign on paper" })).toBeChecked();
   await shot(page, "50-decline");
-  await ui.getByRole("button", { name: "Stop and tell the clinic" }).click();
+  await expect(ui.getByTestId("decline-consequence")).toContainText("closes the document");
+  await ui.getByRole("button", { name: "Close this document and tell the clinic" }).click();
   await expect(ui.getByTestId("screen-declined")).toBeVisible();
   await shot(page, "51-declined");
   await expect(page.locator('#log li[data-message="esign:declined"]')).toHaveCount(1);
@@ -340,6 +341,34 @@ test("expired, withdrawn, failing and never-connected sessions each get their ow
   await shot(page, "65-connecting");
   await expect(ui.getByTestId("screen-connect-failed")).toBeVisible({ timeout: 20_000 });
   await shot(page, "66-connect-failed");
+});
+
+/**
+ * The review and consent screens are the two long scrollers, and the patient who needs the
+ * "closing soon" warning is the one who has been reading for two minutes -- far below the top of
+ * the page. The warning used to be an ordinary block at the top of `<main>`, so by the time it
+ * appeared it was painted out of view, and the next thing that happened was the draft being lost.
+ */
+test("the session warning stays on screen while the patient scrolls and reads", async ({
+  page,
+}) => {
+  const ui = await open(page, "ending-soon");
+  const banner = ui.getByTestId("deadline-banner");
+  await expect(banner).toBeVisible();
+  await expect(banner).toBeInViewport();
+
+  // Read the whole document: the banner is still there, not somewhere above the scroll.
+  await readEveryPage(ui, 2);
+  await expect(banner).toBeInViewport();
+  await shot(page, "67-ending-soon-review-scrolled");
+
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await expect(ui.getByTestId("step-consent")).toBeVisible();
+  await ui
+    .getByRole("checkbox", { name: /I agree to sign electronically/ })
+    .scrollIntoViewIfNeeded();
+  await expect(banner).toBeInViewport();
+  await shot(page, "68-ending-soon-consent-scrolled");
 });
 
 test("dark mode and a 360px screen", async ({ browser }) => {

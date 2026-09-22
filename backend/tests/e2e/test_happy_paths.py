@@ -168,3 +168,49 @@ def test_parallel_signers_may_sign_in_any_order(ehr: Ehr, world: World) -> None:
     assert ehr.envelope(envelope["id"])["status"] == "sealed"
     report = ehr.verification(envelope["id"])
     assert report["ok"] and report["complete"], report["problems"]
+
+
+def test_a_typed_signature_at_the_configured_bound_is_accepted(ehr: Ehr, world: World) -> None:
+    """SPEC section 9: ``typed_text`` is bounded by ``MAX_TYPED_SIGNATURE_CHARS`` (200), and that
+    bound has one definition in ``Settings`` (SPEC section 13).
+
+    The documents module used to keep a private, smaller copy (80), so a typed signature between
+    the two was accepted by the wire schema and by the envelope service and then refused while
+    stamping -- under the envelope row lock, as a bare 422 with no message of its own.
+    """
+    limit = world.settings.max_typed_signature_chars
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    payload = patient.review_and_consent()
+
+    captures = [
+        {"field_id": f["id"], "kind": "typed", "typed_text": "N" * limit}
+        for f in payload["fields"]
+        if f["type"] == "signature"
+    ]
+    signed = patient.post(
+        "/sign", {"intent_confirmed": True, "captures": captures}, **{"Idempotency-Key": "typed-at-bound"}
+    )
+    assert signed.status_code == 200, signed.text
+    assert ehr.envelope(envelope["id"])["status"] == "sealed"
+
+
+def test_a_typed_signature_over_the_bound_is_refused_at_the_edge(ehr: Ehr, world: World) -> None:
+    """One character more is a 422 from the request model, before anything is stamped or stored."""
+    over = "N" * (world.settings.max_typed_signature_chars + 1)
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    payload = patient.review_and_consent()
+
+    captures = [
+        {"field_id": f["id"], "kind": "typed", "typed_text": over}
+        for f in payload["fields"]
+        if f["type"] == "signature"
+    ]
+    refused = patient.post(
+        "/sign", {"intent_confirmed": True, "captures": captures}, **{"Idempotency-Key": "typed-over-bound"}
+    )
+    assert refused.status_code == 422, refused.text
+    # Refused while the request body is being turned into captures, so nothing was stamped.
+    assert refused.json()["error"]["code"] == "capture_shape_invalid"
+    assert ehr.envelope(envelope["id"])["signers"][0]["status"] == "consented"

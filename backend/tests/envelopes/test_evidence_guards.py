@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from esign.contracts import (
     Capture,
+    Conflict,
     EnvelopeView,
     IntegrityFailure,
     NewSigner,
@@ -27,6 +28,8 @@ from esign.contracts import (
 from esign.ids import new_id
 from tests.envelopes.conftest import (
     CTX,
+    HIPAA_PAIR,
+    PAGES,
     PATIENT_CONSENT,
     Bench,
     TemplateSpec,
@@ -269,6 +272,10 @@ def test_a_broken_audit_chain_refuses_to_seal(bench: Bench, db: Session) -> None
     )
     assert not bench.audit.verify(db, "envelope", view.id).ok
 
+    # ``seal_pending`` rolls its own transaction back before recording the failure, so the
+    # setup this assertion reads has to be committed first.
+    db.commit()
+
     with pytest.raises(IntegrityFailure) as seen:
         bench.service.seal_pending(db, view.id)
     assert seen.value.code == "audit_chain_broken"
@@ -333,6 +340,9 @@ def test_a_certificate_never_invents_a_completion_time(bench: Bench, db: Session
     the current time on the page as though it were the moment the last signer finished."""
     view = signed_and_pending(bench, db)
     db.execute(text("UPDATE envelopes SET completed_at = NULL WHERE id = :i"), {"i": view.id})
+    # ``seal_pending`` rolls its own transaction back before recording the failure, so the
+    # setup this assertion reads has to be committed first.
+    db.commit()
 
     with pytest.raises(IntegrityFailure) as seen:
         bench.service.seal_pending(db, view.id)
@@ -370,3 +380,37 @@ def test_a_template_with_two_fields_sharing_an_id_cannot_be_signed_against(bench
             ),
         )
     assert seen.value.code == "template_definitions_invalid"
+
+
+def test_signing_requires_the_bytes_this_session_was_served_to_have_been_viewed(bench: Bench, db: Session) -> None:
+    """``viewed`` is a signer-level status carried across sessions; the *bytes* are not.
+
+    So a signer who read revision 1 in session 1 could, after the host opened session 2, fetch the
+    document and sign in session 2 with no ``document.viewed`` covering the bytes that session was
+    served. ``signer.signed.presented_sha256`` could then name a revision nothing says was read.
+    """
+    host = bench.host(db)
+    bench.template(db, host, HIPAA_PAIR)
+    bench.consent(db)
+    view = bench.create(db, host, HIPAA_PAIR, signing_order="parallel")
+    witness_id = bench.signer_id(view, "witness")
+
+    first = bench.session(db, witness_id)
+    bench.ready_to_sign(db, first)  # present, view and consent revision 1
+
+    # The patient signs, so the current revision moves on.
+    patient = bench.session(db, bench.signer_id(view, "patient"))
+    bench.ready_to_sign(db, patient)
+    bench.service.sign(db, patient, [Capture(field_id="patient_sig", kind="click")], CTX)
+
+    # A new session for the witness, served the *new* revision and never told it was read.
+    second = bench.session(db, witness_id)
+    bench.service.present(db, second, CTX)
+    with pytest.raises(Conflict) as seen:
+        bench.service.sign(db, second, [Capture(field_id="witness_sig", kind="click")], CTX)
+    assert seen.value.code == "not_viewed"
+
+    # Reading it again is all that is needed, and then the signature stands.
+    bench.service.record_viewed(db, second, PAGES, CTX)
+    signed = bench.service.sign(db, second, [Capture(field_id="witness_sig", kind="click")], CTX)
+    assert signed.status == "completed_pending_seal"

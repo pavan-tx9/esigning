@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { DocumentViewer, type DocumentViewerHandle } from "@/components/DocumentViewer";
 import { Button, Dots, Notice, StepScreen, useAnnounce } from "@/components/ui";
 import {
@@ -22,10 +22,16 @@ function listPages(pages: number[]): string {
 
 interface ReviewStepProps {
   session: SigningSession;
+  /**
+   * True when the signer is here for a second look because the document changed under them
+   * (another signer signed before they submitted). They are not being told off, and nothing they
+   * have entered is lost: the fields they filled in are still in the draft.
+   */
+  changed?: boolean;
   onContinue: () => void;
 }
 
-export function ReviewStep({ session, onContinue }: ReviewStepProps) {
+export function ReviewStep({ session, changed = false, onContinue }: ReviewStepProps) {
   const pageCount = session.envelope.page_count;
   const queryClient = useQueryClient();
   const announce = useAnnounce();
@@ -38,6 +44,7 @@ export function ReviewStep({ session, onContinue }: ReviewStepProps) {
   const [nudge, setNudge] = useState<string | null>(null);
   const [pageFailed, setPageFailed] = useState(false);
   const zoom = ZOOMS[zoomIndex] ?? 1;
+  const zoomReadout = useId();
 
   const viewed = useMutation({
     mutationFn: () => postViewed(pageCount),
@@ -56,6 +63,20 @@ export function ReviewStep({ session, onContinue }: ReviewStepProps) {
       setNudge(null);
       announce("You have seen every page. You can continue when you are ready.");
     }
+  };
+
+  const changeZoom = (step: -1 | 1) => {
+    const next = zoomIndex + step;
+    if (next < 0 || next >= ZOOMS.length) {
+      announce(
+        step === 1
+          ? "The document is already at the largest size."
+          : "The document is already at the smallest size.",
+      );
+      return;
+    }
+    setZoomIndex(next);
+    announce(`Zoom ${Math.round((ZOOMS[next] ?? 1) * 100)} percent.`);
   };
 
   const goTo = (page: number) => {
@@ -93,6 +114,19 @@ export function ReviewStep({ session, onContinue }: ReviewStepProps) {
         </>
       }
     >
+      {changed ? (
+        <Notice tone="warn" alert className="mb-5">
+          <p className="font-semibold" data-testid="review-again">
+            Someone else signed this while you were reading.
+          </p>
+          <p className="mt-1">
+            You have not signed anything, and nothing you filled in is lost. Please look through the
+            document as it stands now, then continue: you'll be asked to agree and sign again, with
+            your answers still in place.
+          </p>
+        </Notice>
+      ) : null}
+
       {failed ? (
         <Notice tone="error" alert>
           <p className="font-semibold">We couldn't show the document.</p>
@@ -123,15 +157,24 @@ export function ReviewStep({ session, onContinue }: ReviewStepProps) {
         </div>
       ) : (
         <>
+          {/* The zoom level is state, not decoration: it is read out on every change and named by
+              both buttons, so someone who cannot see the page still knows where the zoom stands
+              and when a press did nothing because it is already at the limit. */}
           <div className="mb-3 flex items-center justify-end gap-2">
-            <span className="mr-1 text-ink-700 text-sm" aria-hidden="true">
+            <span
+              id={zoomReadout}
+              role="status"
+              data-testid="zoom-level"
+              className="mr-1 text-ink-700 text-sm"
+            >
               Zoom {Math.round(zoom * 100)}%
             </span>
             <Button
               variant="secondary"
               aria-label="Make the document smaller"
+              aria-describedby={zoomReadout}
               inert={zoomIndex === 0}
-              onClick={() => setZoomIndex((i) => Math.max(0, i - 1))}
+              onClick={() => changeZoom(-1)}
               className="px-0 text-xl"
             >
               <span aria-hidden="true">−</span>
@@ -139,8 +182,9 @@ export function ReviewStep({ session, onContinue }: ReviewStepProps) {
             <Button
               variant="secondary"
               aria-label="Make the document larger"
+              aria-describedby={zoomReadout}
               inert={zoomIndex === ZOOMS.length - 1}
-              onClick={() => setZoomIndex((i) => Math.min(ZOOMS.length - 1, i + 1))}
+              onClick={() => changeZoom(1)}
               className="px-0 text-xl"
             >
               <span aria-hidden="true">+</span>

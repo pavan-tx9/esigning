@@ -48,10 +48,12 @@ from esign.documents.fonts import (
 from esign.documents.geometry import PageGeometry
 from esign.documents.pdfutil import draw_overlay, geometries, sanitize_document, to_bytes, writer_from_bytes
 
-__all__ = ["MAX_TEXT_VALUE_CHARS", "MAX_TYPED_SIGNATURE_CHARS", "apply_signer_marks", "prepare"]
+__all__ = ["apply_signer_marks", "prepare"]
 
-MAX_TYPED_SIGNATURE_CHARS: Final[int] = 80
-MAX_TEXT_VALUE_CHARS: Final[int] = 500
+#: The bounds on a typed signature and a text field's value have exactly one definition,
+#: ``Settings.max_typed_signature_chars`` and ``Settings.max_text_field_chars`` (SPEC section 13).
+#: A private copy here used to be smaller, so a capture the wire schema and the envelope service
+#: both accepted was refused at the last step, under the envelope row lock, as a bare 422.
 MAX_PREFILL_CHARS: Final[int] = 2000
 
 _CAPTION_SIZE: Final[float] = 6.0
@@ -322,7 +324,7 @@ def _draw_prefill_page(
 # --------------------------------------------------------------------------- signer marks
 
 
-def _validate_captures(fields: list[FieldDef], captures: list[Capture]) -> dict[str, Capture]:
+def _validate_captures(fields: list[FieldDef], captures: list[Capture], settings: Settings) -> dict[str, Capture]:
     """Match captures to this signer's fields. Anything unexpected is a refusal, not a warning."""
     by_id = {field.id: field for field in fields}
     if len(by_id) != len(fields):
@@ -353,14 +355,14 @@ def _validate_captures(fields: list[FieldDef], captures: list[Capture]) -> dict[
             if field.required:
                 problems.append(f"field {field.id!r}: required capture is missing")
             continue
-        problems.extend(_capture_problems(field, supplied))
+        problems.extend(_capture_problems(field, supplied, settings))
 
     if problems:
         raise ValidationFailed("; ".join(sorted(set(problems))), code="captures_invalid")
     return matched
 
 
-def _capture_problems(field: FieldDef, capture: Capture) -> list[str]:
+def _capture_problems(field: FieldDef, capture: Capture, settings: Settings) -> list[str]:
     what = f"field {field.id!r}"
     # Read through ``str`` on purpose: the annotation says this is one of three literals, but the
     # value arrives from a client and an unexpected one must be refused, not fall through a branch.
@@ -373,8 +375,8 @@ def _capture_problems(field: FieldDef, capture: Capture) -> list[str]:
             text = (capture.typed_text or "").strip()
             if not text:
                 return [f"{what}: a typed capture needs text"]
-            if len(text) > MAX_TYPED_SIGNATURE_CHARS:
-                return [f"{what}: typed signature is longer than {MAX_TYPED_SIGNATURE_CHARS} characters"]
+            if len(text) > settings.max_typed_signature_chars:
+                return [f"{what}: typed signature is longer than {settings.max_typed_signature_chars} characters"]
         elif kind == "click":
             if capture.image_png or capture.typed_text:
                 return [f"{what}: a click capture carries no image or text"]
@@ -391,8 +393,8 @@ def _capture_problems(field: FieldDef, capture: Capture) -> list[str]:
         value = capture.text_value
         if value is None:
             return [f"{what}: a text capture needs `text_value`"]
-        if len(value) > MAX_TEXT_VALUE_CHARS:
-            return [f"{what}: text is longer than {MAX_TEXT_VALUE_CHARS} characters"]
+        if len(value) > settings.max_text_field_chars:
+            return [f"{what}: text is longer than {settings.max_text_field_chars} characters"]
         if field.required and not value.strip():
             return [f"{what}: required text is empty"]
         return []
@@ -405,10 +407,16 @@ def apply_signer_marks(
     fields: list[FieldDef],
     captures: list[Capture],
     stamp: SignerStamp,
+    settings: Settings,
 ) -> bytes:
-    """Implements ``DocumentService.apply_signer_marks``."""
+    """Implements ``DocumentService.apply_signer_marks``.
+
+    ``settings`` carries the typed-signature and text-field bounds, which have one definition
+    (SPEC section 13) shared with the wire schema and the envelope service, so a capture cannot be
+    accepted at the edge and refused here.
+    """
     ensure_fonts_registered()
-    matched = _validate_captures(fields, captures)
+    matched = _validate_captures(fields, captures, settings)
     _caption_lines(stamp)  # fail before touching the document if the stamp time is unusable
 
     writer = writer_from_bytes(pdf)

@@ -57,7 +57,16 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   const queryClient = useQueryClient();
   const announce = useAnnounce();
   const [state, dispatch] = useReducer(flowReducer, initialFlowState);
+  /** The disclosure language the host asked for, validated by `embed.ts`. Chosen once, with the
+   * token, and never changed afterwards: it decides which text the signer is shown and accepts. */
+  const [locale, setLocale] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
+  /**
+   * Set when the server refused a signature because the document had moved on since this signer
+   * read it (409 `not_viewed`). Their signer status is still `consented`, so nothing in
+   * `placeFor` would ever send them back to the review step; this does, and says why.
+   */
+  const [readAgain, setReadAgain] = useState(false);
   const [submissionKeys] = useState(() => new SubmissionKeys());
   const reauthListeners = useRef(new Set<() => void>());
   const shell = useRef<HTMLDivElement>(null);
@@ -80,6 +89,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
     setSessionToken(null);
     queryClient.clear();
     setDraft(emptyDraft);
+    setReadAgain(false);
     submissionKeys.reset();
   }, [queryClient, submissionKeys]);
 
@@ -96,9 +106,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
           return;
         }
         setSessionToken(message.token);
-        if (message.locale !== undefined) {
-          document.documentElement.lang = message.locale;
-        }
+        setLocale(message.locale ?? null);
         dispatch({ type: "TOKEN_RECEIVED" });
       } else {
         for (const listener of reauthListeners.current) {
@@ -130,7 +138,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
 
   // ------------------------------------------------------------------ session
   const sessionEnabled = state.phase === "loading" || state.phase === "active";
-  const sessionQuery = useQuery({ ...sessionQueryOptions(), enabled: sessionEnabled });
+  const sessionQuery = useQuery({ ...sessionQueryOptions(locale), enabled: sessionEnabled });
   const session = sessionQuery.data;
 
   useEffect(() => {
@@ -138,6 +146,15 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
       dispatch({ type: "SESSION_LOADED", session });
     }
   }, [session]);
+
+  // The page declares the language of the text it is actually showing -- the disclosure the server
+  // served -- so assistive technology can never be told "Spanish" over an English fallback.
+  const servedLocale = session?.consent.locale;
+  useEffect(() => {
+    if (servedLocale !== undefined && servedLocale !== "") {
+      document.documentElement.lang = servedLocale;
+    }
+  }, [servedLocale]);
 
   useEffect(() => {
     sessionGone.current = () => {
@@ -218,7 +235,16 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   } else {
     const kiosk = session.session.kiosk;
     const steps: Record<Step, React.ReactNode> = {
-      review: <ReviewStep session={session} onContinue={() => go("consent")} />,
+      review: (
+        <ReviewStep
+          session={session}
+          changed={readAgain}
+          onContinue={() => {
+            setReadAgain(false);
+            go("consent");
+          }}
+        />
+      ),
       consent: (
         <ConsentStep
           session={session}
@@ -237,9 +263,15 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
       confirm: (
         <ConfirmStep
           session={session}
+          locale={locale}
           draft={draft}
           submissionKeys={submissionKeys}
           onBack={() => go("sign")}
+          onReadAgain={() => {
+            setReadAgain(true);
+            announce("The document has changed. Please read it again before you sign.");
+            go("review");
+          }}
           onSigned={() => {
             channel.post({ type: "esign:signed" });
             setDraft(emptyDraft);
@@ -248,7 +280,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
           }}
         />
       ),
-      done: <DoneStep session={session} />,
+      done: <DoneStep session={session} locale={locale} />,
     };
     body = steps[state.step];
   }
@@ -266,10 +298,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
         <Masthead session={state.phase === "active" ? session : undefined} step={activeStep} />
         <main className="w-full px-4 pt-6 pb-10 sm:px-6 sm:pt-8">
           {state.phase === "active" && session !== undefined && activeStep !== "done" ? (
-            <DeadlineWatch
-              session={session}
-              onExpire={() => dispatch({ type: "SESSION_EXPIRED" })}
-            />
+            <DeadlineWatch session={session} />
           ) : null}
           {/* Keyed so each step mounts fresh and its heading takes focus. */}
           <div key={`${state.phase}:${activeStep ?? (state.phase === "active" ? "decline" : "")}`}>
@@ -358,32 +387,47 @@ function Seal() {
 
 // --------------------------------------------------------------------------- session deadline
 
-function DeadlineWatch({ session, onExpire }: { session: SigningSession; onExpire: () => void }) {
+/**
+ * The warning that the session is about to close, and with it the adopted signature and the field
+ * values in the draft. Two things it deliberately does not do:
+ *
+ *  - it never ends the flow. The deadline is server time; this is the device's clock, and a tablet
+ *    whose clock runs half an hour fast would land a signer on "this session has ended" before
+ *    they had read a word. Only the server's 401 (wired through `sessionGone`) may do that.
+ *  - it does not scroll away. Review and consent are long scrollers, and the patient who needs
+ *    this warning is the one who has been reading for two minutes, far below the top of the page.
+ */
+function DeadlineWatch({ session }: { session: SigningSession }) {
   const now = useNow(5_000);
   const deadline = Math.min(
     Date.parse(session.session.expires_at),
     Date.parse(session.envelope.expires_at),
   );
   const left = deadline - now;
-  const expired = left <= 0;
 
-  useEffect(() => {
-    if (expired) {
-      onExpire();
-    }
-  }, [expired, onExpire]);
-
-  if (expired || left > WARN_BEFORE_MS) {
+  if (left > WARN_BEFORE_MS) {
     return null;
   }
   const minutes = Math.max(1, Math.ceil(left / 60_000));
   return (
-    <Notice tone="warn" alert className="mx-auto mb-5 max-w-xl">
-      <span>
-        For your security, this session closes in about {minutes}{" "}
-        {minutes === 1 ? "minute" : "minutes"}. If it does, it can be reopened and you can start
-        again.
-      </span>
-    </Notice>
+    <div
+      data-testid="deadline-banner"
+      className="sticky top-[env(safe-area-inset-top,0px)] z-30 mx-auto mb-5 max-w-xl"
+    >
+      <Notice tone="warn" alert className="shadow-sheet">
+        {left > 0 ? (
+          <span>
+            For your security, this session closes in about {minutes}{" "}
+            {minutes === 1 ? "minute" : "minutes"}. If it does, it can be reopened and you can start
+            again.
+          </span>
+        ) : (
+          <span>
+            For your security, this session is due to close. If it has, you'll be told when you next
+            continue, and you can reopen the document and start again.
+          </span>
+        )}
+      </Notice>
+    </div>
   );
 }

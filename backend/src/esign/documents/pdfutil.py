@@ -178,7 +178,16 @@ def draw_overlay(writer: PdfWriter, geometry: PageGeometry, draw: Callable[[Canv
     canvas.save()
 
     overlay = PdfReader(io.BytesIO(buffer.getvalue())).pages[0]
-    writer.pages[geometry.index].merge_transformed_page(overlay, geometry.ctm())
+    try:
+        writer.pages[geometry.index].merge_transformed_page(overlay, geometry.ctm())
+    except (PdfReadError, PyPdfError, ValueError, KeyError, TypeError) as exc:
+        # Merging decodes the *existing* page's content stream, which nothing before this point
+        # has. A FlateDecode stream that inflates past pypdf's output cap raises here, and without
+        # this the host would get a bare ``500 internal_error`` from ``POST /v1/envelopes`` for a
+        # template that passed inspection and published cleanly. It is a bad template, so it is a
+        # validation failure -- and ``inspect_template`` now decodes every page so it is refused at
+        # upload instead.
+        raise ValidationFailed("page content could not be processed", code="pdf_unreadable") from exc
 
 
 # --------------------------------------------------------------------------- flatten and strip

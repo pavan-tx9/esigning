@@ -210,20 +210,26 @@ def configure_logging(
     ``stream`` pins the output (tests that read rendered lines pass a buffer); left as ``None``
     every line goes to the current ``sys.stdout`` -- or ``sys.stderr`` with ``stderr=True``, which
     is what the CLI uses so that its own output on stdout stays parseable.
+
+    Records that reach the *stdlib* root logger -- SQLAlchemy, httpx, pypdf, uvicorn -- are
+    formatted through the same processor chain, so the key allowlist covers them too rather than
+    only this module's own callers.
     """
     numeric_level = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
 
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=numeric_level, force=True)
-
     renderer: Any = structlog.processors.JSONRenderer() if json_output else structlog.dev.ConsoleRenderer()
+
+    shared: list[Any] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
 
     structlog.configure(
         processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
+            *shared,
             # Last: nothing may add a key after the allowlist has run.
             drop_unlisted_keys,
             renderer,
@@ -232,6 +238,33 @@ def configure_logging(
         logger_factory=_StreamLoggerFactory(stream, stderr=stderr),
         cache_logger_on_first_use=False,
     )
+
+    # The stdlib root logger goes through the same allowlist. SQLAlchemy, httpx, pypdf and uvicorn
+    # all write there, and ``logging.basicConfig(format="%(message)s")`` rendered whatever they said
+    # verbatim -- so a single ``DB_ECHO=true`` would have printed every statement's bound parameters
+    # (display names, prefill values, typed signatures) straight past this module's one defence.
+    handler = logging.StreamHandler(cast(TextIO, stream) if stream is not None else None)
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            # ``ExtraAdder`` lifts a stdlib record's ``extra=`` fields into the event dict, which is
+            # what puts them in front of the allowlist instead of inside a pre-rendered message.
+            foreign_pre_chain=[*shared, structlog.stdlib.ExtraAdder()],
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                drop_unlisted_keys,
+                renderer,
+            ],
+        )
+    )
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(numeric_level)
+    # Even allowlisted, these are noise at INFO and the echo is the one that would carry PHI.
+    for chatty in ("sqlalchemy.engine", "httpx", "httpcore", "pypdf", "botocore", "boto3", "urllib3"):
+        logging.getLogger(chatty).setLevel(logging.WARNING)
+
     structlog.contextvars.bind_contextvars(app_env=app_env)
 
 

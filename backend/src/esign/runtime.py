@@ -16,6 +16,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from typing import Final, Protocol
+from uuid import UUID
 
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -36,12 +38,82 @@ from esign.contracts import (
 from esign.db import app_engine, session_factory, transaction
 from esign.documents import build_document_service
 from esign.envelopes import build_envelope_service
-from esign.identity import build_identity_service, build_rate_limiter
+from esign.identity import build_identity_service, build_rate_limiter, parse_trusted_proxies
 from esign.sealing import build_sealer
 from esign.storage import build_blob_service
 from esign.webhooks import WebhookQueue
 
-__all__ = ["Runtime", "build_runtime"]
+__all__ = ["ConfigurationError", "GatedEnvelopeService", "Runtime", "build_runtime", "check_production_settings"]
+
+
+class ConfigurationError(RuntimeError):
+    """Settings that must not be used as they stand.
+
+    A ``RuntimeError`` so the existing contract (``create_app`` refuses to start) is unchanged, and
+    a named subclass so the CLI can turn it into a non-zero exit with a readable message instead of
+    a traceback.
+    """
+
+
+#: The passwords ``0002_roles.sql`` sets when it has to create the roles itself. A production
+#: deployment creates them out of band; a DSN still carrying these is a deployment that did not.
+_DEV_APP_PASSWORD: Final[str] = "esign_app_dev"  # noqa: S105 - a value to refuse, not a credential to use
+_DEV_OWNER_PASSWORD: Final[str] = "esign_owner_dev"  # noqa: S105 - likewise
+
+
+def check_production_settings(settings: Settings) -> None:
+    """Fail at startup, not at the first signature. Production only.
+
+    Called from :func:`build_runtime`, which is the single door every process goes through -- the
+    API, ``esign worker`` (the process that actually seals), ``esign verify`` and every other
+    command. Gating only the API would leave the worker sealing real documents at ``PAdES-B-T``
+    with the dev key while the API container beside it refused to start.
+    """
+    parse_trusted_proxies(settings.trusted_proxy_cidrs)  # a typo here silently changes every recorded IP
+    if settings.app_env != "prod":
+        return
+    problems: list[str] = []
+    if settings.seal_profile == "PAdES-B-T":
+        problems.append("SEAL_PROFILE must be PAdES-B-LT or PAdES-B-LTA in production")
+    if settings.seal_key_backend != "aws_kms":
+        problems.append("SEAL_KEY_BACKEND must be aws_kms in production (the local dev PKI is not a production key)")
+    if settings.seal_key_backend == "aws_kms":
+        # Otherwise these are only noticed at the first seal, by which time a document is signed
+        # and waiting, and the failure looks like an outage rather than a misconfiguration.
+        if not settings.seal_kms_key_id:
+            problems.append("SEAL_KMS_KEY_ID is required when SEAL_KEY_BACKEND is aws_kms")
+        if settings.seal_cert_path is None or not settings.seal_cert_path.is_file():
+            problems.append("SEAL_CERT_PATH must point at the seal certificate when SEAL_KEY_BACKEND is aws_kms")
+    if settings.blob_backend != "s3":
+        problems.append("BLOB_BACKEND must be s3 in production (the fs backend cannot enforce retention)")
+    if not settings.trust_roots_path.is_file():
+        problems.append("TRUST_ROOTS_PATH does not exist; every verification would fail")
+    if not settings.tsa_url:
+        problems.append("TSA_URL is required in production")
+    if _DEV_APP_PASSWORD in settings.database_url:
+        problems.append("DATABASE_URL still holds the development password for esign_app")
+    if _DEV_OWNER_PASSWORD in settings.database_owner_url:
+        problems.append("DATABASE_OWNER_URL still holds the development password for esign_owner")
+    if settings.db_echo:
+        # SQLAlchemy's echo goes to the stdlib logger with bound parameters attached: display
+        # names, prefill values and typed signatures, in a log line. SPEC section 10.
+        problems.append("DB_ECHO must be off in production (it would log statement parameters, which carry PHI)")
+    if problems:
+        raise ConfigurationError("refusing to start: " + "; ".join(problems))
+
+
+class GatedEnvelopeService(EnvelopeService, Protocol):
+    """``EnvelopeService`` plus the one gate the API needs that the contract does not yet declare.
+
+    ``assert_reauth_allowed`` belongs beside ``assert_signer_may_start`` in
+    ``contracts.EnvelopeService``: both answer "may this host still do this to this signer?" under
+    the envelope row lock. ``contracts.py`` is architecture-owned, so the extra method is declared
+    here, at the wiring layer, until it can be moved. See the integration report.
+    """
+
+    def assert_reauth_allowed(self, db: Session, envelope_id: UUID, signer_id: UUID) -> None:
+        """Raise ``Conflict`` unless a re-authentication attestation could still belong to this
+        signer's signature: envelope live, signer not finished, role re-authenticates."""
 
 
 @dataclass(frozen=True)
@@ -56,7 +128,7 @@ class Runtime:
     identity: IdentityService
     limiter: RateLimiter
     sealer: Sealer
-    envelopes: EnvelopeService
+    envelopes: GatedEnvelopeService
     webhooks: WebhookQueue
 
     def transaction(self) -> AbstractContextManager[Session]:
@@ -83,8 +155,13 @@ def build_runtime(
     limiter: RateLimiter | None = None,
 ) -> Runtime:
     """Wire every module through its factory. ``engine``, ``sealer`` and ``limiter`` can be
-    supplied by tests (a shared test engine, a sealer with an outage injected)."""
+    supplied by tests (a shared test engine, a sealer with an outage injected).
+
+    The production settings check runs first, before anything opens a connection, so the API, the
+    worker and every CLI command are gated identically (SPEC sections 3 and 5).
+    """
     settings = settings or get_settings()
+    check_production_settings(settings)
     clock = clock or SystemClock()
     engine = engine or app_engine(settings)
     sessions = session_factory(engine)

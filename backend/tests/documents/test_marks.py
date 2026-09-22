@@ -15,6 +15,7 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader
 
+from esign.config import Settings
 from esign.contracts import Capture, DocumentService, FieldDef, Rect, SignerStamp, ValidationFailed
 from esign.documents.fonts import PLAIN_FONT, SCRIPT_FONT
 from tests.documents.helpers import handwriting_png, make_pdf, placed_images, placed_text
@@ -244,9 +245,25 @@ def test_an_empty_typed_capture_is_rejected(documents: DocumentService, stamp: S
     assert "needs text" in str(excinfo.value)
 
 
-def test_an_over_long_typed_capture_is_rejected(documents: DocumentService, stamp: SignerStamp) -> None:
+def test_a_typed_capture_at_the_configured_bound_is_stamped(
+    documents: DocumentService, settings_no_db: Settings, stamp: SignerStamp
+) -> None:
+    """The bound has one definition, ``Settings.max_typed_signature_chars`` (SPEC section 13).
+
+    A private copy here used to stop at 80, so a typed signature the wire schema and the envelope
+    service both accepted was refused under the envelope row lock as a bare 422.
+    """
+    limit = settings_no_db.max_typed_signature_chars
+    out = documents.apply_signer_marks(make_pdf(), [sig_field()], [typed(text="x" * limit)], stamp)
+    assert out.startswith(b"%PDF")
+
+
+def test_an_over_long_typed_capture_is_rejected(
+    documents: DocumentService, settings_no_db: Settings, stamp: SignerStamp
+) -> None:
+    over = "x" * (settings_no_db.max_typed_signature_chars + 1)
     with pytest.raises(ValidationFailed) as excinfo:
-        documents.apply_signer_marks(make_pdf(), [sig_field()], [typed(text="x" * 200)], stamp)
+        documents.apply_signer_marks(make_pdf(), [sig_field()], [typed(text=over)], stamp)
     assert "longer than" in str(excinfo.value)
 
 
@@ -319,11 +336,24 @@ def test_a_text_field_is_drawn_inside_its_rect(documents: DocumentService, stamp
     assert runs[0].box(PLAIN_FONT).inside(text_field.rect)
 
 
-def test_an_over_long_text_value_is_rejected(documents: DocumentService, stamp: SignerStamp) -> None:
+def test_a_text_value_at_the_configured_bound_is_stamped(
+    documents: DocumentService, settings_no_db: Settings, stamp: SignerStamp
+) -> None:
     text_field = FieldDef(
         id="relationship", type="text", page=1, rect=Rect(x=100, y=300, w=200, h=16), signer_role="patient"
     )
-    capture = Capture(field_id="relationship", text_value="x" * 900)
+    capture = Capture(field_id="relationship", text_value="x" * settings_no_db.max_text_field_chars)
+    out = documents.apply_signer_marks(make_pdf(), [sig_field(), text_field], [typed(), capture], stamp)
+    assert out.startswith(b"%PDF")
+
+
+def test_an_over_long_text_value_is_rejected(
+    documents: DocumentService, settings_no_db: Settings, stamp: SignerStamp
+) -> None:
+    text_field = FieldDef(
+        id="relationship", type="text", page=1, rect=Rect(x=100, y=300, w=200, h=16), signer_role="patient"
+    )
+    capture = Capture(field_id="relationship", text_value="x" * (settings_no_db.max_text_field_chars + 1))
     with pytest.raises(ValidationFailed):
         documents.apply_signer_marks(make_pdf(), [sig_field(), text_field], [typed(), capture], stamp)
 

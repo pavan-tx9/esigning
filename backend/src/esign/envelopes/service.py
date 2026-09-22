@@ -38,6 +38,7 @@ from esign.contracts import (
     VOID_REASON_CODES,
     Actor,
     ActorRole,
+    AuditEvent,
     AuditLog,
     BlobService,
     Capacity,
@@ -428,6 +429,10 @@ class EnvelopeServiceImpl:
             signer.id,
             status=transition.signer_status,
             viewed_at=now,
+            # The bytes, not just the fact. ``viewed`` is a signer-level status carried across
+            # sessions, so without this a signer who read revision 1 in session 1 could sign
+            # revision 2 in session 2 with no ``document.viewed`` covering what they signed.
+            viewed_sha256=presented,
             only_if_unset=frozenset({"viewed_at"}),
         )
         self._append(
@@ -495,6 +500,10 @@ class EnvelopeServiceImpl:
         presented = repo.session_presented_sha(db, session.id)
         if presented is None:
             raise Conflict("the document has not been served to this session", code="not_presented")
+        if signer.viewed_sha256 != presented:
+            # Presented but not *viewed*: these are the bytes this session was served, and the
+            # signer has not said they read them. A fresh POST /viewed is the way forward.
+            raise Conflict("this document has not been read in full", code="not_viewed")
 
         fields = parse_field_defs(loaded.template.fields)
         mine = tuple(f for f in fields if f.signer_role == signer.role_key)
@@ -553,7 +562,7 @@ class EnvelopeServiceImpl:
                 "revision_no": revision_no,
                 "revision_sha256": revision.sha256,
                 "capture_count": len(accepted),
-                "captures": [{"field_id": c.field_id, "kind": c.kind or by_id[c.field_id].type} for c in accepted],
+                "captures": [_capture_ref(c, by_id[c.field_id]) for c in accepted],
             },
         )
 
@@ -695,11 +704,19 @@ class EnvelopeServiceImpl:
         try:
             return self._seal(db, loaded, transition)
         except Exception as exc:
-            # Nothing of the attempt survives the caller's rollback -- that is the point. The
-            # envelope stays completed_pending_seal and the failure is recorded in a step of its
-            # own, so the trail still explains why nothing happened. That holds for the retryable
-            # failures (SealUnavailable, StorageUnavailable) and equally for the ones that are
-            # not: an integrity failure or a bug leaves the envelope pending, recorded and loud.
+            # Nothing of the attempt survives the rollback -- that is the point. The envelope stays
+            # completed_pending_seal and the failure is recorded in a step of its own, so the trail
+            # still explains why nothing happened. That holds for the retryable failures
+            # (SealUnavailable, StorageUnavailable) and equally for the ones that are not: an
+            # integrity failure or a bug leaves the envelope pending, recorded and loud.
+            #
+            # The rollback happens *here*, before the failure is recorded, rather than being left
+            # to the caller. Once ``_seal`` has made its first append it holds the audit stream's
+            # advisory lock for the rest of the transaction, and once it has touched ``seal_jobs``
+            # it holds that row -- and it is this thread that would have to release them. The
+            # separate session would then wait on locks only it can free, hit its 5s
+            # ``lock_timeout`` and abort, leaving no ``seal.failed`` in the trail at all.
+            db.rollback()
             self._on_seal_failure(envelope_id, exc.code if isinstance(exc, EsignError) else "internal_error")
             raise
 
@@ -824,11 +841,11 @@ class EnvelopeServiceImpl:
     def _on_seal_failure(self, envelope_id: UUID, error_code: str) -> None:
         """Record ``seal.failed`` so it survives the rollback of the failed attempt.
 
-        The attempt's own transaction is about to be rolled back by the caller, taking the unsealed
-        revision and everything else with it -- which is correct, and is exactly why the event that
-        explains the failure has to be written somewhere else. ``_seal`` appends nothing to the
-        envelope's audit stream until the seal has validated, so the dying transaction holds no
-        lock this session needs; it never touches the envelope row either.
+        The attempt's own transaction has already been rolled back by ``seal_pending``, taking the
+        unsealed revision, the envelope row lock, the audit stream's advisory lock and the seal-job
+        row lock with it -- which is correct, and is exactly why the event that explains the
+        failure has to be written somewhere else, and why it has to be written *after* the
+        rollback rather than alongside a transaction still holding what it needs.
         """
         if self._new_session is None:
             # No independent session was injected, so the failure can be reported but not
@@ -837,11 +854,9 @@ class EnvelopeServiceImpl:
             return
         try:
             with self._new_session() as fresh:
-                # The failed attempt's transaction is still open and holds the envelope row lock,
-                # and it is *this thread* that would have to release it -- so anything in here
-                # that waited on that lock would wait forever, invisibly to Postgres's deadlock
-                # detector. Nothing below should (the job row exists, so no foreign-key check
-                # touches the envelope), but a bound turns "should not" into "cannot hang".
+                # ``seal_pending`` has rolled the attempt back, so nothing here should wait on a
+                # lock only this thread could release. The bound stays anyway: it turns "should
+                # not" into "cannot hang", invisibly to Postgres's deadlock detector.
                 fresh.execute(text("SET LOCAL lock_timeout = '5s'"))
                 attempts = repo.seal_job_attempts(fresh, envelope_id) + 1
                 delay = next_backoff(attempts)
@@ -875,6 +890,16 @@ class EnvelopeServiceImpl:
     # ----------------------------------------------------------------- certificate
 
     def _certificate_summary(self, db: Session, loaded: _Loaded, final_revision_sha: bytes) -> CertificateSummary:
+        """Build the certificate of completion from the audit trail (SPEC section 3, step 7).
+
+        The mutable rows -- ``signers``, ``signing_sessions``, ``envelopes`` -- are a convenience
+        copy of facts the append-only trail already holds. They are still fully UPDATE-able by the
+        runtime role, and a delayed seal (a KMS or TSA outage backs off for hours) leaves a window
+        in which one of them could be rewritten and then printed into bytes that can never be
+        re-sealed. So every dated fact on the certificate is read from the event that recorded it,
+        the rows are compared against those events, and a disagreement stops the seal
+        (``certificate_evidence_mismatch``) instead of being certified.
+        """
         envelope = loaded.envelope
 
         # The certificate quotes the trail's length and head hash as evidence, and the seal makes
@@ -894,14 +919,27 @@ class EnvelopeServiceImpl:
         if chain.event_count == 0 or chain.head_hash is None:
             raise IntegrityFailure("the envelope has no audit trail", code="missing_audit_trail")
 
+        events = self._audit.list(db, "envelope", envelope.id)
+
+        completed = _last_event(events, EventType.ENVELOPE_COMPLETED)
+        if completed is None:
+            raise IntegrityFailure("the envelope has no completion event", code="missing_completed_at")
         if envelope.completed_at is None:
             # Every path into completed_pending_seal writes completed_at in the same transaction,
             # so this cannot happen -- and if it does, the honest answer is to refuse rather than
             # to put the current time on the certificate as though it were the completion time.
             raise IntegrityFailure("the envelope has no completion time", code="missing_completed_at")
+        _require_agreement(envelope.id, None, "envelopes.completed_at", envelope.completed_at, completed.occurred_at)
+
+        prepared = _first_event(events, EventType.DOCUMENT_PREPARED)
+        presented_sha = _require_revision(envelope.presented_sha256)
+        if prepared is None or prepared.document_sha256 != presented_sha:
+            raise IntegrityFailure(
+                "the presented revision does not match document.prepared", code="certificate_evidence_mismatch"
+            )
 
         signers = tuple(
-            self._certificate_signer(db, loaded, row)
+            self._certificate_signer(db, loaded, events, row)
             for row in sorted(loaded.signers, key=lambda s: (s.order_index, s.role_key))
         )
         return CertificateSummary(
@@ -912,16 +950,18 @@ class EnvelopeServiceImpl:
             # The configured profile: the certificate is inside the sealed bytes, so it is written
             # before the seal exists. The profile actually achieved is in document.sealed.
             seal_profile=self._settings.seal_profile,
-            presented_sha256=_require_revision(envelope.presented_sha256),
+            presented_sha256=presented_sha,
             final_revision_sha256=final_revision_sha,
             created_at=envelope.created_at,
-            completed_at=envelope.completed_at,
+            completed_at=completed.occurred_at,
             signers=signers,
             audit_event_count=chain.event_count,
             audit_head_hash=chain.head_hash,
         )
 
-    def _certificate_signer(self, db: Session, loaded: _Loaded, row: repo.SignerRow) -> CertificateSigner:
+    def _certificate_signer(
+        self, db: Session, loaded: _Loaded, events: Sequence[AuditEvent], row: repo.SignerRow
+    ) -> CertificateSigner:
         # Refuse to certify what the record does not actually show. Every one of these would mean
         # a certificate claiming evidence that is not there.
         if row.status != "signed":
@@ -931,28 +971,99 @@ class EnvelopeServiceImpl:
         if row.consent_text_id is None:
             raise IntegrityFailure("a signer has no recorded consent", code="incomplete_signer_evidence")
 
-        evidence = repo.session_evidence(db, signer_id=row.id, at_or_before=row.signed_at)
-        if evidence is None:
-            raise IntegrityFailure("a signer has no recorded session", code="incomplete_signer_evidence")
-        consent = self._identity.get_consent(db, row.consent_text_id)
-        role = loaded.roles.get(row.role_key)
+        signed = _one_event(events, EventType.SIGNER_SIGNED, row.id)
+        # The rows keep the *first* view and the *first* consent (``only_if_unset``), so the
+        # earliest event of each kind is the one they are a copy of.
+        viewed = _first_event(events, EventType.DOCUMENT_VIEWED, row.id)
+        consented = _first_event(events, EventType.CONSENT_ACCEPTED, row.id)
+        if signed is None or viewed is None or consented is None:
+            raise IntegrityFailure("a signer's trail is incomplete", code="incomplete_signer_evidence")
 
+        mismatch = (loaded.envelope.id, row.id)
+        _require_agreement(*mismatch, "signers.viewed_at", row.viewed_at, viewed.occurred_at)
+        _require_agreement(*mismatch, "signers.consented_at", row.consented_at, consented.occurred_at)
+        _require_agreement(*mismatch, "signers.signed_at", row.signed_at, signed.occurred_at)
+        _require_same(*mismatch, "signers.role_key", row.role_key, signed.data.get("role_key"))
+        _require_same(*mismatch, "signers.capacity", row.capacity, signed.data.get("capacity"))
+
+        consent = self._identity.get_consent(db, row.consent_text_id)
+        _require_same(
+            *mismatch, "signers.consent_text_id", str(row.consent_text_id), consented.data.get("consent_text_id")
+        )
+        _require_same(*mismatch, "consent version", consent.version, consented.data.get("consent_version"))
+
+        # Where the signer actually was. The signing session's ``ip``/``user_agent`` columns are the
+        # *host backend's* -- it is the host that opens the session, server to server -- so reading
+        # them here would print the EHR's address and its HTTP client on every patient's
+        # certificate. ``signer.signed`` carries the context of the signer's own request.
+        ip = signed.ctx.ip
+        user_agent = signed.ctx.user_agent
+
+        # How the person authenticated, and the kiosk context, are the *host's* attestation, not
+        # the browser's: the append-only ``session.created`` event is their record, and the session
+        # row is the fallback. Where both exist they must agree.
+        session_event = _session_created_for(events, signed)
+        attested = repo.session_attestation(db, signer_id=row.id, at_or_before=signed.occurred_at)
+        auth_method = _attested_value(
+            *mismatch, "auth_method", session_event, "auth_method", None if attested is None else attested.auth_method
+        )
+        if not auth_method:
+            raise IntegrityFailure("a signer's trail records no authentication", code="incomplete_signer_evidence")
+        kiosk_staff_user_id = _attested_value(
+            *mismatch,
+            "kiosk_staff_user_id",
+            session_event,
+            "kiosk_staff_user_id",
+            None if attested is None else attested.kiosk_staff_user_id,
+        )
+        kiosk_identity_check = _attested_value(
+            *mismatch,
+            "kiosk_identity_check",
+            session_event,
+            "kiosk_identity_check",
+            None if attested is None else attested.kiosk_identity_check,
+        )
+
+        role = loaded.roles.get(row.role_key)
         return CertificateSigner(
             signer_id=row.id,
+            # Not in the trail, and cannot be: a display name is PHI and the audit allowlist
+            # refuses it. The certificate is inside the sealed bytes, where PHI belongs.
             display_name=row.display_name,
             role_label=role.label if role else row.role_key,
             capacity=row.capacity,
-            auth_method=evidence.auth_method,
-            reauth_method=repo.latest_reauth_method(db, evidence.session_id),
+            auth_method=auth_method,
+            # The method actually used for *this* signature, not the newest attestation on the
+            # session: a host can still POST /reauth while the copy-download session is alive, and
+            # a role that does not require re-authentication never used one (SPEC section 6).
+            reauth_method=_reauth_method(signed, requires_reauth=row.requires_reauth),
             consent_version=consent.version,
-            viewed_at=row.viewed_at,
-            consented_at=row.consented_at,
-            signed_at=row.signed_at,
-            ip=evidence.ip,
-            user_agent=evidence.user_agent,
-            kiosk_staff_user_id=evidence.kiosk_staff_user_id,
-            kiosk_identity_check=evidence.kiosk_identity_check,
+            viewed_at=viewed.occurred_at,
+            consented_at=consented.occurred_at,
+            signed_at=signed.occurred_at,
+            ip=ip,
+            user_agent=user_agent,
+            kiosk_staff_user_id=kiosk_staff_user_id,
+            kiosk_identity_check=kiosk_identity_check,
         )
+
+    def assert_reauth_allowed(self, db: Session, envelope_id: UUID, signer_id: UUID) -> None:
+        """Refuse a re-authentication attestation that cannot belong to a signature.
+
+        The identity module only checks that the session is live, and the session a signer signed
+        from deliberately stays live so they can download their copy. Without this, a host could
+        attest re-authentication after the signature, for a role that never needed one, or against
+        an envelope that is already sealed -- and each of those appends ``auth.reauthenticated`` to
+        an append-only trail where it can never be corrected.
+        """
+        loaded = self._load(db, envelope_id, host=None, lock=True)
+        signer = self._signer_of(loaded, signer_id)
+        if loaded.envelope.status not in ("created", "in_progress"):
+            raise Conflict("this envelope is no longer being signed", code="envelope_not_live")
+        if signer.status in ("signed", "declined"):
+            raise Conflict("this signer has finished", code="signer_finished")
+        if not signer.requires_reauth:
+            raise Conflict("this role does not re-authenticate", code="reauth_not_required")
 
     # ----------------------------------------------------------------- captures
 
@@ -1369,6 +1480,21 @@ def _refuse_signature_payload(capture: Capture) -> None:
         raise ValidationFailed("this field takes no signature payload", code="capture_shape_invalid")
 
 
+def _capture_ref(capture: Capture, field: FieldDef) -> dict[str, Any]:
+    """What the trail records about one capture: the field, how it was filled, and a digest.
+
+    The digest is what ties the row in ``signature_captures`` to the hash chain. The value itself
+    never goes in: a typed signature is a name, and a drawn one is an image.
+    """
+    ref: dict[str, Any] = {"field_id": capture.field_id, "kind": capture.kind or field.type}
+    if capture.image_png is not None:
+        # The same value ``BlobService.put`` will key the image by: it is content-addressed.
+        ref["image_sha256"] = hashlib.sha256(capture.image_png).digest()
+    if capture.typed_text is not None:
+        ref["typed_text_sha256"] = hashlib.sha256(capture.typed_text.encode("utf-8")).digest()
+    return ref
+
+
 def _require_text(value: str, code: str, *, limit: int) -> str:
     text_value = (value or "").strip()
     if not text_value or len(text_value) > limit:
@@ -1387,6 +1513,122 @@ def _require_revision(sha: bytes | None) -> bytes:
     if sha is None:
         raise IntegrityFailure("the envelope has no current revision", code="missing_revision")
     return sha
+
+
+# --------------------------------------------------------------------------- trail-sourced evidence
+
+#: How far a mutable row's timestamp may sit from the event that recorded the same fact.
+#:
+#: They are written in one transaction but from two ``Clock`` reads, so they differ by microseconds
+#: under a real clock. A minute is far wider than that and far narrower than any rewrite worth
+#: detecting: an ``UPDATE signers SET signed_at = ...`` that matters moves the time by more.
+_EVIDENCE_TOLERANCE: Final = timedelta(seconds=60)
+
+
+def _matches_signer(event: AuditEvent, signer_id: UUID | None) -> bool:
+    return signer_id is None or str(event.data.get("signer_id")) == str(signer_id)
+
+
+def _first_event(
+    events: Sequence[AuditEvent], event_type: EventType, signer_id: UUID | None = None
+) -> AuditEvent | None:
+    return next((e for e in events if e.event_type == event_type and _matches_signer(e, signer_id)), None)
+
+
+def _last_event(
+    events: Sequence[AuditEvent], event_type: EventType, signer_id: UUID | None = None
+) -> AuditEvent | None:
+    found = [e for e in events if e.event_type == event_type and _matches_signer(e, signer_id)]
+    return found[-1] if found else None
+
+
+def _one_event(events: Sequence[AuditEvent], event_type: EventType, signer_id: UUID) -> AuditEvent | None:
+    """The single event of this type for this signer, or ``None`` if there is not exactly one.
+
+    Two ``signer.signed`` events for one signer would mean the envelope lock failed to serialise
+    two signatures, which is not a thing to average over on a certificate.
+    """
+    found = [e for e in events if e.event_type == event_type and _matches_signer(e, signer_id)]
+    return found[0] if len(found) == 1 else None
+
+
+def _session_created_for(events: Sequence[AuditEvent], signed: AuditEvent) -> AuditEvent | None:
+    """The ``session.created`` event for the session this signature came from.
+
+    Matched by session id where the signing request carried one; otherwise the most recent session
+    opened for this signer at or before the signature.
+    """
+    created = [
+        e
+        for e in events
+        if e.event_type == EventType.SESSION_CREATED and _matches_signer(e, _opt_uuid(signed.data.get("signer_id")))
+    ]
+    if signed.ctx.session_id is not None:
+        exact = [e for e in created if e.ctx.session_id == signed.ctx.session_id]
+        if exact:
+            return exact[-1]
+    earlier = [e for e in created if e.occurred_at <= signed.occurred_at]
+    return earlier[-1] if earlier else None
+
+
+def _attested_value(
+    envelope_id: UUID,
+    signer_id: UUID | None,
+    what: str,
+    session_event: AuditEvent | None,
+    key: str,
+    row_value: str | None,
+) -> str | None:
+    """One value the host attested when it opened the session.
+
+    The append-only ``session.created`` event is the record; ``signing_sessions`` is a mutable copy
+    of it. Where both are present they must agree, and where only the row is (a trail written
+    before the API owned this event) the row stands.
+    """
+    from_event = None if session_event is None else _opt_str(session_event.data.get(key))
+    if session_event is None:
+        return row_value
+    if row_value is not None and from_event != row_value:
+        _mismatch(envelope_id, signer_id, f"signing_sessions.{what}")
+    return from_event
+
+
+def _reauth_method(signed: AuditEvent, *, requires_reauth: bool) -> str | None:
+    if not requires_reauth or not signed.data.get("reauth_used"):
+        return None
+    return _opt_str(signed.data.get("reauth_method"))
+
+
+def _opt_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _opt_uuid(value: Any) -> UUID | None:
+    if value is None:
+        return None
+    return value if isinstance(value, UUID) else UUID(str(value))
+
+
+def _mismatch(envelope_id: UUID, signer_id: UUID | None, what: str) -> None:
+    log.error(
+        "seal.certificate_evidence_mismatch",
+        envelope_id=envelope_id,
+        signer_id=signer_id,
+        problem=what,
+    )
+    raise IntegrityFailure("a stored row disagrees with the audit trail", code="certificate_evidence_mismatch")
+
+
+def _require_agreement(
+    envelope_id: UUID, signer_id: UUID | None, what: str, row_value: datetime, event_value: datetime
+) -> None:
+    if abs(row_value - event_value) > _EVIDENCE_TOLERANCE:
+        _mismatch(envelope_id, signer_id, what)
+
+
+def _require_same(envelope_id: UUID, signer_id: UUID | None, what: str, row_value: Any, event_value: Any) -> None:
+    if event_value is None or str(row_value) != str(event_value):
+        _mismatch(envelope_id, signer_id, what)
 
 
 def build_envelope_service(

@@ -55,6 +55,18 @@ describe("which postMessages are believed", () => {
     }
   });
 
+  it("keeps a language tag and drops a locale the Signer API would refuse", () => {
+    const accept = (data: unknown) =>
+      acceptMessage({ origin: HOST, source: parent, data }, [HOST], parent);
+
+    expect(accept({ ...init, locale: "es-MX" })).toEqual({ ...init, locale: "es-MX" });
+    expect(accept({ ...init, locale: "en" })).toEqual({ ...init, locale: "en" });
+    // A junk locale costs the host its choice of language, never the signer their session.
+    for (const locale of ["es MX", "../en", 42, "en_US", "x".repeat(40)]) {
+      expect(accept({ ...init, locale })).toEqual(init);
+    }
+  });
+
   it("accepts reauth_done under the same rules", () => {
     const data = { type: "esign:reauth_done" };
     expect(acceptMessage({ origin: HOST, source: parent, data }, [HOST], parent)).toEqual(data);

@@ -83,7 +83,7 @@ class PdfDocumentService:
     def apply_signer_marks(
         self, pdf: bytes, fields: list[FieldDef], captures: list[Capture], stamp: SignerStamp
     ) -> bytes:
-        out = stamping.apply_signer_marks(pdf, fields, captures, stamp)
+        out = stamping.apply_signer_marks(pdf, fields, captures, stamp, self._settings)
         log.info(
             "documents.marks_applied",
             signer_id=stamp.signer_id,

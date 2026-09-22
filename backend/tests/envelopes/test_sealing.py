@@ -12,14 +12,17 @@ from sqlalchemy.orm import Session
 
 from esign.config import Settings
 from esign.contracts import (
+    AuthContext,
     Capture,
     Conflict,
     EnvelopeView,
     Host,
     IntegrityFailure,
+    RequestContext,
     SealUnavailable,
     SealValidation,
 )
+from esign.ids import new_id
 from tests.envelopes.conftest import CTX, HIPAA_PAIR, PATIENT_CONSENT, PROCEDURE_CONSENT, Bench
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"scribbled signature bytes"
@@ -235,6 +238,9 @@ def test_a_seal_that_does_not_validate_is_refused(bench: Bench, db: Session) -> 
 def test_the_envelope_stays_pending_when_validation_fails(bench: Bench, db: Session) -> None:
     _host, view = completed(bench, db)
     bench.sealer.bad_validation = True
+    # ``seal_pending`` rolls its own transaction back before recording the failure, so the
+    # setup this assertion reads has to be committed first.
+    db.commit()
 
     with pytest.raises(SealUnavailable):
         bench.service.seal_pending(db, view.id)
@@ -269,6 +275,9 @@ def test_every_kind_of_validation_failure_refuses(
         problems=("something is wrong",),
     )
     bench.sealer.validate = lambda pdf: verdict  # type: ignore[method-assign]
+    # ``seal_pending`` rolls its own transaction back before recording the failure, so the
+    # setup this assertion reads has to be committed first.
+    db.commit()
 
     with pytest.raises(SealUnavailable):
         bench.service.seal_pending(db, view.id)
@@ -364,7 +373,86 @@ def test_a_failure_with_no_independent_session_still_refuses(bench: Bench, db: S
     """Without a way to record the failure the seal still fails closed; it is just louder."""
     _host, view = completed(bench, db)
     bench.sealer.fail_times = 1
+    # ``seal_pending`` rolls its own transaction back before recording the failure, so the
+    # setup this assertion reads has to be committed first.
+    db.commit()
 
     with pytest.raises(SealUnavailable):
         bench.service.seal_pending(db, view.id)
+    assert bench.status(db, view.id) == "completed_pending_seal"
+
+
+# --------------------------------------------------------------------------- the trail is the source
+
+
+def test_the_certificate_records_the_signers_address_not_the_hosts(bench: Bench, db: Session) -> None:
+    """SPEC section 6: the certificate carries *the signer's* IP and user agent.
+
+    The signing session's ``ip``/``user_agent`` columns are written from the host's server-to-server
+    ``POST .../sessions`` call, so reading them here printed the EHR backend's address and its HTTP
+    library on every patient's certificate. The signer's own provenance is on ``signer.signed``.
+    """
+    host_ctx = RequestContext(ip="10.0.0.1", user_agent="ehr-backend", auth_method="password")
+    browser_ctx = RequestContext(ip="203.0.113.9", user_agent="Browser/1", auth_method="password")
+
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    bench.consent(db)
+    view = bench.create(db, host, PATIENT_CONSENT)
+    signer_id = bench.signer_id(view, "patient")
+    # The host opens the session from its own backend...
+    auth = AuthContext(method="password", auth_time=bench.clock.now() - timedelta(minutes=1))
+    _token, session = bench.identity.create_session(db, signer_id=signer_id, auth=auth, kiosk=None, ctx=host_ctx)
+    # ...and the patient's browser does everything else.
+    bench.service.present(db, session, browser_ctx)
+    bench.service.record_viewed(db, session, 3, browser_ctx)
+    bench.service.accept_consent(db, session, "2026-09", browser_ctx)
+    bench.service.sign(db, session, [sig()], browser_ctx)
+
+    bench.service.seal_pending(db, view.id)
+    signer = bench.documents.last_summary.signers[0]
+    assert signer.ip == "203.0.113.9"
+    assert signer.user_agent == "Browser/1"
+    # The host's attestation of *how* they authenticated still comes from the session.
+    assert signer.auth_method == "password"
+
+
+def test_the_certificate_shows_no_reauth_for_a_role_that_does_not_need_one(bench: Bench, db: Session) -> None:
+    """An attestation can exist against a session without having been used for the signature."""
+    _host, view = completed(bench, db)
+    session_id = db.execute(
+        text("SELECT id FROM signing_sessions WHERE signer_id = :s"),
+        {"s": bench.signer_id(view, "patient")},
+    ).scalar_one()
+    db.execute(
+        text(
+            "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at) "
+            "VALUES (:id, :session, 'password', :at, :at)"
+        ),
+        {"id": new_id(), "session": session_id, "at": bench.clock.now()},
+    )
+
+    bench.service.seal_pending(db, view.id)
+    signer = bench.documents.last_summary.signers[0]
+    assert signer.reauth_method is None
+
+
+def test_a_row_rewritten_between_the_signature_and_the_seal_stops_the_seal(bench: Bench, db: Session) -> None:
+    """SPEC section 3 step 7: the certificate is built from the audit trail.
+
+    ``signers`` is fully UPDATE-able by the runtime role, and a delayed seal (a KMS or TSA outage
+    backs off for hours) leaves a window in which a row could be rewritten and then printed into
+    bytes that can never be re-sealed. The trail still says otherwise, and the disagreement is the
+    finding.
+    """
+    _host, view = completed(bench, db)
+    db.execute(
+        text("UPDATE signers SET signed_at = signed_at - interval '3 hours' WHERE envelope_id = :i"),
+        {"i": view.id},
+    )
+    db.commit()
+
+    with pytest.raises(IntegrityFailure) as seen:
+        bench.service.seal_pending(db, view.id)
+    assert seen.value.code == "certificate_evidence_mismatch"
     assert bench.status(db, view.id) == "completed_pending_seal"

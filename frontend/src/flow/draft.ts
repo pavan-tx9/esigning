@@ -24,7 +24,15 @@ export interface Draft {
 
 export const emptyDraft: Draft = { adopted: null, initials: "", values: {} };
 
-export const TEXT_FIELD_MAX = 200;
+/**
+ * `Settings.max_text_field_chars` (SPEC section 9): what the server will actually accept in a
+ * text field. It was 200 here -- the *typed signature* bound -- so a long answer stopped dead
+ * with no counter and no message.
+ */
+export const TEXT_FIELD_MAX = 2000;
+
+/** Past this much of the limit the field starts saying how much room is left. */
+export const TEXT_FIELD_HINT_AT = Math.floor(TEXT_FIELD_MAX * 0.8);
 
 export const isMarkField = (field: SigningField) =>
   field.type === "signature" || field.type === "initials";
