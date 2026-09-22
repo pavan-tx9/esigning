@@ -5,7 +5,13 @@ import { App } from "@/App";
 import { CONNECT_TIMEOUT_MS } from "@/flow/SigningFlow";
 import { hasSessionToken, setSessionToken } from "@/lib/api";
 import { ParentChannel } from "@/lib/embed";
-import { mockDb, type Scenario, tokenFor } from "@/mocks/db";
+import {
+  liveSavedSignature,
+  mockDb,
+  SAVED_SIGNATURE_ID,
+  type Scenario,
+  tokenFor,
+} from "@/mocks/db";
 import { signerApiHandlers } from "@/mocks/handlers";
 import { server } from "@/test/server";
 
@@ -478,6 +484,238 @@ describe("re-authentication", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
   }, 20_000);
+});
+
+/**
+ * SPEC section 14 C: a host may let one re-authentication cover a clinician's next few documents
+ * (a signing queue). The session then arrives already vouched for, so the hand-off is skipped,
+ * the screen says what the record will say, and a fresh confirmation is one press away.
+ */
+describe("a re-authentication carried over from an earlier document", () => {
+  async function toConfirm(scenario: Scenario) {
+    const host = await start(scenario);
+    await throughConsent();
+    await adoptPrintedName();
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+    return host;
+  }
+
+  it("skips the hand-off, says when the cover runs out, and signs straight away", async () => {
+    const host = await toConfirm("span-valid");
+
+    const covered = screen.getByTestId("reauth-verified");
+    expect(covered).toHaveAttribute("data-reauth-scope", "span");
+    expect(covered).toHaveTextContent("for an earlier document");
+    expect(covered).toHaveTextContent(/covers this signature until \d{1,2}:\d{2}/);
+    expect(covered).toHaveTextContent("the record will say so");
+    expect(screen.queryByRole("button", { name: "Confirm it's me" })).toBeNull();
+    expect(screen.queryByTestId("reauth-waiting")).toBeNull();
+    expect(screen.getByRole("button", { name: "Confirm again" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+    await screen.findByTestId("step-done");
+    expect(mockDb.peek("span-valid")?.signerStatus).toBe("signed");
+    // Nothing was ever asked of the host page.
+    expect(types(host)).not.toContain("esign:reauth_required");
+  }, 20_000);
+
+  it("can still be confirmed again for this document, and cancelling keeps the cover", async () => {
+    const host = await toConfirm("span-valid");
+
+    await click("Confirm again");
+    expect(host.posted.at(-1)).toEqual({
+      type: "esign:reauth_required",
+      session_id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
+    });
+    expect(screen.getByTestId("reauth-waiting")).toBeInTheDocument();
+
+    // Changing their mind costs nothing: the earlier confirmation still stands.
+    await click("Cancel");
+    expect(screen.getByTestId("reauth-verified")).toHaveAttribute("data-reauth-scope", "span");
+
+    await click("Confirm again");
+    mockDb.attestReauth("span-valid");
+    await host.send({ type: "esign:reauth_done" });
+    const fresh = await screen.findByText(/Confirmed, thank you/);
+    expect(fresh).toHaveTextContent("please sign now");
+    expect(mockDb.peek("span-valid")?.reauthScope).toBe("session");
+  }, 20_000);
+
+  it("asks for the hand-off as usual once the earlier confirmation has run out", async () => {
+    await toConfirm("span-expired");
+    expect(screen.queryByTestId("reauth-verified")).toBeNull();
+    expect(screen.getByRole("button", { name: "Confirm it's me" })).toBeInTheDocument();
+    await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+    expect(screen.getByRole("alert")).toHaveTextContent("Confirm it's you first");
+    expect(mockDb.peek("span-expired")?.signRequests).toHaveLength(0);
+  }, 20_000);
+});
+
+/**
+ * SPEC section 14 B: a signature saved in an earlier session is offered first, with using it,
+ * making a new one and removing it as equal choices. Placing it stays one explicit action per
+ * field; saving a new one is an unchecked box; and a kiosk sees and sends none of this.
+ */
+describe("a saved signature", () => {
+  const sent = (scenario: Scenario) =>
+    JSON.parse(mockDb.peek(scenario)?.signRequests[0]?.body ?? "{}");
+
+  async function placeAndSign() {
+    await user.click(await screen.findByRole("checkbox"));
+    await click("Next");
+    await click("Sign here");
+    await click("Check your answers");
+    await screen.findByTestId("step-sign-summary");
+    await click("Continue");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+  }
+
+  it("is offered first and, once placed, goes over the wire as its id alone", async () => {
+    await start("saved-signature");
+    await throughConsent();
+
+    const offer = screen.getByTestId("saved-signature");
+    expect(within(offer).getByRole("img", { name: /Your saved signature/ })).toHaveAttribute(
+      "src",
+      expect.stringMatching(/^data:image\/png;base64,/),
+    );
+    expect(within(offer).getByText(/saved on/)).toHaveTextContent(/Drawn · saved on .*2026/);
+    expect(screen.getByRole("radio", { name: /Use my saved signature/ })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /Create a new one/ })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: /Remove saved signature/ })).toBeInTheDocument();
+    // Nothing to draw or type while the saved one is chosen, and nothing to save either.
+    expect(screen.queryByRole("radio", { name: /^Draw it/ })).toBeNull();
+    expect(screen.queryByTestId("save-signature")).toBeNull();
+
+    await click("Use this signature");
+    await screen.findByRole("heading", {
+      level: 1,
+      name: "I have received the Notice of Privacy Practices",
+    });
+    await placeAndSign();
+
+    await screen.findByTestId("step-done");
+    const body = sent("saved-signature");
+    expect(body.captures).toEqual([
+      { field_id: "ack_received", checked: true },
+      { field_id: "patient_sig", kind: "adopted", adopted_signature_id: SAVED_SIGNATURE_ID },
+    ]);
+    expect(body).not.toHaveProperty("save_adopted_signature");
+    expect(JSON.stringify(body)).not.toMatch(/image_png|typed_text/);
+  }, 25_000);
+
+  it("can be replaced by a new one, saved on request, and the old one is revoked", async () => {
+    await start("saved-signature");
+    await throughConsent();
+    await user.click(screen.getByRole("radio", { name: /Create a new one/ }));
+    expect(screen.getByText("How would you like to make the new one?")).toBeInTheDocument();
+    // Drawing is the default and offers to save; the printed name has nothing to save.
+    expect(screen.getByRole("radio", { name: /^Draw it/ })).toBeChecked();
+    expect(screen.getByTestId("save-signature")).toBeInTheDocument();
+    await user.click(screen.getByRole("radio", { name: /Use my printed name/ }));
+    expect(screen.queryByTestId("save-signature")).toBeNull();
+
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+    const keep = screen.getByRole("checkbox", { name: /Save this signature for next time/ });
+    expect(keep).not.toBeChecked();
+    expect(screen.getByTestId("save-signature")).toHaveTextContent("replaces the one you saved");
+    await user.click(keep);
+    await click("Use this signature");
+
+    await user.click(await screen.findByRole("checkbox"));
+    await click("Next");
+    await click("Sign here");
+    await click("Check your answers");
+    expect(await screen.findByTestId("summary-save-note")).toHaveTextContent("also be saved");
+    await click("Continue");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    await screen.findByTestId("step-done");
+    const body = sent("saved-signature");
+    expect(body.save_adopted_signature).toBe(true);
+    expect(body.captures).toContainEqual({
+      field_id: "patient_sig",
+      kind: "typed",
+      typed_text: "Maria Alvarez",
+    });
+    const record = mockDb.peek("saved-signature");
+    const live = record === undefined ? null : liveSavedSignature(record);
+    expect(live?.kind).toBe("typed");
+    expect(live?.typedText).toBe("Maria Alvarez");
+    expect(live?.id).not.toBe(SAVED_SIGNATURE_ID);
+    expect(record?.savedSignatures[0]?.revokeReason).toBe("replaced");
+  }, 25_000);
+
+  it("can be removed, after a second look, and then the plain choices remain", async () => {
+    await start("saved-signature");
+    await throughConsent();
+
+    await click(/Remove saved signature/);
+    const confirm = screen.getByTestId("remove-saved");
+    expect(confirm).toHaveTextContent("Remove your saved signature?");
+    expect(mockDb.peek("saved-signature")?.savedSignatures[0]?.revokedAt).toBeNull();
+    await click("Keep it");
+    expect(screen.queryByTestId("remove-saved")).toBeNull();
+
+    await click(/Remove saved signature/);
+    await click("Remove it");
+    await waitFor(() => expect(screen.queryByTestId("saved-signature")).toBeNull());
+    expect(screen.getByText("How would you like to sign?")).toBeInTheDocument();
+    expect(screen.getAllByRole("radio")).toHaveLength(3);
+    await waitFor(() =>
+      expect(screen.getByTestId("announcer")).toHaveTextContent("saved signature has been removed"),
+    );
+    const record = mockDb.peek("saved-signature");
+    expect(record === undefined ? null : liveSavedSignature(record)).toBeNull();
+    expect(record?.savedSignatures[0]?.revokeReason).toBe("user");
+
+    // Signing still works, with a signature made here, and nothing is saved unasked.
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+    expect(screen.getByTestId("save-signature")).not.toHaveTextContent("replaces");
+    await click("Use this signature");
+    await placeAndSign();
+    await screen.findByTestId("step-done");
+    expect(sent("saved-signature")).not.toHaveProperty("save_adopted_signature");
+  }, 25_000);
+
+  it("is never offered to, or saved from, a shared tablet", async () => {
+    // The patient on this kiosk has a signature on file; the session does not say so.
+    await start("kiosk");
+    await throughConsent();
+    expect(mockDb.peek("kiosk")?.savedSignatures).toHaveLength(1);
+    expect(screen.queryByTestId("saved-signature")).toBeNull();
+    expect(screen.queryByRole("radio", { name: /Use my saved signature/ })).toBeNull();
+    expect(screen.getByText("How would you like to sign?")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+    expect(screen.queryByTestId("save-signature")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /Save this signature/ })).toBeNull();
+    await click("Use this signature");
+    await user.click(await screen.findByRole("checkbox"));
+    await click("Next");
+    await click("Sign here");
+    await click("Check your answers");
+    expect(screen.queryByTestId("summary-save-note")).toBeNull();
+    await click("Continue");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    await screen.findByTestId("screen-handback");
+    const body = sent("kiosk");
+    expect(body).not.toHaveProperty("save_adopted_signature");
+    expect(JSON.stringify(body)).not.toContain("adopted");
+    expect(mockDb.peek("kiosk")?.savedSignatures).toHaveLength(1);
+  }, 25_000);
 });
 
 /**

@@ -47,6 +47,7 @@ from esign.contracts import (
     ConsentText,
     EventType,
     FieldDef,
+    Forbidden,
     Host,
     IntegrityFailure,
     KioskContext,
@@ -454,6 +455,29 @@ class _SessionRecord:
     revoked: bool = False
 
 
+#: Everything ``adopted_signatures`` holds, in the order :func:`_adopted` reads it.
+_ADOPTED_COLUMNS = (
+    "id, host_id, host_user_id, kind, image_sha256, typed_text, created_in_envelope_id, "
+    "created_by_session_id, created_at, revoked_at, revoke_reason"
+)
+
+
+def _adopted(row: Any) -> AdoptedSignature:
+    return AdoptedSignature(
+        id=UUID(str(row.id)),
+        host_id=UUID(str(row.host_id)),
+        host_user_id=str(row.host_user_id),
+        kind=cast(AdoptedSignatureKind, str(row.kind)),
+        image_sha256=None if row.image_sha256 is None else bytes(row.image_sha256),
+        typed_text=None if row.typed_text is None else str(row.typed_text),
+        created_in_envelope_id=UUID(str(row.created_in_envelope_id)),
+        created_by_session_id=UUID(str(row.created_by_session_id)),
+        created_at=row.created_at.astimezone(UTC),
+        revoked_at=None if row.revoked_at is None else row.revoked_at.astimezone(UTC),
+        revoke_reason=cast(AdoptedRevokeReason | None, None if row.revoke_reason is None else str(row.revoke_reason)),
+    )
+
+
 class FakeIdentityService:
     """Real rows for everything the envelope schema points at by foreign key."""
 
@@ -633,10 +657,18 @@ class FakeIdentityService:
         )
 
     # -- adopted signatures (Addendum 1 B) ----------------------------------
+    #: Real rows, like the sessions: ``signature_captures.adopted_signature_id`` is a foreign key
+    #: into ``adopted_signatures``, so a fake that kept these in a dict would let the envelope
+    #: tests pass against a schema that would reject what they wrote.
     def get_adopted_signature(self, db: Session, *, host_id: UUID, host_user_id: str) -> AdoptedSignature | None:
-        # TODO(addendum-1 B, adopted signatures): real rows in adopted_signatures, like the sessions.
-        _ = (db, host_id, host_user_id)
-        raise NotImplementedError("Addendum 1 B (adopted signatures): FakeIdentityService.get_adopted_signature")
+        row = db.execute(
+            text(
+                f"SELECT {_ADOPTED_COLUMNS} FROM adopted_signatures "  # a fixed column list
+                "WHERE host_id = :host AND host_user_id = :user AND revoked_at IS NULL"
+            ),
+            {"host": host_id, "user": host_user_id},
+        ).one_or_none()
+        return None if row is None else _adopted(row)
 
     def adopt_signature(
         self,
@@ -647,16 +679,54 @@ class FakeIdentityService:
         image_sha256: bytes | None = None,
         typed_text: str | None = None,
     ) -> AdoptedSignature:
-        # TODO(addendum-1 B, adopted signatures)
-        _ = (db, session_id, kind, image_sha256, typed_text)
-        raise NotImplementedError("Addendum 1 B (adopted signatures): FakeIdentityService.adopt_signature")
+        info = next(record.info for record in self._sessions.values() if record.info.id == session_id)
+        if info.kiosk is not None:
+            raise Forbidden("a shared tablet does not keep a signature", code="adoption_not_allowed")
+        self.revoke_adopted_signature(db, host_id=info.host_id, host_user_id=info.host_user_id, reason="replaced")
+        adopted_id = new_id()
+        now = self._clock.now()
+        db.execute(
+            text(
+                "INSERT INTO adopted_signatures (id, host_id, host_user_id, kind, image_sha256, typed_text, "
+                "  created_in_envelope_id, created_by_session_id, created_at) "
+                "VALUES (:id, :host, :user, :kind, :image, :typed, :envelope, :session, :now)"
+            ),
+            {
+                "id": adopted_id,
+                "host": info.host_id,
+                "user": info.host_user_id,
+                "kind": kind,
+                "image": image_sha256,
+                "typed": typed_text,
+                "envelope": info.envelope_id,
+                "session": session_id,
+                "now": now,
+            },
+        )
+        return AdoptedSignature(
+            id=adopted_id,
+            host_id=info.host_id,
+            host_user_id=info.host_user_id,
+            kind=kind,
+            image_sha256=image_sha256,
+            typed_text=typed_text,
+            created_in_envelope_id=info.envelope_id,
+            created_by_session_id=session_id,
+            created_at=now,
+        )
 
     def revoke_adopted_signature(
         self, db: Session, *, host_id: UUID, host_user_id: str, reason: AdoptedRevokeReason
     ) -> AdoptedSignature | None:
-        # TODO(addendum-1 B, adopted signatures)
-        _ = (db, host_id, host_user_id, reason)
-        raise NotImplementedError("Addendum 1 B (adopted signatures): FakeIdentityService.revoke_adopted_signature")
+        row = db.execute(
+            text(
+                "UPDATE adopted_signatures SET revoked_at = :now, revoke_reason = :reason "
+                "WHERE host_id = :host AND host_user_id = :user AND revoked_at IS NULL "
+                f"RETURNING {_ADOPTED_COLUMNS}"  # a fixed column list
+            ),
+            {"now": self._clock.now(), "reason": reason, "host": host_id, "user": host_user_id},
+        ).one_or_none()
+        return None if row is None else _adopted(row)
 
 
 # --------------------------------------------------------------------------- log capture

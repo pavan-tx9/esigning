@@ -19,16 +19,18 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
 from esign.api import idempotency
+from esign.api.adopted import adoption_source, revoke_and_record, save_adopted_signature, signer_actor
 from esign.api.context import authenticate_signer, runtime_of
 from esign.api.schemas import (
     ConsentBody,
     DeclineBody,
     SignBody,
     ViewedBody,
+    adopted_signature_json,
     signer_ack_json,
     signing_session_json,
 )
-from esign.contracts import RequestContext, SessionInfo, ValidationFailed
+from esign.contracts import AdoptedSignature, RequestContext, SessionInfo, ValidationFailed
 from esign.identity import Limit, RateLimits, ip_key, session_key
 from esign.runtime import Runtime
 from esign.worker import claim_seal_job, seal_one
@@ -73,6 +75,22 @@ def _signer_ack(rt: Runtime, db: Session, session: SessionInfo) -> dict[str, Any
     }
 
 
+def _adopted_signature(rt: Runtime, db: Session, session: SessionInfo) -> dict[str, Any] | None:
+    """This signer's own saved signature, for the session payload (Addendum 1 B).
+
+    The pair it is looked up by comes from the session's rows, so a session can only ever be
+    offered the signature of the person whose session it is. A kiosk session is offered nothing:
+    the tablet is shared, and the next patient must not be handed the last one's signature.
+    """
+    if session.kiosk is not None:
+        return None
+    adopted: AdoptedSignature | None = rt.identity.get_adopted_signature(
+        db, host_id=session.host_id, host_user_id=session.host_user_id
+    )
+    image = None if adopted is None or adopted.image_sha256 is None else rt.blobs.get(db, adopted.image_sha256)
+    return adopted_signature_json(adopted, image)
+
+
 @router.get("/session")
 def get_session(
     request: Request, locale: Annotated[str | None, Query(max_length=35, pattern=r"^[A-Za-z0-9-]+$")] = None
@@ -87,7 +105,8 @@ def get_session(
         _limit(rt, "present", session, ctx)
         view = rt.envelopes.signing_view(db, session)
         consent = rt.identity.current_consent(db, locale or rt.settings.default_locale)
-    return JSONResponse(signing_session_json(view, consent, session))
+        adopted = _adopted_signature(rt, db, session)
+    return JSONResponse(signing_session_json(view, consent, session, adopted))
 
 
 @router.get("/document")
@@ -141,6 +160,10 @@ def post_sign(
     and in a transaction of its own: if KMS, the timestamp authority or storage is down the
     signature still stands, the failure is recorded, and the worker retries. The response reports
     the state as of the signature, never "sealed" on the strength of an attempt.
+
+    ``save_adopted_signature`` (Addendum 1 B) keeps the drawn or typed signature just applied, in
+    this same transaction and only once the signature itself has succeeded. A replay of the same
+    idempotency key returns the first response and saves nothing a second time.
     """
     rt = runtime_of(request)
     if idempotency_key is None:
@@ -163,8 +186,15 @@ def post_sign(
         # After the replay check: a retry of a signature that already succeeded must get its first
         # answer back, not a 429, however many times the connection drops.
         _limit(rt, "sign", session, ctx)
-        view = rt.envelopes.sign(db, session, body.to_contract(rt.settings), ctx)
+        captures = body.to_contract(rt.settings)
+        # Which signature would be saved is decided before anything is applied, so "there is
+        # nothing here to save" is a refusal the signer sees instead of a rolled-back signature.
+        source = adoption_source(captures) if body.save_adopted_signature else None
+        view = rt.envelopes.sign(db, session, captures, ctx)
         ack = signer_ack_json(view, session.signer_id)
+        if source is not None:
+            signer = next((s for s in view.signers if s.id == session.signer_id), None)
+            save_adopted_signature(rt, db, session, source, ctx, capacity=None if signer is None else signer.capacity)
         idempotency.complete(db, scope=scope, key=idempotency_key, status=200, body=ack)
     if view.status == "completed_pending_seal":
         # Claim the job like any worker would, so a worker ticking right now does not make a second
@@ -176,6 +206,32 @@ def post_sign(
         if mine:
             seal_one(rt, view.id, claimed_at=claimed_at)
     return JSONResponse(ack)
+
+
+@router.post("/adopted-signature/revoke")
+def revoke_adopted_signature(request: Request) -> JSONResponse:
+    """The signer removes their own saved signature (Addendum 1 B, ``reason: user``).
+
+    200 whether or not there was one: the signer asked for it to be gone, and it is. Nothing is
+    deleted -- the row is revoked and stays, because a signature already applied points at it.
+
+    Unmetered, unlike the calls around it: a repeat writes no audit event (there is nothing live
+    left to revoke), so a loop here cannot grow the append-only trail. Saving another signature to
+    revoke costs a whole signature.
+    """
+    rt = runtime_of(request)
+    with rt.transaction() as db:
+        session, ctx = authenticate_signer(request, rt, db)
+        revoked = revoke_and_record(
+            rt,
+            db,
+            host_id=session.host_id,
+            host_user_id=session.host_user_id,
+            reason="user",
+            actor=signer_actor(session),
+            ctx=ctx,
+        )
+    return JSONResponse({"revoked": revoked is not None})
 
 
 @router.post("/decline")

@@ -97,6 +97,10 @@ def build_payload(
         "event": event,
         "occurred_at": occurred_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "envelope_id": str(envelope.id),
+        # Addendum 1 A: which sort of envelope this is. A paper archive has no template, so the
+        # two template fields are null, and it only ever fires ``envelope.sealed`` and
+        # ``envelope.voided``.
+        "kind": envelope.kind,
         "status": envelope.status,
         "template_key": envelope.template_key,
         "template_version": envelope.template_version,

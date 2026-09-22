@@ -24,6 +24,7 @@ from esign.contracts import (
     TemplatePdfInfo,
     ValidationFailed,
 )
+from esign.documents import archive_cover as archive_cover_module
 from esign.documents import certificate as certificate_module
 from esign.documents import definitions as definitions_module
 from esign.documents import images, inspection, stamping
@@ -109,9 +110,16 @@ class PdfDocumentService:
         return out
 
     def build_archive_cover(self, summary: ArchiveCoverSummary) -> bytes:
-        # TODO(addendum-1 A, paper archives): one page placed before the scan; see the contract.
-        _ = summary
-        raise NotImplementedError("Addendum 1 A (paper archives): DocumentService.build_archive_cover")
+        """The one page that precedes a scan inside the sealed bytes (Addendum 1 A)."""
+        out = archive_cover_module.build_archive_cover(summary)
+        log.info(
+            "documents.archive_cover_built",
+            envelope_id=summary.envelope_id,
+            document_type=summary.document_type,
+            page_count=summary.scan_page_count,
+            size_bytes=len(out),
+        )
+        return out
 
     def page_count(self, pdf: bytes) -> int:
         """Pages in a PDF this service produced (a prepared, stamped or finalized revision)."""

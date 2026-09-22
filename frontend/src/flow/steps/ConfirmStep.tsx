@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Button, CheckRow, Dots, Notice, Sheet, StepScreen, useAnnounce } from "@/components/ui";
 import { useHostLink, useNow } from "@/flow/context";
-import { buildCaptures, type Draft } from "@/flow/draft";
+import { buildSignRequest, type Draft } from "@/flow/draft";
 import { ApiError } from "@/lib/api";
 import {
   isNetworkError,
@@ -25,6 +25,16 @@ type Reauth =
   | { status: "timed_out" }
   | { status: "not_confirmed" }
   | { status: "lapsed" };
+
+/** A server timestamp as a wall-clock time in the language the page is in ("2:41 PM", "14:41"). */
+function clockTime(iso: string, locale: string | null | undefined): string {
+  const options: Intl.DateTimeFormatOptions = { hour: "numeric", minute: "2-digit" };
+  try {
+    return new Intl.DateTimeFormat(locale ?? undefined, options).format(new Date(iso));
+  } catch {
+    return new Intl.DateTimeFormat(undefined, options).format(new Date(iso));
+  }
+}
 
 interface ConfirmStepProps {
   session: SigningSession;
@@ -53,6 +63,8 @@ export function ConfirmStep({
   const live = useQuery(sessionQueryOptions(locale));
   const signer = live.data?.signer ?? session.signer;
   const [reauth, setReauth] = useState<Reauth>({ status: "idle" });
+  /** Re-authenticated through the hand-off on this screen, as opposed to arriving already covered. */
+  const [confirmedHere, setConfirmedHere] = useState(false);
   const [intent, setIntent] = useState(false);
   const [nudge, setNudge] = useState(false);
   const [reauthNudge, setReauthNudge] = useState(false);
@@ -66,15 +78,22 @@ export function ConfirmStep({
    * clock runs two minutes fast would read every successful confirmation as already lapsed and
    * refuse to let anyone sign. The countdown below is advisory; the server's 403 is what decides,
    * and it is handled as `reauth: lapsed`.
+   *
+   * SPEC section 14 C: the value covers an attestation borrowed from an earlier session of this
+   * person's (a signing queue) as well as one made for this session, and `reauth_scope` says
+   * which. Either way the hand-off is skipped and the screen says what the record will say.
    */
   const validUntil = signer.reauth_valid_until ? Date.parse(signer.reauth_valid_until) : 0;
   const secondsLeft = Math.floor((validUntil - now) / 1000);
   const serverVouches = !signer.requires_reauth || signer.reauth_valid_until !== null;
   const verified = serverVouches && reauth.status !== "lapsed";
+  const coveredUntil = signer.reauth_valid_until
+    ? clockTime(signer.reauth_valid_until, session.consent.locale)
+    : null;
 
   const request = useMemo<SignRequest>(
-    () => ({ intent_confirmed: true, captures: buildCaptures(session.fields, draft) }),
-    [session.fields, draft],
+    () => buildSignRequest(session.fields, draft, { kiosk: session.session.kiosk }),
+    [session.fields, draft, session.session.kiosk],
   );
 
   const sign = useMutation({
@@ -130,6 +149,7 @@ export function ConfirmStep({
         // device's clock would turn a fast tablet into an endless "try again".
         if (fresh.signer.reauth_valid_until !== null) {
           setReauth({ status: "idle" });
+          setConfirmedHere(true);
           announce("Thank you. We've confirmed it's you.");
         } else {
           setReauth({ status: "not_confirmed" });
@@ -192,13 +212,7 @@ export function ConfirmStep({
       {signer.requires_reauth ? (
         <Sheet className="mb-6">
           <h2 className="text-ink-900 text-xl">First, confirm it's you</h2>
-          {verified ? (
-            <p className="mt-2 text-ink-700" data-testid="reauth-verified">
-              <span aria-hidden="true">✓ </span>Confirmed, thank you. For security this lasts about
-              two minutes, so please sign now.
-              {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
-            </p>
-          ) : reauth.status === "waiting" || reauth.status === "checking" ? (
+          {reauth.status === "waiting" || reauth.status === "checking" ? (
             <div role="status" className="mt-2 text-ink-700" data-testid="reauth-waiting">
               <p className="flex items-center gap-3 font-semibold text-ink-900">
                 <Dots /> Waiting for you to confirm your identity
@@ -215,6 +229,40 @@ export function ConfirmStep({
                 Cancel
               </Button>
             </div>
+          ) : verified && confirmedHere ? (
+            <p className="mt-2 text-ink-700" data-testid="reauth-verified">
+              <span aria-hidden="true">✓ </span>Confirmed, thank you. For security this lasts about
+              two minutes, so please sign now.
+              {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
+            </p>
+          ) : verified ? (
+            <>
+              {/* Already covered when this screen opened: nothing to hand off. The record will say
+                  which confirmation the signature rests on and when it was made, so say so here,
+                  and leave the way open to make a fresh one for this document. */}
+              <p
+                className="mt-2 text-ink-700"
+                data-testid="reauth-verified"
+                data-reauth-scope={signer.reauth_scope ?? undefined}
+              >
+                <span aria-hidden="true">✓ </span>
+                {signer.reauth_scope === "span"
+                  ? "You confirmed your identity for an earlier document a short while ago. "
+                  : "You've already confirmed it's you. "}
+                {coveredUntil !== null
+                  ? `That confirmation covers this signature until ${coveredUntil}, and the record will say so.`
+                  : "That confirmation covers this signature, and the record will say so."}
+                {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
+              </p>
+              <Button
+                ref={reauthButton}
+                variant="secondary"
+                className="mt-4 w-full sm:w-auto"
+                onClick={startReauth}
+              >
+                Confirm again
+              </Button>
+            </>
           ) : (
             <>
               {reauth.status === "timed_out" ? (

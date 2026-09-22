@@ -17,10 +17,12 @@ from fastapi import APIRouter, File, Form, Header, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from esign.api import idempotency
+from esign.api.adopted import revoke_and_record
 from esign.api.context import authenticate_host, runtime_of
 from esign.api.schemas import (
     NewEnvelopeBody,
     ReauthBody,
+    RevokeAdoptedBody,
     SessionBody,
     VoidBody,
     audit_event_json,
@@ -39,6 +41,7 @@ from esign.contracts import (
     RequestContext,
     SignerView,
     ValidationFailed,
+    is_opaque_id,
 )
 from esign.identity import RateLimits, host_key
 from esign.logging import get_logger
@@ -51,6 +54,9 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["host"])
 
 _HOST_ACTOR = Actor(role="host")
+
+#: Long enough for any identifier ``is_opaque_id`` accepts; a path longer than that is not one.
+_MAX_HOST_USER_ID = 128
 _PDF_HEADERS = {"Cache-Control": "no-store", "Content-Disposition": 'attachment; filename="document.pdf"'}
 
 
@@ -297,6 +303,30 @@ def attest_reauth(request: Request, session_id: UUID, body: ReauthBody) -> JSONR
         )
         valid_until = body.auth_time + timedelta(seconds=rt.settings.reauth_max_age_seconds)
     return JSONResponse({"session_id": str(info.id), "reauth_valid_until": timestamp(valid_until)})
+
+
+@router.post("/users/{host_user_id}/adopted-signature/revoke")
+def revoke_adopted_signature(
+    request: Request, host_user_id: str, body: RevokeAdoptedBody | None = None
+) -> JSONResponse:
+    """Remove a user's saved signature (Addendum 1 B). Only the *signer* can create one; either
+    side can revoke, and the trail records which (``reason: host`` here).
+
+    200 whether or not there was one: the lookup is scoped to the authenticated host, so a user of
+    another host and a user with nothing saved are the same answer. ``reason`` may be sent for the
+    host's own records and is not stored -- free text has no place in the trail.
+    """
+    _ = body
+    rt = runtime_of(request)
+    with rt.transaction() as db:
+        host, ctx = authenticate_host(request, rt, db)
+        if len(host_user_id) > _MAX_HOST_USER_ID or not is_opaque_id(host_user_id):
+            # No row can carry a non-opaque id, so there is nothing to revoke and nothing to say.
+            return JSONResponse({"revoked": False})
+        revoked = revoke_and_record(
+            rt, db, host_id=host.id, host_user_id=host_user_id, reason="host", actor=_HOST_ACTOR, ctx=ctx
+        )
+    return JSONResponse({"revoked": revoked is not None})
 
 
 @router.get("/envelopes/{envelope_id}/document")

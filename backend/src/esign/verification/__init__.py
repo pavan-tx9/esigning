@@ -177,7 +177,7 @@ class Verifier:
         the CLI passes ``None``."""
         envelope = db.execute(
             text(
-                "SELECT id, host_id, status, presented_sha256, current_revision_sha256, sealed_sha256 "
+                "SELECT id, host_id, status, kind, presented_sha256, current_revision_sha256, sealed_sha256 "
                 # A shared row lock: signing and sealing wait, so the envelope, its revisions and
                 # its trail are read as one consistent state and a seal landing mid-check cannot
                 # show up as a false finding. Other verifications are not blocked.
@@ -188,6 +188,12 @@ class Verifier:
         if envelope is None or (host is not None and envelope.host_id != host.id):
             raise NotFound("no such envelope", code="not_found")
         status = str(envelope.status)
+        #: Addendum 1 A. A paper archive is verified like any other envelope, with three
+        #: differences that follow from having no template and no signers: revision 1 is the
+        #: ``scan``, the trail starts with ``archive.created`` / ``archive.attested`` instead of
+        #: ``envelope.created`` / ``document.prepared``, and the sealed document carries a cover
+        #: page before the scanned pages.
+        kind = str(envelope.kind)
         run = _Run()
 
         revisions = db.execute(
@@ -198,7 +204,7 @@ class Verifier:
         ).all()
         blobs_checked, fetched = self._check_revisions(db, run, revisions)
         sealed_pdf = next(iter(fetched.get("sealed", [])), None)
-        self._check_pointers(run, envelope, revisions)
+        self._check_pointers(run, envelope, revisions, kind)
 
         chain = self._audit.verify(db, "envelope", envelope_id)
         if chain.ok:
@@ -206,12 +212,13 @@ class Verifier:
         else:
             run.failed("audit_chain", "; ".join(chain.problems) or "chain did not verify")
         events = self._audit.list(db, "envelope", envelope_id)
-        self._check_trail_against_revisions(run, events, revisions, status)
+        self._check_trail_against_revisions(run, events, revisions, status, kind)
 
-        self._check_envelope_row_against_trail(db, run, events, envelope_id)
+        self._check_envelope_row_against_trail(db, run, events, envelope_id, kind)
         self._check_signer_rows_against_trail(db, run, events, envelope_id)
+        self._check_reauth_attestations(db, run, events, envelope_id)
         blobs_checked += self._check_capture_images(db, run, events, envelope_id)
-        self._check_sealed_pages_match_final_revision(run, fetched, status)
+        self._check_sealed_pages_match_final_revision(run, fetched, status, kind)
 
         seal: SealValidation | None = None
         if status == "sealed":
@@ -294,11 +301,14 @@ class Verifier:
             fetched.setdefault(str(revision.kind), []).append(data)
         return checked, fetched
 
-    def _check_pointers(self, run: _Run, envelope: Any, revisions: Any) -> None:
+    def _check_pointers(self, run: _Run, envelope: Any, revisions: Any, kind: str = "electronic") -> None:
         by_kind: dict[str, list[bytes]] = {}
         for revision in revisions:
             by_kind.setdefault(str(revision.kind), []).append(bytes(revision.sha256))
-        presented = by_kind.get("presented", [None])[0]
+        # Addendum 1 A: revision 1 of a paper archive is the ``scan``, and it is also the last
+        # revision -- nothing is ever applied to it, so both pointers name it.
+        first_kind = "scan" if kind == "paper_archive" else "presented"
+        presented = by_kind.get(first_kind, [None])[0]
         run.expect(
             "envelope_presented_pointer",
             presented is not None and _opt(envelope.presented_sha256) == presented,
@@ -326,16 +336,22 @@ class Verifier:
                 "a sealed document exists for an envelope that is not sealed",
             )
 
-    def _check_trail_against_revisions(self, run: _Run, events: list[AuditEvent], revisions: Any, status: str) -> None:
+    def _check_trail_against_revisions(
+        self, run: _Run, events: list[AuditEvent], revisions: Any, status: str, kind: str = "electronic"
+    ) -> None:
         """The hashes the trail recorded must be the hashes of the revisions that are stored."""
         by_no = {int(r.revision_no): bytes(r.sha256) for r in revisions}
         by_kind = {str(r.kind): bytes(r.sha256) for r in revisions}
 
-        prepared = [e for e in events if e.event_type == EventType.DOCUMENT_PREPARED]
+        # Addendum 1 A: ``archive.created`` is a paper archive's ``document.prepared`` -- the
+        # event that says which bytes revision 1 is. The claim checked is the same one.
+        first_event = EventType.ARCHIVE_CREATED if kind == "paper_archive" else EventType.DOCUMENT_PREPARED
+        first_revision = by_kind.get("scan" if kind == "paper_archive" else "presented")
+        prepared = [e for e in events if e.event_type == first_event]
         run.expect(
             "trail_presented_hash",
-            len(prepared) == 1 and prepared[0].document_sha256 == by_kind.get("presented"),
-            "document.prepared does not record the stored presented revision",
+            len(prepared) == 1 and prepared[0].document_sha256 == first_revision,
+            f"{first_event.value} does not record the stored first revision",
         )
         signed = [e for e in events if e.event_type == EventType.SIGNER_SIGNED]
         mismatched = [
@@ -417,7 +433,7 @@ class Verifier:
         )
 
     def _check_envelope_row_against_trail(
-        self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID
+        self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID, kind: str = "electronic"
     ) -> None:
         """The document-level facts the certificate prints must still say what the trail says.
 
@@ -426,6 +442,9 @@ class Verifier:
         "Template". The seal now refuses on a disagreement; this reports the same five comparisons
         for an envelope that was already sealed when a row was changed.
         """
+        if kind == "paper_archive":
+            self._check_archive_row_against_trail(db, run, events, envelope_id)
+            return
         row = db.execute(
             text(
                 "SELECT e.created_at, e.document_type, e.template_version_id, t.version, tpl.key AS template_key "
@@ -454,6 +473,56 @@ class Verifier:
         ):
             if _text(row_value) != _text(event_value):
                 problems.append(f"{what} is not what envelope.created recorded")
+        run.expect("envelope_row_matches_trail", not problems, "; ".join(problems))
+
+    def _check_archive_row_against_trail(
+        self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID
+    ) -> None:
+        """The same comparison for a paper archive (Addendum 1 A), against its own two events.
+
+        The attestation is where an archive keeps everything a signer row keeps for an electronic
+        envelope, and it is the load-bearing claim on the cover page and the certificate: who says
+        this scan is a true copy, and what became of the paper. ``envelopes.attestation`` is an
+        UPDATE-able jsonb column, so it is compared with ``archive.attested`` exactly as a signer's
+        row is compared with ``signer.signed`` -- the names inside it are not in the trail and
+        cannot be (they are PHI), but the staff member, the statement, the disposition and the
+        number of paper signers are, and a rewrite of any of them is a finding here.
+        """
+        row = db.execute(
+            text("SELECT created_at, document_type, attested_at, attestation FROM envelopes WHERE id = :id"),
+            {"id": envelope_id},
+        ).first()
+        created = next((e for e in events if e.event_type == EventType.ARCHIVE_CREATED), None)
+        attested = next((e for e in events if e.event_type == EventType.ARCHIVE_ATTESTED), None)
+        if created is None or attested is None:
+            run.failed("envelope_row_matches_trail", "the archive has no archive.created / archive.attested event")
+            return
+        if row is None or row.attestation is None or row.attested_at is None:  # pragma: no cover - CHECKed
+            run.failed("envelope_row_matches_trail", "the archive row has no attestation")
+            return
+        attestation = dict(row.attestation)
+        problems: list[str] = []
+        if abs(row.created_at - created.occurred_at) > _ROW_EVENT_TOLERANCE:
+            problems.append("created_at is not the time archive.created recorded")
+        if abs(row.attested_at - attested.occurred_at) > _ROW_EVENT_TOLERANCE:
+            problems.append("attested_at is not the time archive.attested recorded")
+        for what, row_value, event_value in (
+            ("document_type", row.document_type, created.data.get("document_type")),
+            ("staff_user_id", attestation.get("staff_user_id"), attested.data.get("staff_user_id")),
+            ("statement", attestation.get("statement"), attested.data.get("statement")),
+            (
+                "original_disposition",
+                attestation.get("original_disposition"),
+                attested.data.get("original_disposition"),
+            ),
+            (
+                "paper_signer_count",
+                len(attestation.get("paper_signers") or []),
+                attested.data.get("paper_signer_count"),
+            ),
+        ):
+            if _text(row_value) != _text(event_value):
+                problems.append(f"{what} is not what the archive's trail recorded")
         run.expect("envelope_row_matches_trail", not problems, "; ".join(problems))
 
     def _check_signer_rows_against_trail(
@@ -536,7 +605,79 @@ class Verifier:
                 problems.append("no document.viewed covers the revision signer.signed was built on")
         run.expect("signer_rows_match_trail", not problems, "; ".join(sorted(set(problems))))
 
-    def _check_sealed_pages_match_final_revision(self, run: _Run, fetched: dict[str, list[bytes]], status: str) -> None:
+    def _check_reauth_attestations(self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID) -> None:
+        """Every signature that rests on a re-authentication still has the attestation it names.
+
+        ``signer.signed`` records the attestation's id, its method, whether it was made for that
+        signature's own session or borrowed from another of the same user's within the span
+        (SPEC section 14 C), and how old it was at the moment of signing. Each of those is a claim
+        about a row in ``reauth_attestations``, and until they are compared the row could say
+        something else entirely: the table is append-only against the application and the owner
+        role, but the point of verification is to re-derive rather than to assume. A borrowed
+        attestation is checked hardest, because it is the one the base spec would not have allowed:
+        it must exist, belong to this signer's own ``(host_id, host_user_id)``, and really come
+        from another session.
+        """
+        signed = [e for e in events if e.event_type == EventType.SIGNER_SIGNED and e.data.get("reauth_used")]
+        if not signed:
+            # Passed, not skipped: the check ran. Most envelopes have no re-authenticating role.
+            run.passed("reauth_attestations_match_trail", "no signature rests on a re-authentication")
+            return
+        whose = {
+            str(row.id): (str(row.host_id), str(row.host_user_id))
+            for row in db.execute(
+                text(
+                    "SELECT s.id AS id, s.host_user_id AS host_user_id, e.host_id AS host_id "
+                    "FROM signers s JOIN envelopes e ON e.id = s.envelope_id WHERE s.envelope_id = :id"
+                ),
+                {"id": envelope_id},
+            ).all()
+        }
+        problems: list[str] = []
+        for event in signed:
+            signer_id = str(event.data.get("signer_id"))
+            scope = _text(event.data.get("reauth_scope"))
+            age = event.data.get("reauth_age_seconds")
+            attestation_id = _uuid(event.data.get("reauth_attestation_id"))
+            if attestation_id is None or scope is None or age is None:
+                # A trail written before 0700 lands here, and so does one that claims a
+                # re-authentication without saying which. Both are findings, not silence.
+                problems.append(f"{signer_id}: signer.signed does not say which attestation covered the signature")
+                continue
+            row = db.execute(
+                text(
+                    "SELECT session_id, method, auth_time, host_id, host_user_id "
+                    "FROM reauth_attestations WHERE id = :id"
+                ),
+                {"id": attestation_id},
+            ).first()
+            if row is None:
+                problems.append(f"{signer_id}: the attestation signer.signed names is not in the database")
+                continue
+            if _text(row.method) != _text(event.data.get("reauth_method")):
+                problems.append(f"{signer_id}: the attestation's method is not the one signer.signed recorded")
+            recorded_auth_time = event.occurred_at - timedelta(seconds=int(age))
+            if abs(row.auth_time - recorded_auth_time) > _ROW_EVENT_TOLERANCE:
+                problems.append(f"{signer_id}: the attestation's auth_time is not the age signer.signed recorded")
+            pair = whose.get(signer_id)
+            if pair is not None and row.host_id is not None and (str(row.host_id), str(row.host_user_id)) != pair:
+                problems.append(f"{signer_id}: the attestation was made for another user or another host")
+            made_here = _text(row.session_id) == _text(event.ctx.session_id)
+            if scope == "session" and not made_here:
+                problems.append(
+                    f"{signer_id}: signer.signed claims its own attestation, and it belongs to another session"
+                )
+            if scope == "span" and made_here:
+                problems.append(
+                    f"{signer_id}: signer.signed claims a borrowed attestation, and it was made in this session"
+                )
+            if scope == "span" and row.host_id is None:
+                problems.append(f"{signer_id}: a borrowed attestation does not say whose it is")
+        run.expect("reauth_attestations_match_trail", not problems, "; ".join(sorted(set(problems))))
+
+    def _check_sealed_pages_match_final_revision(
+        self, run: _Run, fetched: dict[str, list[bytes]], status: str, kind: str = "electronic"
+    ) -> None:
         """The pages inside the seal are the pages of the last signer-applied revision.
 
         ``finalize`` rebuilds the document with pypdf rather than appending the certificate as an
@@ -545,11 +686,19 @@ class Verifier:
         the pages inside the seal are revision N's pages -- the only link was the trail's word for
         it. This recomputes the link: same page count plus the certificate's, and the same content
         streams and page boxes for the leading pages.
+
+        Addendum 1 A: a paper archive's last revision is the scan, and the sealed document puts
+        the cover page in front of it, so the comparison starts one page in. That offset is what
+        catches a scan swapped inside the sealed bytes after the fact -- the pages the seal covers
+        must still be the pages that were filed and hashed.
         """
         if status != "sealed":
             run.skipped("sealed_pages_match_final_revision", f"envelope is {status}, not sealed")
             return
-        signed = fetched.get("signer_applied", [])
+        archive = kind == "paper_archive"
+        signed = fetched.get("scan" if archive else "signer_applied", [])
+        # The cover page precedes the scan inside the seal; an electronic document starts at page 1.
+        offset = 1 if archive else 0
         final = next(iter(fetched.get("final_unsealed", [])), None)
         if not signed or final is None:
             run.failed(
@@ -563,15 +712,15 @@ class Verifier:
         except Exception:
             run.failed("sealed_pages_match_final_revision", "a revision's pages could not be read")
             return
-        if len(target) < len(source):
+        if len(target) < len(source) + offset:
             run.failed(
                 "sealed_pages_match_final_revision",
                 f"the finalized document has {len(target)} pages, fewer than the {len(source)} that were signed",
             )
             return
         problems = [
-            f"page {index + 1}"
-            for index, (before, after) in enumerate(zip(source, target, strict=False))
+            f"page {index + 1 + offset}"
+            for index, (before, after) in enumerate(zip(source, target[offset:], strict=False))
             if not _same_page(before, after)
         ]
         run.expect(
@@ -687,6 +836,20 @@ def _opt(value: Any) -> bytes | None:
 def _text(value: Any) -> str | None:
     """A row value and a canonicalised event value compared as the same kind of thing."""
     return None if value is None else str(value)
+
+
+def _uuid(value: Any) -> UUID | None:
+    """An id read back out of stored audit ``data``, or ``None`` when it is not one.
+
+    ``data`` is canonical JSON, so ids come back as strings. A value that is not a UUID is not an
+    id this service wrote, and the caller reports that rather than asking the database about it.
+    """
+    if value is None:
+        return None
+    try:
+        return value if isinstance(value, UUID) else UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _same_page(before: Any, after: Any) -> bool:

@@ -17,20 +17,31 @@ markers below each sit on one of those, and nowhere else.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from esign.contracts import BlobKind, Capacity, EnvelopeStatus, SignerStatus
+from esign.contracts import (
+    Attestation,
+    BlobKind,
+    Capacity,
+    EnvelopeKind,
+    EnvelopeStatus,
+    IntegrityFailure,
+    PaperSigner,
+    SignerStatus,
+)
 
 __all__ = [
     "EnvelopeRow",
     "SessionAttestation",
     "SignerRow",
     "TemplateVersionRow",
+    "adopted_signature_created_at",
+    "cancel_seal_job",
     "complete_seal_job",
     "due_envelope_ids",
     "enqueue_seal_job",
@@ -63,13 +74,17 @@ __all__ = [
 
 @dataclass(frozen=True)
 class EnvelopeRow:
+    """One envelope row. Addendum 1 A: ``kind`` decides which half of it is filled in --
+    ``template_version_id`` and ``signing_order`` for an ``electronic`` envelope, the three paper
+    columns for a ``paper_archive``, and the schema's CHECKs make the mixture unrepresentable."""
+
     id: UUID
     host_id: UUID
-    template_version_id: UUID
+    template_version_id: UUID | None
     document_type: str
     patient_ref: str
     host_document_ref: str | None
-    signing_order: str
+    signing_order: str | None
     status: EnvelopeStatus
     presented_sha256: bytes | None
     current_revision_sha256: bytes | None
@@ -79,6 +94,12 @@ class EnvelopeRow:
     created_at: datetime
     completed_at: datetime | None
     sealed_at: datetime | None
+    kind: EnvelopeKind = "electronic"
+    #: Paper archives only (``0700``): the date on the paper, the host's attestation, and when it
+    #: was filed. The names inside ``attestation`` are PHI: the cover page and the certificate.
+    paper_signed_on: date | None = None
+    attestation: Attestation | None = None
+    attested_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -156,15 +177,44 @@ def _opt_utc(value: Any) -> datetime | None:
     return None if value is None else _utc(value)
 
 
+def _attestation(value: Any, envelope_id: UUID) -> Attestation | None:
+    """The stored jsonb as the contract type. Addendum 1 A.
+
+    ``envelopes_attestation_shape`` already constrains this to five keys with a closed statement
+    and disposition vocabulary, so anything this cannot read is a row that got past the CHECK --
+    an integrity failure, not a value to guess at. The cover page and the certificate are built
+    from it, and a certificate built from a guess would be worse than none.
+    """
+    if value is None:
+        return None
+    try:
+        signers = tuple(
+            PaperSigner(display_name=str(item["display_name"]), capacity=item["capacity"])
+            for item in value["paper_signers"]
+        )
+        return Attestation(
+            staff_user_id=str(value["staff_user_id"]),
+            staff_display_name=str(value["staff_display_name"]),
+            statement=value["statement"],
+            original_disposition=value["original_disposition"],
+            paper_signers=signers,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise IntegrityFailure(
+            f"the attestation on envelope {envelope_id} cannot be read", code="attestation_unreadable"
+        ) from None
+
+
 def _envelope(row: Any) -> EnvelopeRow:
+    envelope_id = _uuid(row.id)
     return EnvelopeRow(
-        id=_uuid(row.id),
+        id=envelope_id,
         host_id=_uuid(row.host_id),
-        template_version_id=_uuid(row.template_version_id),
+        template_version_id=_opt_uuid(row.template_version_id),
         document_type=str(row.document_type),
         patient_ref=str(row.patient_ref),
         host_document_ref=None if row.host_document_ref is None else str(row.host_document_ref),
-        signing_order=str(row.signing_order),
+        signing_order=None if row.signing_order is None else str(row.signing_order),
         status=str(row.status),  # type: ignore[arg-type]  # CHECK-constrained in the schema
         presented_sha256=_opt_bytes(row.presented_sha256),
         current_revision_sha256=_opt_bytes(row.current_revision_sha256),
@@ -174,6 +224,10 @@ def _envelope(row: Any) -> EnvelopeRow:
         created_at=_utc(row.created_at),
         completed_at=_opt_utc(row.completed_at),
         sealed_at=_opt_utc(row.sealed_at),
+        kind=str(row.kind),  # type: ignore[arg-type]  # CHECK-constrained in the schema
+        paper_signed_on=row.paper_signed_on,
+        attestation=_attestation(row.attestation, envelope_id),
+        attested_at=_opt_utc(row.attested_at),
     )
 
 
@@ -202,7 +256,10 @@ def _signer(row: Any) -> SignerRow:
 _ENVELOPE_COLUMNS = (
     "id, host_id, template_version_id, document_type, patient_ref, host_document_ref, signing_order, "
     "status, presented_sha256, current_revision_sha256, sealed_sha256, supersedes_envelope_id, "
-    "expires_at, created_at, completed_at, sealed_at"
+    "expires_at, created_at, completed_at, sealed_at, "
+    # Addendum 1 A (0700): which kind of envelope this is, and the paper facts that only a
+    # paper_archive carries.
+    "kind, paper_signed_on, attestation, attested_at"
 )
 
 _SIGNER_COLUMNS = (
@@ -635,11 +692,15 @@ def insert_capture(
     image_sha256: bytes | None,
     typed_text: str | None,
     created_at: datetime,
+    adopted_signature_id: UUID | None = None,
 ) -> None:
+    """One signature mark. Addendum 1 B: an ``adopted`` capture names the saved signature whose
+    image or text was stamped and carries neither itself -- one row holds the ink (``0700``)."""
     db.execute(
         text(
-            "INSERT INTO signature_captures (id, signer_id, field_id, kind, image_sha256, typed_text, created_at) "
-            "VALUES (:id, :signer, :field_id, :kind, :image, :typed, :at)"
+            "INSERT INTO signature_captures "
+            "(id, signer_id, field_id, kind, image_sha256, typed_text, created_at, adopted_signature_id) "
+            "VALUES (:id, :signer, :field_id, :kind, :image, :typed, :at, :adopted)"
         ),
         {
             "id": capture_id,
@@ -649,8 +710,22 @@ def insert_capture(
             "image": image_sha256,
             "typed": typed_text,
             "at": created_at,
+            "adopted": adopted_signature_id,
         },
     )
+
+
+def adopted_signature_created_at(db: Session, adopted_signature_id: UUID) -> datetime | None:
+    """When a saved signature was adopted, revoked or not (Addendum 1 B).
+
+    The certificate prints "signed with a saved signature adopted on <date>" for a signature that
+    applied one, and that row may since have been replaced or revoked -- which is why this reads
+    the row by id rather than asking ``IdentityService.get_adopted_signature`` for the live one.
+    """
+    row = db.execute(
+        text("SELECT created_at FROM adopted_signatures WHERE id = :id"), {"id": adopted_signature_id}
+    ).one_or_none()
+    return None if row is None else _utc(row.created_at)
 
 
 def capture_count(db: Session, signer_id: UUID) -> int:
@@ -695,6 +770,24 @@ def fail_seal_job(db: Session, envelope_id: UUID, *, error_code: str, next_attem
         {"id": envelope_id, "next": next_attempt_at, "code": error_code},
     ).one()
     return int(row.attempts)
+
+
+def cancel_seal_job(db: Session, envelope_id: UUID, at: datetime) -> None:
+    """Stop a queued seal job from coming round again (Addendum 1 A).
+
+    A paper archive may be voided while ``completed_pending_seal``, which leaves a job for an
+    envelope that will never be sealed. ``seal_pending`` refuses it anyway -- the envelope is not
+    pending, so nothing happens and nothing is reported complete -- but an un-cancelled job is
+    retried, and refused, for ever, logging a failure that is not one. Nothing else cancels a job:
+    an electronic envelope that has reached this state cannot be voided at all (SPEC section 3).
+    """
+    db.execute(
+        text(
+            "UPDATE seal_jobs SET completed_at = COALESCE(completed_at, :at), locked_at = NULL "
+            "WHERE envelope_id = :id AND completed_at IS NULL"
+        ),
+        {"id": envelope_id, "at": at},
+    )
 
 
 def complete_seal_job(db: Session, envelope_id: UUID, at: datetime) -> None:

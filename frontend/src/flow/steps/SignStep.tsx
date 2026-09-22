@@ -67,8 +67,8 @@ export function SignStep({ session, draft, onDraft, onContinue }: SignStepProps)
       : { at: "field", index: firstOpen };
   });
 
-  const adopt = (adopted: AdoptedSignature, initials: string) => {
-    onDraft(withAdopted(draft, adopted, initials));
+  const adopt = (adopted: AdoptedSignature, initials: string, save: boolean) => {
+    onDraft(withAdopted(draft, adopted, initials, save));
     setPhase(fields.length > 0 ? { at: "field", index: 0 } : { at: "summary" });
   };
 
@@ -86,6 +86,10 @@ export function SignStep({ session, draft, onDraft, onContinue }: SignStepProps)
           defaultInitials={initialsFrom(session.signer.display_name)}
           current={draft.adopted}
           currentInitials={draft.initials}
+          currentSave={draft.save}
+          saved={session.adopted_signature}
+          kiosk={session.session.kiosk}
+          locale={session.consent.locale}
           onAdopt={adopt}
         />
       </StepScreen>
@@ -446,6 +450,14 @@ function SummaryScreen({
           ))}
         </ul>
       </Sheet>
+
+      {/* Part of what will happen when they sign, so it belongs on the screen that checks that. */}
+      {draft.save && !session.session.kiosk ? (
+        <p className="mt-4 text-ink-700" data-testid="summary-save-note">
+          Your signature will also be saved, so it's offered the next time you sign with this
+          clinic.
+        </p>
+      ) : null}
 
       {nudge && remaining.length > 0 ? (
         <p role="alert" className="mt-4 font-medium text-danger-600">

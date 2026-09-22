@@ -9,6 +9,7 @@ import {
   recordConsent,
   recordDecline,
   recordPresented,
+  recordRevokeSaved,
   recordSign,
   recordViewed,
   sessionBody,
@@ -119,9 +120,21 @@ export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
     ),
 
     http.post(
+      "/v1/signing/adopted-signature/revoke",
+      signerRoute(latency, (record) => {
+        recordRevokeSaved(record);
+        return ack(record);
+      }),
+    ),
+
+    http.post(
       "/v1/signing/sign",
       signerRoute(latency, async (record, request) => {
-        const body = (await request.json()) as { intent_confirmed?: unknown; captures?: unknown };
+        const body = (await request.json()) as {
+          intent_confirmed?: unknown;
+          captures?: unknown;
+          save_adopted_signature?: unknown;
+        };
         const outcome = recordSign(record, request.headers.get("Idempotency-Key"), body);
         // The nasty case: the server signed, but the reply never made it back.
         if (record.scenario === "flaky-sign" && outcome === "signed") {

@@ -49,6 +49,33 @@ export const fieldSchema = z.object({
   label: z.string(),
 });
 
+/**
+ * Which attestation `reauth_valid_until` rests on (SPEC section 14 C). `session`: made for this
+ * session. `span`: borrowed from an earlier session of the same person on the same host, within
+ * the host's signing-queue window. `null`: none the server is willing to vouch for right now.
+ */
+export const reauthScopeSchema = z.enum(["session", "span"]);
+
+/**
+ * The signature this person saved in an earlier session (SPEC section 14 B), served only to a
+ * session of the same person on the same host, and always `null` on a kiosk. The image comes as
+ * PNG bytes in base64; the UI shows it and sends back the id, never the bytes.
+ */
+export const adoptedSignatureSchema = z.discriminatedUnion("kind", [
+  z.object({
+    id: z.uuid(),
+    kind: z.literal("drawn"),
+    image_png_base64: z.string().min(1),
+    created_at: timestamp,
+  }),
+  z.object({
+    id: z.uuid(),
+    kind: z.literal("typed"),
+    typed_text: z.string().min(1),
+    created_at: timestamp,
+  }),
+]);
+
 export const sessionSchema = z.object({
   envelope: z.object({
     id: z.uuid(),
@@ -67,6 +94,7 @@ export const sessionSchema = z.object({
     status: signerStatusSchema,
     requires_reauth: z.boolean(),
     reauth_valid_until: timestamp.nullable(),
+    reauth_scope: reauthScopeSchema.nullable(),
   }),
   other_signers: z.array(z.object({ role_label: z.string(), status: signerStatusSchema })),
   fields: z.array(fieldSchema),
@@ -78,6 +106,7 @@ export const sessionSchema = z.object({
     expires_at: timestamp,
     kiosk: z.boolean(),
   }),
+  adopted_signature: adoptedSignatureSchema.nullable(),
   decline_reasons: z.array(z.object({ code: z.string().min(1), label: z.string().min(1) })),
 });
 
@@ -86,6 +115,8 @@ export type SigningField = z.infer<typeof fieldSchema>;
 export type Rect = z.infer<typeof rectSchema>;
 export type EnvelopeStatus = z.infer<typeof envelopeStatusSchema>;
 export type SignerStatus = z.infer<typeof signerStatusSchema>;
+export type ReauthScope = z.infer<typeof reauthScopeSchema>;
+export type SavedSignature = z.infer<typeof adoptedSignatureSchema>;
 
 export const signingKeys = {
   all: ["signing"] as const,
@@ -174,7 +205,9 @@ export const ackSchema = z.looseObject({});
 export type SignatureCapture =
   | { field_id: string; kind: "drawn"; image_png_base64: string }
   | { field_id: string; kind: "typed"; typed_text: string }
-  | { field_id: string; kind: "click" };
+  | { field_id: string; kind: "click" }
+  /** The saved signature's id and nothing else: the server holds the image or text. */
+  | { field_id: string; kind: "adopted"; adopted_signature_id: string };
 export type Capture =
   | SignatureCapture
   | { field_id: string; checked: boolean }
@@ -183,6 +216,12 @@ export type Capture =
 export interface SignRequest {
   intent_confirmed: true;
   captures: Capture[];
+  /**
+   * Save the drawn or typed signature in this submission for next time (SPEC section 14 B).
+   * Present only when true: the server refuses it from a kiosk and without such a capture, and
+   * an unchanged submission must keep its idempotency fingerprint.
+   */
+  save_adopted_signature?: true;
 }
 
 export function postViewed(pagesViewed: number) {
@@ -205,6 +244,15 @@ export function postDecline(reasonCode: string) {
 
 export function postSign(request: SignRequest, idempotencyKey: string) {
   return api("/signing/sign", ackSchema, { body: request, idempotencyKey });
+}
+
+/**
+ * The signer removes their own saved signature (SPEC section 14 B). The server answers 200
+ * whether or not there was one, so this is safe to send twice; the session is refetched
+ * afterwards and its `adopted_signature: null` is what the UI believes.
+ */
+export function postRevokeAdoptedSignature() {
+  return api("/signing/adopted-signature/revoke", ackSchema, { method: "POST", body: {} });
 }
 
 // --------------------------------------------------------------------------- idempotency

@@ -26,7 +26,8 @@ from typing import Final
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen.canvas import Canvas
 
-from esign.contracts import CertificateSigner, CertificateSummary, SealProfile
+from esign.contracts import Attestation, CertificateSigner, CertificateSummary, SealProfile
+from esign.documents.archive_cover import WHAT_THE_SEAL_PROVES
 from esign.documents.fonts import (
     PLAIN_BOLD_FONT,
     PLAIN_FONT,
@@ -105,6 +106,11 @@ def _when(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _day(value: datetime) -> str:
+    """A date, where the time of day says nothing: when a saved signature was adopted."""
+    return value.astimezone(UTC).strftime("%Y-%m-%d")
+
+
 def _heading(cursor: _Cursor, text: str) -> None:
     cursor.ensure(32)
     canvas = cursor.canvas
@@ -148,6 +154,25 @@ def _split_hex(text: str) -> list[str]:
     return [text[i : i + per_line] for i in range(0, len(text), per_line)] or [""]
 
 
+def _reauthentication(signer: CertificateSigner) -> str:
+    """What this signature's re-authentication was, in one line a reader can act on.
+
+    A signature may rest on an attestation the signer made in an earlier document of the same
+    signing queue (SPEC section 14 C). That is a real weakening of per-document proof, so the page
+    a court reads says it in words -- when the person proved who they were, and whether they did
+    it for this document or for an earlier one, and how long before this signature.
+    """
+    if not signer.reauth_method:
+        return "not required"
+    if signer.reauth_at is None:
+        return signer.reauth_method
+    when = _when(signer.reauth_at)
+    if signer.reauth_scope == "span":
+        seconds = max(0, int((signer.signed_at - signer.reauth_at).total_seconds()))
+        return f"{signer.reauth_method}, at {when} in an earlier session, {seconds} seconds before signing"
+    return f"{signer.reauth_method}, at {when} for this document"
+
+
 def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> None:
     cursor.ensure(150)
     canvas = cursor.canvas
@@ -165,7 +190,12 @@ def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> Non
     _row(cursor, "Capacity", signer.capacity)
     _row(cursor, "Signer id", str(signer.signer_id))
     _row(cursor, "Authentication", signer.auth_method)
-    _row(cursor, "Re-authentication", signer.reauth_method or "not required")
+    _row(cursor, "Re-authentication", _reauthentication(signer))
+    if signer.adopted_signature_id is not None and signer.adopted_at is not None:
+        # Addendum 1 B. The mark on the page is the signature this person saved in an earlier
+        # session, so the certificate says so and says when they adopted it -- the reader can then
+        # follow ``signature.adopted`` in the trail to the session that created it.
+        _row(cursor, "Saved signature", f"signed with a saved signature adopted on {_day(signer.adopted_at)}")
     _row(cursor, "Consent version", signer.consent_version)
     _row(cursor, "Viewed", _when(signer.viewed_at))
     _row(cursor, "Consented", _when(signer.consented_at))
@@ -176,6 +206,39 @@ def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> Non
         _row(cursor, "Kiosk staff member", signer.kiosk_staff_user_id or "not recorded")
         _row(cursor, "Identity check", signer.kiosk_identity_check or "not recorded")
     cursor.space(4)
+
+
+#: Addendum 1 A. How a paper archive's attestation reads on the certificate. The same vocabulary
+#: the cover page prints, in the same words, because they are inside the same sealed bytes.
+_DISPOSITION_LABELS: Final[dict[str, str]] = {
+    "retained": "kept by the practice",
+    "returned_to_signer": "returned to the person who signed it",
+    "destroyed_per_policy": "destroyed under the practice's retention policy",
+}
+
+_STATEMENT_LABELS: Final[dict[str, str]] = {
+    "true_copy": "This scan is a complete and accurate copy of the paper document.",
+}
+
+
+def _attestation_block(cursor: _Cursor, attestation: Attestation) -> None:
+    """The archive variant of the signer table (Addendum 1 A).
+
+    A paper archive has no signers in this system: nobody authenticated, consented or clicked
+    anything here. What there is instead is one staff member's attestation, and the people whose
+    names are on the paper -- printed as names, in the sealed bytes, where PHI belongs.
+    """
+    _row(cursor, "Attested by", attestation.staff_display_name)
+    _row(cursor, "Staff id", attestation.staff_user_id)
+    _row(cursor, "Statement", _STATEMENT_LABELS.get(attestation.statement, attestation.statement))
+    _row(
+        cursor,
+        "The original was",
+        _DISPOSITION_LABELS.get(attestation.original_disposition, attestation.original_disposition),
+    )
+    cursor.space(6)
+    for index, signer in enumerate(attestation.paper_signers, start=1):
+        _row(cursor, f"Signed on paper {index}", f"{signer.display_name} ({signer.capacity})")
 
 
 def _paragraph(cursor: _Cursor, text: str, *, size: float = 8.0) -> None:
@@ -199,6 +262,8 @@ def build_certificate(summary: CertificateSummary, *, seal_profile: SealProfile)
     buffer = io.BytesIO()
     canvas = new_canvas(buffer, _PAGE_W, _PAGE_H)
 
+    archive = summary.kind == "paper_archive"
+
     canvas.setFont(PLAIN_BOLD_FONT, 16)
     canvas.setFillColorRGB(*_INK)
     canvas.drawString(_MARGIN, _PAGE_H - _MARGIN - 12, _TITLE)
@@ -207,7 +272,9 @@ def build_certificate(summary: CertificateSummary, *, seal_profile: SealProfile)
     canvas.drawString(
         _MARGIN,
         _PAGE_H - _MARGIN - 26,
-        "This page is part of the sealed document and records how it was signed.",
+        "This page is part of the sealed document and records how it was filed."
+        if archive
+        else "This page is part of the sealed document and records how it was signed.",
     )
 
     cursor = _Cursor(canvas=canvas, y=_PAGE_H - _MARGIN - 44)
@@ -215,23 +282,39 @@ def build_certificate(summary: CertificateSummary, *, seal_profile: SealProfile)
     _heading(cursor, "Document")
     _row(cursor, "Envelope id", str(summary.envelope_id))
     _row(cursor, "Document type", summary.document_type)
-    _row(cursor, "Template", f"{summary.template_key} v{summary.template_version}")
-    _row(cursor, "Created", _when(summary.created_at))
-    _row(cursor, "Completed", _when(summary.completed_at))
-    _row(cursor, "Signers", str(len(summary.signers)))
+    if archive:
+        # No template: a paper archive is a scan the host filed, not something rendered here.
+        _row(cursor, "Kind", "Scanned copy of a document signed on paper")
+        _row(cursor, "Filed", _when(summary.created_at))
+        _row(cursor, "Attested", _when(summary.completed_at))
+    else:
+        _row(cursor, "Template", f"{summary.template_key} v{summary.template_version}")
+        _row(cursor, "Created", _when(summary.created_at))
+        _row(cursor, "Completed", _when(summary.completed_at))
+        _row(cursor, "Signers", str(len(summary.signers)))
 
     _heading(cursor, "Hashes (SHA-256)")
-    _row(cursor, "Presented to signers", _hexed(summary.presented_sha256), mono_wrap=True)
-    _row(cursor, "Final signed revision", _hexed(summary.final_revision_sha256), mono_wrap=True)
+    if archive:
+        # Both are the scan: it is revision 1 and the last revision, and nothing was applied to it.
+        _row(cursor, "Scan as filed", _hexed(summary.presented_sha256), mono_wrap=True)
+    else:
+        _row(cursor, "Presented to signers", _hexed(summary.presented_sha256), mono_wrap=True)
+        _row(cursor, "Final signed revision", _hexed(summary.final_revision_sha256), mono_wrap=True)
 
     _heading(cursor, "Audit trail")
     _row(cursor, "Events", str(summary.audit_event_count))
     _row(cursor, "Head hash", _hexed(summary.audit_head_hash), mono_wrap=True)
     _row(cursor, "Seal profile (configured)", seal_profile)
 
-    _heading(cursor, "Signers")
-    for index, signer in enumerate(summary.signers, start=1):
-        _signer_block(cursor, index, signer)
+    if archive and summary.attestation is not None:
+        _heading(cursor, "Attestation")
+        _attestation_block(cursor, summary.attestation)
+        _heading(cursor, "What this seal proves")
+        _paragraph(cursor, WHAT_THE_SEAL_PROVES)
+    else:
+        _heading(cursor, "Signers")
+        for index, signer in enumerate(summary.signers, start=1):
+            _signer_block(cursor, index, signer)
 
     _heading(cursor, "Verification")
     for paragraph in _VERIFY_LINES:

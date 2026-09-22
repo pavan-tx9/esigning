@@ -22,6 +22,7 @@ from uuid import UUID
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from esign.archives import build_archive_service, scan_settings
 from esign.audit import build_audit_log
 from esign.clock import SystemClock
 from esign.config import Settings, get_settings
@@ -186,6 +187,18 @@ def build_runtime(
     the_sealer = sealer or build_sealer(settings, clock)
     webhooks = WebhookQueue(clock)
 
+    # Addendum 1 A. A scan goes through the template hygiene rules under the *scan* bounds, and
+    # ``DocumentService.inspect_template_pdf`` takes those from the settings it was built with, so
+    # the archives module gets a document service of its own built from ``scan_settings``. It is
+    # the same implementation in every other respect.
+    archives = build_archive_service(
+        settings,
+        clock,
+        audit_log=audit,
+        blob_service=blobs,
+        document_service=build_document_service(scan_settings(settings), clock),
+    )
+
     @contextmanager
     def fresh_session() -> Iterator[Session]:
         session = sessions()
@@ -204,6 +217,7 @@ def build_runtime(
         sealer=the_sealer,
         new_session=fresh_session,
         notifier=webhooks,
+        archives=archives,
     )
     return Runtime(
         settings=settings,

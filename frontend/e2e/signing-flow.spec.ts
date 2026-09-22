@@ -337,6 +337,213 @@ test("a co-signer moves the document on: back to review, and the signature then 
   expect(record.viewedRevision).toBe(2);
 });
 
+/**
+ * SPEC section 14 C: a host may let one re-authentication cover a clinician's next few documents.
+ * The session then arrives already vouched for: no hand-off, a plain statement of what the record
+ * will say, and "Confirm again" for a fresh one. Once the cover has run out, the hand-off is back.
+ */
+test("a clinician in a signing queue is not handed off again while the earlier confirmation covers them", async ({
+  page,
+}) => {
+  const ui = await open(page, "span-valid");
+  await readEveryPage(ui, 3);
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await agree(ui);
+  await ui.getByRole("radio", { name: /Use my printed name/ }).check();
+  await ui.getByRole("button", { name: "Use this signature" }).click();
+  await ui.getByRole("button", { name: "Sign here" }).click();
+  await ui.getByRole("button", { name: "Check your answers" }).click();
+  await ui.getByRole("button", { name: "Continue" }).click();
+
+  await expect(ui.getByTestId("step-confirm")).toBeVisible();
+  const covered = ui.getByTestId("reauth-verified");
+  await expect(covered).toHaveAttribute("data-reauth-scope", "span");
+  await expect(covered).toContainText(/covers this signature until \d{1,2}:\d{2}/);
+  await expect(ui.getByRole("button", { name: "Confirm it's me" })).toHaveCount(0);
+  await expect(page.locator("#reauth")).toBeHidden();
+  await shot(page, "25-confirm-span-covered");
+
+  // A fresh confirmation is on offer, and backing out of it keeps the earlier one.
+  await ui.getByRole("button", { name: "Confirm again" }).click();
+  await expect(ui.getByTestId("reauth-waiting")).toBeVisible();
+  await expect(page.locator("#reauth")).toBeVisible();
+  await shot(page, "26-confirm-span-again");
+  await page.getByRole("button", { name: "Do nothing" }).click();
+  await ui.getByRole("button", { name: "Cancel" }).click();
+  await expect(covered).toHaveAttribute("data-reauth-scope", "span");
+
+  await ui.getByRole("checkbox", { name: /I want to sign it as Dr. Priya Raman/ }).check();
+  await ui.getByRole("button", { name: "Sign document" }).click();
+  await expect(ui.getByTestId("copy-ready")).toBeVisible({ timeout: 20_000 });
+  await expect(page.locator('#log li[data-message="esign:reauth_required"]')).toHaveCount(1);
+});
+
+test("a clinician whose earlier confirmation has run out is handed off as usual", async ({
+  page,
+}) => {
+  const ui = await open(page, "span-expired");
+  await readEveryPage(ui, 3);
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await agree(ui);
+  await ui.getByRole("radio", { name: /Use my printed name/ }).check();
+  await ui.getByRole("button", { name: "Use this signature" }).click();
+  await ui.getByRole("button", { name: "Sign here" }).click();
+  await ui.getByRole("button", { name: "Check your answers" }).click();
+  await ui.getByRole("button", { name: "Continue" }).click();
+
+  await expect(ui.getByTestId("step-confirm")).toBeVisible();
+  await expect(ui.getByTestId("reauth-verified")).toHaveCount(0);
+  await expect(ui.getByRole("button", { name: "Confirm it's me" })).toBeVisible();
+  await shot(page, "27-confirm-span-expired");
+  await ui.getByRole("button", { name: "Confirm it's me" }).click();
+  await page.getByRole("button", { name: "Password confirmed" }).click();
+  await expect(ui.getByTestId("reauth-verified")).toContainText("Confirmed, thank you");
+});
+
+/**
+ * SPEC section 14 B: the signature saved last time is offered first, with using it, making a new
+ * one and removing it as equal choices. Placing it is still one press per field, the request to
+ * save a new one is an unchecked box, and the saved image never travels back to the server.
+ */
+test("a saved signature is offered first, placed per field, and sent as its id", async ({
+  page,
+}) => {
+  const signRequests: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith("/v1/signing/sign")) {
+      signRequests.push(request.postData() ?? "");
+    }
+  });
+  const ui = await open(page, "saved-signature");
+  await readEveryPage(ui, 2);
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await agree(ui);
+
+  await expect(ui.getByTestId("saved-signature")).toBeVisible();
+  await expect(ui.getByRole("img", { name: /Your saved signature/ })).toBeVisible();
+  await expect(ui.getByRole("radio", { name: /Use my saved signature/ })).toBeChecked();
+  await expect(ui.getByRole("radio", { name: /Create a new one/ })).toBeVisible();
+  await expect(ui.getByRole("button", { name: /Remove saved signature/ })).toBeVisible();
+  await expect(ui.getByTestId("signature-pad")).toHaveCount(0);
+  await shot(page, "90-adopt-saved-offered");
+
+  // The other two choices are as big as the first one.
+  const [useBox, newBox, removeBox] = await Promise.all([
+    ui
+      .getByRole("radio", { name: /Use my saved signature/ })
+      .locator("..")
+      .boundingBox(),
+    ui
+      .getByRole("radio", { name: /Create a new one/ })
+      .locator("..")
+      .boundingBox(),
+    ui.getByRole("button", { name: /Remove saved signature/ }).boundingBox(),
+  ]);
+  expect(useBox?.width).toBe(newBox?.width);
+  expect(useBox?.width).toBe(removeBox?.width);
+
+  await ui.getByRole("button", { name: "Use this signature" }).click();
+  await ui.getByRole("checkbox").check();
+  await ui.getByRole("button", { name: "Next" }).click();
+  await expect(ui.getByRole("heading", { name: "Patient signature" })).toBeVisible();
+  await ui.getByRole("button", { name: "Sign here" }).click();
+  await expect(ui.locator('[data-field-box="patient_sig"] img')).toBeVisible();
+  await shot(page, "91-field-saved-placed");
+  await ui.getByRole("button", { name: "Check your answers" }).click();
+  await expect(ui.getByTestId("summary-save-note")).toHaveCount(0);
+  await shot(page, "92-summary-saved");
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await ui.getByRole("checkbox", { name: /I want to sign/ }).check();
+  await ui.getByRole("button", { name: "Sign document" }).click();
+  await expect(ui.getByTestId("step-done")).toBeVisible();
+
+  expect(signRequests).toHaveLength(1);
+  const sent = JSON.parse(signRequests[0] ?? "{}");
+  expect(sent.captures).toContainEqual({
+    field_id: "patient_sig",
+    kind: "adopted",
+    adopted_signature_id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+  });
+  expect(sent).not.toHaveProperty("save_adopted_signature");
+  expect(signRequests[0]).not.toMatch(/image_png|iVBOR/);
+});
+
+test("a new signature can be drawn, saved for next time, and the saved one removed", async ({
+  page,
+}) => {
+  const signRequests: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().endsWith("/v1/signing/sign")) {
+      signRequests.push(request.postData() ?? "");
+    }
+  });
+  const ui = await open(page, "saved-signature");
+  await readEveryPage(ui, 2);
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await agree(ui);
+
+  // Removing asks once more, and keeping it changes nothing.
+  await ui.getByRole("button", { name: /Remove saved signature/ }).click();
+  await expect(ui.getByTestId("remove-saved")).toBeVisible();
+  await shot(page, "93-adopt-remove-asks");
+  await ui.getByRole("button", { name: "Keep it" }).click();
+  await expect(ui.getByTestId("remove-saved")).toHaveCount(0);
+  await expect(ui.getByTestId("saved-signature")).toBeVisible();
+
+  // Making a new one: the box to save it is there, and unticked.
+  await ui.getByRole("radio", { name: /Create a new one/ }).check();
+  await expect(ui.getByText("How would you like to make the new one?")).toBeVisible();
+  const keep = ui.getByRole("checkbox", { name: /Save this signature for next time/ });
+  await expect(keep).not.toBeChecked();
+  await drawSignature(page, ui);
+  await keep.check();
+  await shot(page, "94-adopt-new-and-save");
+  await ui.getByRole("button", { name: "Use this signature" }).click();
+  await ui.getByRole("checkbox").check();
+  await ui.getByRole("button", { name: "Next" }).click();
+  await ui.getByRole("button", { name: "Sign here" }).click();
+  await ui.getByRole("button", { name: "Check your answers" }).click();
+  await expect(ui.getByTestId("summary-save-note")).toBeVisible();
+  await shot(page, "95-summary-will-save");
+
+  // Second thoughts: back to the signature, and the saved one can go after all.
+  await ui.getByRole("button", { name: "Choose a different signature" }).click();
+  await expect(ui.getByRole("radio", { name: /Create a new one/ })).toBeChecked();
+  await ui.getByRole("button", { name: /Remove saved signature/ }).click();
+  await ui.getByRole("button", { name: "Remove it" }).click();
+  await expect(ui.getByTestId("saved-signature")).toHaveCount(0);
+  await expect(ui.getByText("How would you like to sign?")).toBeVisible();
+  await shot(page, "96-adopt-after-remove");
+
+  // The drawing has to be made again (the pad is fresh), and saving is still on offer.
+  await drawSignature(page, ui);
+  await ui.getByRole("checkbox", { name: /Save this signature for next time/ }).check();
+  await ui.getByRole("button", { name: "Use this signature" }).click();
+  // The tick they gave earlier is still there; only the signature had to be placed again.
+  await expect(ui.getByRole("checkbox")).toBeChecked();
+  await ui.getByRole("button", { name: "Next" }).click();
+  await ui.getByRole("button", { name: "Sign here" }).click();
+  await ui.getByRole("button", { name: "Check your answers" }).click();
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await ui.getByRole("checkbox", { name: /I want to sign/ }).check();
+  await ui.getByRole("button", { name: "Sign document" }).click();
+  await expect(ui.getByTestId("step-done")).toBeVisible();
+
+  expect(signRequests).toHaveLength(1);
+  const sent = JSON.parse(signRequests[0] ?? "{}");
+  expect(sent.save_adopted_signature).toBe(true);
+  expect(sent.captures.find((c: { kind?: string }) => c.kind === "drawn")?.field_id).toBe(
+    "patient_sig",
+  );
+
+  const frame = page.frames().find((f) => f.url().includes("sign.html"));
+  const record = (await frame?.evaluate(() => window.__esignMock?.peek("saved-signature"))) as {
+    savedSignatures: { kind: string; revokeReason: string | null }[];
+  };
+  expect(record.savedSignatures.map((row) => row.revokeReason)).toEqual(["user", null]);
+  expect(record.savedSignatures[1]?.kind).toBe("drawn");
+});
+
 test("a kiosk session ends by asking for the tablet back and forgets everything", async ({
   page,
 }) => {
@@ -344,6 +551,9 @@ test("a kiosk session ends by asking for the tablet back and forgets everything"
   await readEveryPage(ui, 2);
   await ui.getByRole("button", { name: "Continue" }).click();
   await agree(ui);
+  // The patient has a signature on file; a shared tablet is never offered it, nor asked to save.
+  await expect(ui.getByTestId("saved-signature")).toHaveCount(0);
+  await expect(ui.getByRole("checkbox", { name: /Save this signature/ })).toHaveCount(0);
   await ui.getByRole("radio", { name: /Use my printed name/ }).check();
   await ui.getByRole("button", { name: "Use this signature" }).click();
   await ui.getByRole("checkbox").check();

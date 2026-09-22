@@ -19,6 +19,7 @@ from esign.api.template_service import TemplateVersionView, TemplateView
 from esign.config import Settings
 from esign.contracts import (
     DECLINE_REASON_CODES,
+    AdoptedSignature,
     AuditEvent,
     AuthContext,
     AuthMethod,
@@ -42,10 +43,12 @@ __all__ = [
     "DeclineBody",
     "NewEnvelopeBody",
     "ReauthBody",
+    "RevokeAdoptedBody",
     "SessionBody",
     "SignBody",
     "ViewedBody",
     "VoidBody",
+    "adopted_signature_json",
     "audit_event_json",
     "envelope_json",
     "signer_ack_json",
@@ -108,6 +111,17 @@ class VoidBody(_Body):
     reason_code: str = Field(max_length=64)
 
 
+class RevokeAdoptedBody(_Body):
+    """Addendum 1 B: why a host removed a user's saved signature.
+
+    Accepted for the host's own logs and deliberately not stored: the trail records ``reason:
+    host``, and a free-text string from a host is exactly the kind of value that turns out to
+    contain a name.
+    """
+
+    reason: str | None = Field(default=None, max_length=200)
+
+
 class AuthBody(_Body):
     method: AuthMethod
     auth_time: datetime
@@ -159,6 +173,9 @@ class CaptureBody(_Body):
     typed_text: str | None = None
     checked: bool | None = None
     text_value: str | None = None
+    #: Addendum 1 B: an ``adopted`` capture is this id and nothing else. The image or the text it
+    #: stands for is read server-side from the signer's own saved signature.
+    adopted_signature_id: UUID | None = None
 
     @model_validator(mode="after")
     def _one_shape(self) -> CaptureBody:
@@ -172,12 +189,19 @@ class CaptureBody(_Body):
             raise ValueError("a capture carries checked or text_value, not both")
         if not signature and not value:
             raise ValueError("a capture carries something")
+        if (self.kind == "adopted") != (self.adopted_signature_id is not None):
+            raise ValueError("an adopted capture names the saved signature, and only an adopted capture does")
+        if self.kind == "adopted" and (self.image_png_base64 is not None or self.typed_text is not None):
+            raise ValueError("an adopted capture carries no image or text")
         return self
 
 
 class SignBody(_Body):
     intent_confirmed: Literal[True]
     captures: list[CaptureBody] = Field(max_length=200)
+    #: Addendum 1 B: keep the drawn or typed signature just applied, for this signer's next
+    #: session. Refused (422) with no drawn or typed capture, and always from a kiosk session.
+    save_adopted_signature: bool = False
 
     def to_contract(self, settings: Settings) -> list[Capture]:
         """Decode and bound, nothing more. Which field takes which shape is the envelope service's
@@ -208,6 +232,7 @@ class SignBody(_Body):
                     typed_text=item.typed_text,
                     checked=item.checked,
                     text_value=item.text_value,
+                    adopted_signature_id=item.adopted_signature_id,
                 )
             )
         return out
@@ -247,10 +272,16 @@ def _id(value: UUID | None) -> str | None:
 
 
 def envelope_json(view: EnvelopeView) -> dict[str, Any]:
-    """``EnvelopeView`` for the host. Display names are the host's own data, returned to it."""
+    """``EnvelopeView`` for the host. Display names are the host's own data, returned to it.
+
+    Addendum 1 A: ``kind`` says which sort of envelope this is. A ``paper_archive`` has no
+    template, no signing order and no signers, and carries the date on the paper and the moment it
+    was attested instead; an ``electronic`` envelope carries ``null`` for those two.
+    """
     return {
         "id": str(view.id),
         "status": view.status,
+        "kind": view.kind,
         "document_type": view.document_type,
         "template_key": view.template_key,
         "template_version": view.template_version,
@@ -275,6 +306,8 @@ def envelope_json(view: EnvelopeView) -> dict[str, Any]:
         "expires_at": timestamp(view.expires_at),
         "supersedes_envelope_id": _id(view.supersedes_envelope_id),
         "superseded_by_envelope_id": _id(view.superseded_by_envelope_id),
+        "paper_signed_on": None if view.paper_signed_on is None else view.paper_signed_on.isoformat(),
+        "attested_at": timestamp(view.attested_at),
     }
 
 
@@ -288,7 +321,30 @@ def signer_ack_json(view: EnvelopeView, signer_id: UUID) -> dict[str, Any]:
     }
 
 
-def signing_session_json(view: SigningView, consent: ConsentText, session: SessionInfo) -> dict[str, Any]:
+def adopted_signature_json(adopted: AdoptedSignature | None, image_png: bytes | None) -> dict[str, Any] | None:
+    """The signer's own saved signature, for the session payload (Addendum 1 B).
+
+    The image travels as base64 because the UI draws it straight onto the field preview. It is
+    served only to a session with the same ``(host_id, host_user_id)`` -- the caller resolves that
+    pair from the session's rows -- and never on a kiosk session.
+    """
+    if adopted is None:
+        return None
+    return {
+        "id": str(adopted.id),
+        "kind": adopted.kind,
+        "image_png_base64": None if image_png is None else base64.b64encode(image_png).decode("ascii"),
+        "typed_text": adopted.typed_text,
+        "created_at": timestamp(adopted.created_at),
+    }
+
+
+def signing_session_json(
+    view: SigningView,
+    consent: ConsentText,
+    session: SessionInfo,
+    adopted_signature: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "envelope": {
             "id": str(view.envelope_id),
@@ -306,7 +362,11 @@ def signing_session_json(view: SigningView, consent: ConsentText, session: Sessi
             "on_behalf_of_label": view.on_behalf_of_label,
             "status": view.signer.status,
             "requires_reauth": view.signer.requires_reauth,
+            # ``reauth_valid_until`` reflects a borrowed attestation too (SPEC section 14 C), so
+            # ``reauth_scope`` says which: ``session`` for one made here, ``span`` for one made in
+            # an earlier document of the same signing queue, ``null`` when there is none.
             "reauth_valid_until": timestamp(view.reauth_valid_until),
+            "reauth_scope": view.reauth_scope,
         },
         "other_signers": [{"role_label": label, "status": status} for label, status in view.other_signers],
         "fields": [
@@ -326,6 +386,9 @@ def signing_session_json(view: SigningView, consent: ConsentText, session: Sessi
             "expires_at": timestamp(session.expires_at),
             "kiosk": session.kiosk is not None,
         },
+        #: Addendum 1 B: this signer's saved signature, or ``null`` -- including on every kiosk
+        #: session, where one is neither offered nor saved.
+        "adopted_signature": adopted_signature,
         "decline_reasons": [{"code": code, "label": DECLINE_REASON_LABELS[code]} for code in DECLINE_REASON_CODES],
     }
 

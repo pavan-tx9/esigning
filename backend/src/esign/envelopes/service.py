@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Protocol, cast, get_args
 from uuid import UUID
 
 from sqlalchemy import text
@@ -38,6 +38,7 @@ from esign.contracts import (
     VOID_REASON_CODES,
     Actor,
     ActorRole,
+    ArchiveCoverSummary,
     AuditEvent,
     AuditLog,
     BlobService,
@@ -45,6 +46,7 @@ from esign.contracts import (
     Capture,
     CertificateSigner,
     CertificateSummary,
+    ChainReport,
     Conflict,
     DocumentService,
     EnvelopeNotifier,
@@ -60,6 +62,8 @@ from esign.contracts import (
     NewEnvelope,
     NewSigner,
     NotFound,
+    ReauthEvidence,
+    ReauthScope,
     RequestContext,
     Sealer,
     SealUnavailable,
@@ -108,15 +112,36 @@ SessionScope = Callable[[], AbstractContextManager[Session]]
 
 _SEAL_REASON = "Certified complete by the e-signing service"
 
+#: Addendum 1 C. The words ``signer.signed`` may use for a re-authentication's scope, from the
+#: contract rather than a copy: anything else read back out of the trail is treated as absent.
+_REAUTH_SCOPES: Final[tuple[str, ...]] = get_args(ReauthScope)
+
 
 @dataclass(frozen=True)
 class _Loaded:
-    """An envelope and everything a decision needs, read under the row lock."""
+    """An envelope and everything a decision needs, read under the row lock.
+
+    Addendum 1 A: a ``paper_archive`` has no template, so ``template`` is ``None`` and ``roles``
+    is empty. Every use of the template goes through ``_template_of``, which refuses rather than
+    inventing one.
+    """
 
     envelope: repo.EnvelopeRow
     signers: tuple[repo.SignerRow, ...]
     roles: dict[str, SignerRoleDef]
-    template: repo.TemplateVersionRow
+    template: repo.TemplateVersionRow | None
+
+
+class ArchiveCreator(Protocol):
+    """Addendum 1 A: what ``create_archive`` delegates to (``esign.archives``).
+
+    Declared here rather than imported, so the envelopes module keeps depending on
+    ``contracts.py`` and the foundation alone (SPEC section 2). ``esign.runtime`` builds the
+    archives module and injects it, exactly as it injects the other collaborators.
+    """
+
+    def create(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> UUID:
+        """File the scan and return the new envelope's id, in the caller's transaction."""
 
 
 class EnvelopeServiceImpl:
@@ -134,6 +159,7 @@ class EnvelopeServiceImpl:
         sealer: Sealer,
         new_session: SessionScope | None = None,
         notifier: EnvelopeNotifier | None = None,
+        archives: ArchiveCreator | None = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
@@ -144,15 +170,25 @@ class EnvelopeServiceImpl:
         self._sealer = sealer
         self._new_session = new_session
         self._notifier = notifier
+        self._archives = archives
 
     # ----------------------------------------------------------------- creation
 
     def create_archive(
         self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext
     ) -> EnvelopeView:
-        # TODO(addendum-1 A, paper archives): see the contract for everything this must enforce.
-        _ = (db, host, spec, scan, ctx)
-        raise NotImplementedError("Addendum 1 A (paper archives): EnvelopeService.create_archive")
+        """Addendum 1 A: file a scan of a paper-signed document as a ``paper_archive`` envelope.
+
+        The work belongs to ``esign.archives``, which owns everything a paper archive adds:
+        the hygiene check under the scan bounds, the write-once scan as revision 1, the
+        attestation and the two audit events. What comes back is an envelope in
+        ``completed_pending_seal`` with a seal job queued, which every method below -- sealing,
+        the certificate, the webhook, voiding, verification -- already knows how to handle.
+        """
+        if self._archives is None:  # pragma: no cover - runtime always injects it
+            raise Conflict("filing a paper archive is not available here", code="archives_unavailable")
+        envelope_id = self._archives.create(db, host, spec, scan, ctx)
+        return self.get(db, host, envelope_id)
 
     def create(self, db: Session, host: Host, spec: NewEnvelope, ctx: RequestContext) -> EnvelopeView:
         now = self._clock.now()
@@ -316,21 +352,23 @@ class EnvelopeServiceImpl:
         label and status only -- one signer never learns another's name from this service."""
         loaded = self._load(db, session.envelope_id, host=None, lock=False)
         signer = self._signer_of(loaded, session.signer_id)
-        fields = parse_field_defs(loaded.template.fields)
+        template = self._template_of(loaded)
+        fields = parse_field_defs(template.fields)
         current = _require_revision(loaded.envelope.current_revision_sha256)
         fresh = self._identity.fresh_reauth(db, session.id) if signer.requires_reauth else None
         return SigningView(
             envelope_id=loaded.envelope.id,
             envelope_status=loaded.envelope.status,
             document_type=loaded.envelope.document_type,
-            title=loaded.template.template_name,
+            title=template.template_name,
             page_count=self._documents.page_count(self._blobs.get(db, current)),
             expires_at=loaded.envelope.expires_at,
             signer=self._signer_view(loaded, signer),
             on_behalf_of_label=signer.on_behalf_of,
-            reauth_valid_until=(
-                fresh.auth_time + timedelta(seconds=self._settings.reauth_max_age_seconds) if fresh else None
-            ),
+            reauth_valid_until=self._reauth_valid_until(fresh),
+            # Addendum 1 C: the UI skips the hand-off while this is in the future, so it has to be
+            # told whether the attestation behind it belongs to this session or was borrowed.
+            reauth_scope=None if fresh is None else fresh.scope,
             other_signers=tuple(
                 (loaded.roles[s.role_key].label if s.role_key in loaded.roles else s.role_key, s.status)
                 for s in sorted(loaded.signers, key=lambda s: (s.order_index, s.role_key))
@@ -517,7 +555,7 @@ class EnvelopeServiceImpl:
         transition = self._decide(loaded, Command.SIGN, signer.id)
         now = self._clock.now()
 
-        reauth_method = self._require_fresh_reauth(db, signer, session)
+        reauth = self._require_fresh_reauth(db, signer, session)
         presented = repo.session_presented_sha(db, session.id)
         if presented is None:
             raise Conflict("the document has not been served to this session", code="not_presented")
@@ -537,10 +575,14 @@ class EnvelopeServiceImpl:
         if presented != base_sha:
             raise Conflict("this document has changed since it was read", code="not_viewed")
 
-        fields = parse_field_defs(loaded.template.fields)
+        fields = parse_field_defs(self._template_of(loaded).fields)
         mine = tuple(f for f in fields if f.signer_role == signer.role_key)
         by_id = {f.id: f for f in fields}
         accepted = self._check_captures(fields, mine, captures, signer.role_key)
+        # Addendum 1 B: an ``adopted`` capture arrives as an id and nothing else. The image or text
+        # it stands for is read from this signer's own saved signature here, under the envelope
+        # lock, so what gets stamped is never what the client sent.
+        accepted = self._resolve_adopted(db, loaded, signer, session, accepted)
 
         base_pdf = self._blobs.get(db, base_sha)
 
@@ -583,8 +625,18 @@ class EnvelopeServiceImpl:
                 "role_key": signer.role_key,
                 "capacity": signer.capacity,
                 "consent_version": self._consent_version(db, signer),
-                "reauth_used": reauth_method is not None,
-                "reauth_method": reauth_method,
+                "reauth_used": reauth is not None,
+                "reauth_method": None if reauth is None else reauth.method,
+                # Addendum 1 C: *which* attestation this signature rests on, whether it was made
+                # for this session or borrowed from another of the same user's (``span``), and how
+                # old it was at the moment of signing. A borrowed attestation is still per-document
+                # evidence -- the document says which one it borrowed and how stale it was.
+                "reauth_attestation_id": None if reauth is None else reauth.attestation_id,
+                "reauth_scope": None if reauth is None else reauth.scope,
+                "reauth_age_seconds": None if reauth is None else _age_seconds(now, reauth.auth_time),
+                # Addendum 1 B: which saved signature was applied, when one was. The certificate
+                # prints "signed with a saved signature adopted on <date>" from it.
+                "adopted_signature_id": _adopted_signature_id(accepted),
                 # All three hashes, always: what this signer was shown, what they signed on top
                 # of, and what came out. In a parallel envelope another signer may have moved the
                 # document in between, and that has to be visible rather than smoothed over.
@@ -676,7 +728,7 @@ class EnvelopeServiceImpl:
 
     def void(self, db: Session, host: Host, envelope_id: UUID, reason_code: str, ctx: RequestContext) -> EnvelopeView:
         loaded = self._load(db, envelope_id, host=host, lock=True)
-        transition = self._decide(loaded, Command.VOID, None)
+        transition = self._decide_void(loaded)
         if reason_code not in VOID_REASON_CODES:
             raise ValidationFailed("unknown void reason", code="invalid_reason_code")
         now = self._clock.now()
@@ -688,6 +740,12 @@ class EnvelopeServiceImpl:
             voided_at=now,
             void_reason_code=reason_code,
         )
+        if loaded.envelope.kind == "paper_archive":
+            # An archive voided before its seal leaves a queued job for a document that will never
+            # be sealed. ``seal_pending`` refuses it anyway (the envelope is not pending), so
+            # nothing is ever reported complete; cancelling it stops an hourly retry, and an
+            # hourly error line, about a decision that has already been made.
+            repo.cancel_seal_job(db, envelope_id, now)
         self._append(
             db,
             envelope_id,
@@ -759,7 +817,8 @@ class EnvelopeServiceImpl:
 
         certificate = self._documents.build_certificate(summary)
         signed_pdf = self._blobs.get(db, final_revision_sha)
-        final_unsealed = self._documents.finalize(signed_pdf, certificate)
+        body = self._archive_body(envelope, summary, signed_pdf) if envelope.kind == "paper_archive" else signed_pdf
+        final_unsealed = self._documents.finalize(body, certificate)
 
         retain_until = self._settings.retain_until(envelope.document_type, now)
         unsealed = self._blobs.put(db, final_unsealed, kind="final_unsealed_pdf", retain_until=retain_until)
@@ -869,6 +928,30 @@ class EnvelopeServiceImpl:
         self._notify(db, "envelope.sealed", view)
         return view
 
+    def _archive_body(self, envelope: repo.EnvelopeRow, summary: CertificateSummary, scan: bytes) -> bytes:
+        """Cover page, then the scan (Addendum 1 A). The certificate is appended after both.
+
+        The cover goes *inside* the seal and *before* the scan, so the first thing a reader of the
+        sealed PDF sees is what this document is and what the seal does and does not prove. It is
+        built from the same summary the certificate is built from, which was cross-checked against
+        the trail a moment ago: the two pages cannot disagree with each other.
+        """
+        attestation = summary.attestation
+        if attestation is None or envelope.paper_signed_on is None:  # pragma: no cover - CHECKed
+            raise IntegrityFailure("the archive has no attestation", code="incomplete_archive_evidence")
+        cover = self._documents.build_archive_cover(
+            ArchiveCoverSummary(
+                envelope_id=summary.envelope_id,
+                document_type=summary.document_type,
+                paper_signed_on=envelope.paper_signed_on,
+                attestation=attestation,
+                attested_at=summary.completed_at,
+                scan_sha256=summary.presented_sha256,
+                scan_page_count=self._documents.page_count(scan),
+            )
+        )
+        return self._documents.finalize(cover, scan)
+
     def _on_seal_failure(self, envelope_id: UUID, error_code: str) -> None:
         """Record ``seal.failed`` so it survives the rollback of the failed attempt.
 
@@ -952,6 +1035,13 @@ class EnvelopeServiceImpl:
 
         events = self._audit.list(db, "envelope", envelope.id)
 
+        if envelope.kind == "paper_archive":
+            # Addendum 1 A: no signers, no template, and ``archive.created`` / ``archive.attested``
+            # in place of ``envelope.created`` / ``envelope.completed``. Everything else about the
+            # certificate -- the chain check above, the hashes, the head hash, the seal profile --
+            # is the same, because the evidence it rests on is the same.
+            return self._archive_certificate_summary(envelope, events, chain, final_revision_sha)
+
         completed = _last_event(events, EventType.ENVELOPE_COMPLETED)
         if completed is None:
             raise IntegrityFailure("the envelope has no completion event", code="missing_completed_at")
@@ -989,10 +1079,9 @@ class EnvelopeServiceImpl:
             str(envelope.template_version_id),
             created.data.get("template_version_id"),
         )
-        _require_same(envelope.id, None, "template_key", loaded.template.template_key, created.data.get("template_key"))
-        _require_same(
-            envelope.id, None, "template_version", loaded.template.version, created.data.get("template_version")
-        )
+        template = self._template_of(loaded)
+        _require_same(envelope.id, None, "template_key", template.template_key, created.data.get("template_key"))
+        _require_same(envelope.id, None, "template_version", template.version, created.data.get("template_version"))
 
         signers = tuple(
             self._certificate_signer(db, loaded, events, row)
@@ -1001,8 +1090,8 @@ class EnvelopeServiceImpl:
         return CertificateSummary(
             envelope_id=envelope.id,
             document_type=envelope.document_type,
-            template_key=loaded.template.template_key,
-            template_version=loaded.template.version,
+            template_key=template.template_key,
+            template_version=template.version,
             # The configured profile: the certificate is inside the sealed bytes, so it is written
             # before the seal exists. The profile actually achieved is in document.sealed.
             seal_profile=self._settings.seal_profile,
@@ -1013,6 +1102,85 @@ class EnvelopeServiceImpl:
             signers=signers,
             audit_event_count=chain.event_count,
             audit_head_hash=chain.head_hash,
+        )
+
+    def _archive_certificate_summary(
+        self,
+        envelope: repo.EnvelopeRow,
+        events: Sequence[AuditEvent],
+        chain: ChainReport,
+        final_revision_sha: bytes,
+    ) -> CertificateSummary:
+        """The certificate of a paper archive (Addendum 1 A), built from the trail like any other.
+
+        A paper archive has nobody to attribute a signature to in this system, so the certificate
+        prints the attestation instead. That makes the attestation the load-bearing claim on the
+        page, and the ``envelopes.attestation`` column it is printed from is UPDATE-able by the
+        runtime role -- so it is cross-checked against ``archive.attested`` exactly as a signer's
+        row is cross-checked against ``signer.signed``, and a disagreement stops the seal rather
+        than being certified into bytes nobody can correct.
+        """
+        if chain.head_hash is None:  # pragma: no cover - the caller has already refused this
+            raise IntegrityFailure("the envelope has no audit trail", code="missing_audit_trail")
+        scan_sha = _require_revision(envelope.presented_sha256)
+        attestation = envelope.attestation
+        if attestation is None or envelope.attested_at is None:
+            # The schema's ``envelopes_kind_paper`` CHECK makes this unrepresentable.
+            raise IntegrityFailure("the archive has no attestation", code="incomplete_archive_evidence")
+
+        created = _first_event(events, EventType.ARCHIVE_CREATED)
+        attested = _first_event(events, EventType.ARCHIVE_ATTESTED)
+        if created is None or attested is None:
+            raise IntegrityFailure("the archive's trail is incomplete", code="incomplete_archive_evidence")
+        if created.document_sha256 != scan_sha or final_revision_sha != scan_sha:
+            # The scan is revision 1 and the last revision: nothing is ever applied to an archive.
+            raise IntegrityFailure(
+                "the stored scan does not match archive.created", code="certificate_evidence_mismatch"
+            )
+        _require_agreement(envelope.id, None, "envelopes.created_at", envelope.created_at, created.occurred_at)
+        _require_agreement(envelope.id, None, "envelopes.attested_at", envelope.attested_at, attested.occurred_at)
+        _require_same(
+            envelope.id, None, "envelopes.document_type", envelope.document_type, created.data.get("document_type")
+        )
+        _require_same(
+            envelope.id,
+            None,
+            "attestation.staff_user_id",
+            attestation.staff_user_id,
+            attested.data.get("staff_user_id"),
+        )
+        _require_same(envelope.id, None, "attestation.statement", attestation.statement, attested.data.get("statement"))
+        _require_same(
+            envelope.id,
+            None,
+            "attestation.original_disposition",
+            attestation.original_disposition,
+            attested.data.get("original_disposition"),
+        )
+        _require_same(
+            envelope.id,
+            None,
+            "attestation.paper_signers",
+            len(attestation.paper_signers),
+            attested.data.get("paper_signer_count"),
+        )
+        return CertificateSummary(
+            envelope_id=envelope.id,
+            document_type=envelope.document_type,
+            # No template: the host filed a scan, nothing was rendered here.
+            template_key=None,
+            template_version=None,
+            seal_profile=self._settings.seal_profile,
+            presented_sha256=scan_sha,
+            final_revision_sha256=scan_sha,
+            created_at=envelope.created_at,
+            # "Completed" is the moment it was attested: that is when the record was made.
+            completed_at=envelope.attested_at,
+            signers=(),
+            audit_event_count=chain.event_count,
+            audit_head_hash=chain.head_hash,
+            kind="paper_archive",
+            attestation=attestation,
         )
 
     def _certificate_signer(
@@ -1081,6 +1249,13 @@ class EnvelopeServiceImpl:
         )
 
         role = loaded.roles.get(row.role_key)
+        # Addendum 1 B: the saved signature this signature applied, read by id because the row may
+        # since have been replaced or revoked. Nothing ever deletes one, so an id in the trail with
+        # no row behind it is evidence disagreeing with itself, not an absent feature.
+        adopted_id = _opt_uuid(signed.data.get("adopted_signature_id"))
+        adopted_at = None if adopted_id is None else repo.adopted_signature_created_at(db, adopted_id)
+        if adopted_id is not None and adopted_at is None:
+            _mismatch(*mismatch, "adopted_signatures row")
         return CertificateSigner(
             signer_id=row.id,
             # Not in the trail, and cannot be: a display name is PHI and the audit allowlist
@@ -1093,6 +1268,13 @@ class EnvelopeServiceImpl:
             # session: a host can still POST /reauth while the copy-download session is alive, and
             # a role that does not require re-authentication never used one (SPEC section 6).
             reauth_method=_reauth_method(signed, requires_reauth=row.requires_reauth),
+            # Addendum 1 C, from the same event: which attestation covered the signature and when
+            # the person actually proved who they were. The certificate says whether that happened
+            # for this document or in an earlier session of the same signing queue.
+            reauth_scope=_reauth_scope(signed, requires_reauth=row.requires_reauth),
+            reauth_at=_reauth_at(signed, requires_reauth=row.requires_reauth),
+            adopted_signature_id=adopted_id,
+            adopted_at=adopted_at,
             consent_version=consent.version,
             viewed_at=viewed.occurred_at,
             consented_at=consented.occurred_at,
@@ -1192,6 +1374,13 @@ class EnvelopeServiceImpl:
                 if capture.image_png is not None or capture.typed_text is not None:
                     raise ValidationFailed("a click capture carries no payload", code="capture_shape_invalid")
                 return Capture(field_id=field.id, kind="click")
+            if capture.kind == "adopted":
+                # Addendum 1 B: an id, and nothing else. The image or the text comes from the
+                # signer's own saved row in ``_resolve_adopted``; a payload beside the id would be
+                # the client choosing what a saved signature looks like.
+                if capture.image_png is not None or capture.typed_text is not None:
+                    raise ValidationFailed("an adopted capture carries no payload", code="capture_shape_invalid")
+                return Capture(field_id=field.id, kind="adopted", adopted_signature_id=capture.adopted_signature_id)
             raise ValidationFailed("unknown capture kind", code="capture_shape_invalid")
 
         if field.type == "checkbox":
@@ -1261,6 +1450,64 @@ class EnvelopeServiceImpl:
                     typed_text=None,
                     created_at=now,
                 )
+            elif capture.kind == "adopted" and capture.adopted_signature_id is not None:
+                # The ink is in the ``adopted_signatures`` row (and, for a drawn one, in the blob
+                # it names), so the capture row points at it rather than keeping a second copy.
+                # The trail's ``CaptureRef`` still carries the digest of what was stamped.
+                repo.insert_capture(
+                    db,
+                    capture_id=new_id(),
+                    signer_id=signer_id,
+                    field_id=capture.field_id,
+                    kind="adopted",
+                    image_sha256=None,
+                    typed_text=None,
+                    created_at=now,
+                    adopted_signature_id=capture.adopted_signature_id,
+                )
+
+    def _resolve_adopted(
+        self,
+        db: Session,
+        loaded: _Loaded,
+        signer: repo.SignerRow,
+        session: SessionInfo,
+        accepted: tuple[Capture, ...],
+    ) -> tuple[Capture, ...]:
+        """Fill every ``adopted`` capture from the signer's own saved signature (Addendum 1 B).
+
+        The pair the row is looked up by comes from the *rows* -- this envelope's host and this
+        signer's ``host_user_id`` -- never from the request, so one user's session cannot apply
+        another user's saved ink even with its id in hand. A kiosk session may not apply one at
+        all: the tablet is shared, and whoever is holding it is not necessarily the person whose
+        signature is saved.
+        """
+        if not any(capture.kind == "adopted" for capture in accepted):
+            return accepted
+        if session.kiosk is not None:
+            raise Forbidden("a saved signature is not available here", code="adopted_signature_unavailable")
+        saved = self._identity.get_adopted_signature(
+            db, host_id=loaded.envelope.host_id, host_user_id=signer.host_user_id
+        )
+        out: list[Capture] = []
+        for capture in accepted:
+            if capture.kind != "adopted":
+                out.append(capture)
+                continue
+            if saved is None or not saved.is_live or saved.id != capture.adopted_signature_id:
+                # Revoked, replaced, or somebody else's: one refusal, so an id that belongs to
+                # another user is indistinguishable from an id that no longer exists.
+                raise Forbidden("that saved signature is not available", code="adopted_signature_unavailable")
+            out.append(
+                Capture(
+                    field_id=capture.field_id,
+                    kind="adopted",
+                    adopted_signature_id=saved.id,
+                    image_png=None if saved.image_sha256 is None else self._blobs.get(db, saved.image_sha256),
+                    typed_text=saved.typed_text,
+                )
+            )
+        return tuple(out)
 
     # ----------------------------------------------------------------- shared machinery
 
@@ -1323,21 +1570,44 @@ class EnvelopeServiceImpl:
         old = repo.lock_envelope(db, envelope_id)
         if old is None or old.host_id != host.id:
             raise NotFound("no such envelope", code="not_found")
-        decision = decide(EnvelopeState(old.status, old.signing_order, ()), Command.SUPERSEDE)
+        # An envelope of either kind may be superseded, and only the status decides (Addendum 1 A),
+        # so a paper archive's absent signing order stands in as the one that constrains nothing.
+        decision = decide(EnvelopeState(old.status, old.signing_order or "parallel", ()), Command.SUPERSEDE)
         if isinstance(decision, Refusal):
             raise Conflict("only a sealed envelope can be superseded", code=decision.code)
         if repo.superseded_by(db, envelope_id) is not None:
             raise Conflict("that envelope has already been superseded", code="already_superseded")
         return old
 
-    def _require_fresh_reauth(self, db: Session, signer: repo.SignerRow, session: SessionInfo) -> str | None:
-        """``requires_reauth`` was copied from the template role at creation. Never from input."""
+    def _reauth_valid_until(self, fresh: ReauthEvidence | None) -> datetime | None:
+        """How long the UI may go on trusting this attestation (Addendum 1 C).
+
+        An attestation of this session's own is good for ``REAUTH_MAX_AGE_SECONDS`` after its
+        ``auth_time``. A borrowed one is good for that or for the rest of the span, whichever ends
+        first -- the same window ``fresh_reauth`` will apply when the signature actually arrives,
+        so the UI never promises a hand-off-free signature the server would then refuse.
+        """
+        if fresh is None:
+            return None
+        window = self._settings.reauth_max_age_seconds
+        if fresh.scope == "span":
+            window = min(window, self._settings.reauth_span_seconds)
+        return fresh.auth_time + timedelta(seconds=window)
+
+    def _require_fresh_reauth(self, db: Session, signer: repo.SignerRow, session: SessionInfo) -> ReauthEvidence | None:
+        """``requires_reauth`` was copied from the template role at creation. Never from input.
+
+        The whole attestation comes back, not just its method: ``signer.signed`` records which
+        attestation covered this signature and whether it was made in this session or borrowed
+        from another within the span (Addendum 1 C), so the weakening the span allows is visible
+        in the trail rather than inferred from configuration nobody kept.
+        """
         if not signer.requires_reauth:
             return None
         fresh = self._identity.fresh_reauth(db, session.id)
         if fresh is None:
             raise Forbidden("this role must re-authenticate before signing", code="reauth_required")
-        return fresh.method
+        return fresh
 
     def _load(self, db: Session, envelope_id: UUID, *, host: Host | None, lock: bool) -> _Loaded:
         envelope = repo.lock_envelope(db, envelope_id) if lock else repo.load_envelope(db, envelope_id)
@@ -1353,6 +1623,11 @@ class EnvelopeServiceImpl:
         return self._hydrate(db, envelope)
 
     def _hydrate(self, db: Session, envelope: repo.EnvelopeRow) -> _Loaded:
+        if envelope.template_version_id is None:
+            # Addendum 1 A: a paper archive has no template and no signers. The schema's
+            # ``envelopes_kind_template`` CHECK ties the two together, so this is the archive case
+            # and not a missing row.
+            return _Loaded(envelope=envelope, signers=(), roles={}, template=None)
         template = repo.load_template_version(db, envelope.template_version_id)
         if template is None:
             raise IntegrityFailure("the envelope's template version is missing", code="missing_template_version")
@@ -1362,6 +1637,18 @@ class EnvelopeServiceImpl:
             roles={role.key: role for role in parse_signer_roles(template.signer_roles)},
             template=template,
         )
+
+    @staticmethod
+    def _template_of(loaded: _Loaded) -> repo.TemplateVersionRow:
+        """The envelope's template version, or a refusal (Addendum 1 A).
+
+        Only an electronic envelope has one. Nothing can reach these paths for a paper archive --
+        it has no signers, so it has no sessions -- and the honest answer if anything ever does is
+        that this envelope is not signed here, rather than a document built from no template.
+        """
+        if loaded.template is None:
+            raise Conflict("this envelope is not signed here", code="not_an_electronic_envelope")
+        return loaded.template
 
     def _load_for_session(self, db: Session, session: SessionInfo) -> tuple[_Loaded, repo.SignerRow]:
         """Load under the envelope lock, then check the session really belongs to this envelope."""
@@ -1392,7 +1679,9 @@ class EnvelopeServiceImpl:
     def _state(loaded: _Loaded) -> EnvelopeState:
         return EnvelopeState(
             status=loaded.envelope.status,
-            signing_order=loaded.envelope.signing_order,
+            # A paper archive has no signing order and no signers, so the value is never consulted
+            # (``_out_of_order`` looks at other signers, of which there are none).
+            signing_order=loaded.envelope.signing_order or "parallel",
             signers=tuple(
                 SignerState(signer_id=s.id, order_index=s.order_index, status=s.status) for s in loaded.signers
             ),
@@ -1407,6 +1696,23 @@ class EnvelopeServiceImpl:
     def _decide_or_none(self, loaded: _Loaded, command: Command, signer_id: UUID | None) -> Transition | None:
         decision = decide(self._state(loaded), command, signer_id=signer_id)
         return None if isinstance(decision, Refusal) else decision
+
+    def _decide_void(self, loaded: _Loaded) -> Transition:
+        """Whether this envelope may be voided, which depends on its kind (Addendum 1 A).
+
+        An electronic envelope waiting for its seal cannot be: every signer has signed, and the
+        honest states are "sealed" or "still trying" (SPEC section 3). A paper archive in the same
+        state can: nobody signed anything electronically, the scan is still the host's, and the
+        seal has not happened. Once sealed, neither can -- a sealed document is corrected by a new
+        envelope that supersedes it, never by touching the sealed bytes.
+        """
+        if loaded.envelope.kind != "paper_archive":
+            return self._decide(loaded, Command.VOID, None)
+        if loaded.envelope.status in ("created", "completed_pending_seal"):
+            return Transition("voided")
+        decision = decide(self._state(loaded), Command.VOID)
+        code = decision.code if isinstance(decision, Refusal) else "envelope_sealed"
+        raise Conflict("that is not possible in the envelope's current state", code=code)
 
     def _apply_envelope_transition(
         self, db: Session, loaded: _Loaded, transition: Transition, *, now: datetime
@@ -1449,8 +1755,10 @@ class EnvelopeServiceImpl:
             id=envelope.id,
             status=envelope.status,
             document_type=envelope.document_type,
-            template_key=loaded.template.template_key,
-            template_version=loaded.template.version,
+            # Addendum 1 A: a paper archive has no template and no signing order, and says so
+            # rather than pretending to one.
+            template_key=None if loaded.template is None else loaded.template.template_key,
+            template_version=None if loaded.template is None else loaded.template.version,
             signing_order=envelope.signing_order,
             signers=tuple(self._signer_view(loaded, row) for row in loaded.signers),
             presented_sha256=envelope.presented_sha256,
@@ -1461,6 +1769,9 @@ class EnvelopeServiceImpl:
             current_revision_sha256=envelope.current_revision_sha256,
             created_at=envelope.created_at,
             host_id=envelope.host_id,
+            kind=envelope.kind,
+            paper_signed_on=envelope.paper_signed_on,
+            attested_at=envelope.attested_at,
         )
 
     def _notify(self, db: Session, event: WebhookEvent, view: EnvelopeView) -> None:
@@ -1565,6 +1876,16 @@ def _require_opaque(value: str, code: str) -> str:
     return text_value
 
 
+def _adopted_signature_id(accepted: Sequence[Capture]) -> UUID | None:
+    """The saved signature these captures applied, if any (Addendum 1 B).
+
+    One per signature: the UI adopts once and applies it to each field, and ``_resolve_adopted``
+    resolves every ``adopted`` capture through the signer's one live saved row, so two adopted
+    captures in one signature can only name the same id.
+    """
+    return next((c.adopted_signature_id for c in accepted if c.kind == "adopted"), None)
+
+
 def _require_revision(sha: bytes | None) -> bytes:
     if sha is None:
         raise IntegrityFailure("the envelope has no current revision", code="missing_revision")
@@ -1655,6 +1976,44 @@ def _reauth_method(signed: AuditEvent, *, requires_reauth: bool) -> str | None:
     return _opt_str(signed.data.get("reauth_method"))
 
 
+def _reauth_scope(signed: AuditEvent, *, requires_reauth: bool) -> ReauthScope | None:
+    """``session`` or ``span``, as ``signer.signed`` recorded it (Addendum 1 C).
+
+    Anything else is treated as absent rather than printed: the certificate is inside the sealed
+    bytes, and an unrecognised word there would be evidence of nothing.
+    """
+    if not requires_reauth or not signed.data.get("reauth_used"):
+        return None
+    scope = _opt_str(signed.data.get("reauth_scope"))
+    return cast(ReauthScope, scope) if scope in _REAUTH_SCOPES else None
+
+
+def _reauth_at(signed: AuditEvent, *, requires_reauth: bool) -> datetime | None:
+    """When the attestation this signature rests on was made.
+
+    Derived from the trail alone, like every other fact on the certificate: the event records the
+    attestation's age at the moment of signing, so its ``auth_time`` is that many seconds before
+    the signature. The ``reauth_attestations`` row is the cross-check, and verification does it
+    (``reauth_attestations_match_trail``).
+    """
+    if not requires_reauth or not signed.data.get("reauth_used"):
+        return None
+    age = signed.data.get("reauth_age_seconds")
+    if age is None:
+        return None
+    return signed.occurred_at - timedelta(seconds=int(age))
+
+
+def _age_seconds(now: datetime, auth_time: datetime) -> int:
+    """Whole seconds between an attestation and the signature it covers, never negative.
+
+    ``fresh_reauth`` has already refused an ``auth_time`` in the future; the floor is here because
+    the two timestamps are two ``Clock`` reads and the audit allowlist takes a count, not a signed
+    quantity.
+    """
+    return max(0, int((now - auth_time).total_seconds()))
+
+
 def _opt_str(value: Any) -> str | None:
     return None if value is None else str(value)
 
@@ -1698,12 +2057,16 @@ def build_envelope_service(
     sealer: Sealer,
     new_session: SessionScope | None = None,
     notifier: EnvelopeNotifier | None = None,
+    archives: ArchiveCreator | None = None,
 ) -> EnvelopeServiceImpl:
     """The module's one factory (SPEC section 2).
 
     ``new_session`` is how ``seal_pending`` records ``seal.failed`` in a step of its own: the
     failed attempt's transaction has to be rolled back to release its locks, so the event that
     explains the failure cannot be written inside it.
+
+    ``archives`` is the module ``create_archive`` delegates to (Addendum 1 A). Without it every
+    other method behaves exactly as before and filing a scan is refused rather than half-done.
     """
     return EnvelopeServiceImpl(
         settings,
@@ -1715,4 +2078,5 @@ def build_envelope_service(
         sealer=sealer,
         new_session=new_session,
         notifier=notifier,
+        archives=archives,
     )

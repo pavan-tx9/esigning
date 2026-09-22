@@ -1,4 +1,4 @@
-import type { AdoptedSignature } from "@/flow/draft";
+import type { AdoptedSignature, SavedLook } from "@/flow/draft";
 
 interface MarkPreviewProps {
   adopted: AdoptedSignature;
@@ -12,6 +12,7 @@ interface MarkPreviewProps {
 /**
  * How the adopted signature will look in a field. A preview only: the server stamps the real
  * mark (and the caption with name, capacity, time and signer id) when the document is signed.
+ * A saved signature previews as what it is underneath -- the stored drawing or typed name.
  */
 export function MarkPreview({ adopted, kind, initials, displayName, context }: MarkPreviewProps) {
   const ink = context === "page" ? "text-page-ink" : "text-pen";
@@ -34,18 +35,19 @@ export function MarkPreview({ adopted, kind, initials, displayName, context }: M
       </span>
     );
   }
-  if (adopted.kind === "typed") {
+  const look: SavedLook = adopted.kind === "adopted" ? adopted.look : adopted;
+  if (look.kind === "typed") {
     return (
       <span
         className={`truncate px-1 font-script ${ink} ${context === "page" ? "text-xl" : "text-3xl"}`}
       >
-        {adopted.text}
+        {look.text}
       </span>
     );
   }
   return (
     <img
-      src={adopted.dataUrl}
+      src={look.dataUrl}
       alt=""
       className={`${fit} object-contain p-0.5 ${context === "card" ? "dark:invert dark:hue-rotate-180" : ""}`}
     />

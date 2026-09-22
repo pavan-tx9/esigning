@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  type AdoptedSignature,
   actionableFields,
   buildCaptures,
+  buildSignRequest,
   type Draft,
   emptyDraft,
   initialsFrom,
   isFieldComplete,
   remainingRequired,
+  savedLook,
   TEXT_FIELD_MAX,
   withAdopted,
   withValue,
@@ -134,5 +137,99 @@ describe("the signing draft", () => {
     expect(initialsFrom("Maria Alvarez")).toBe("MA");
     expect(initialsFrom("Dr. Priya Raman")).toBe("PR");
     expect(initialsFrom("  anne-marie   o'neil ")).toBe("AO");
+  });
+});
+
+/**
+ * SPEC section 14 B. A saved signature goes over the wire as its id and nothing else -- the
+ * server holds the image or text and the trail must say a *saved* signature was applied -- and
+ * the request to save one is made only when it can possibly be honoured.
+ */
+describe("saved signatures in the draft", () => {
+  const saved = savedLook({
+    id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+    kind: "drawn",
+    image_png_base64: "iVBORw0KGgo=",
+    created_at: "2026-09-16T09:00:00Z",
+  });
+  const adopted: AdoptedSignature = {
+    kind: "adopted",
+    id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+    look: saved,
+  };
+
+  it("turns the payload into something the previews can draw", () => {
+    expect(saved).toEqual({ kind: "drawn", dataUrl: "data:image/png;base64,iVBORw0KGgo=" });
+    expect(
+      savedLook({
+        id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+        kind: "typed",
+        typed_text: "Priya Raman",
+        created_at: "2026-09-16T09:00:00Z",
+      }),
+    ).toEqual({ kind: "typed", text: "Priya Raman" });
+  });
+
+  it("sends an adopted capture as the id alone; initials stay typed", () => {
+    let draft = withAdopted(emptyDraft, adopted, "PR");
+    draft = withValue(draft, "sig", { type: "mark" });
+    draft = withValue(draft, "init", { type: "mark" });
+    expect(buildCaptures(fields, draft)).toEqual([
+      { field_id: "init", kind: "typed", typed_text: "PR" },
+      { field_id: "sig", kind: "adopted", adopted_signature_id: adopted.id },
+    ]);
+    expect(JSON.stringify(buildCaptures(fields, draft))).not.toMatch(/image_png|dataUrl|base64/);
+  });
+
+  it("asks to save only a drawn or typed signature that was actually placed", () => {
+    const placed = (draft: Draft) => withValue(draft, "sig", { type: "mark" });
+    const typed: AdoptedSignature = { kind: "typed", text: "Maria Alvarez" };
+
+    // Off unless asked, and the flag is absent from the body rather than false.
+    const quiet = buildSignRequest(fields, placed(withAdopted(emptyDraft, typed, "MA")), {
+      kiosk: false,
+    });
+    expect(quiet).not.toHaveProperty("save_adopted_signature");
+
+    const asked = buildSignRequest(fields, placed(withAdopted(emptyDraft, typed, "MA", true)), {
+      kiosk: false,
+    });
+    expect(asked.save_adopted_signature).toBe(true);
+    expect(asked.captures).toEqual([
+      { field_id: "sig", kind: "typed", typed_text: "Maria Alvarez" },
+    ]);
+
+    // A printed name and a saved signature are not things to save.
+    for (const notSaveable of [{ kind: "click" } as const, adopted]) {
+      const draft = placed(withAdopted(emptyDraft, notSaveable, "MA", true));
+      expect(draft.save).toBe(false);
+      expect(buildSignRequest(fields, draft, { kiosk: false })).not.toHaveProperty(
+        "save_adopted_signature",
+      );
+    }
+
+    // Nor one that was adopted but never placed in a signature field.
+    let initialsOnly = withAdopted(emptyDraft, typed, "MA", true);
+    initialsOnly = withValue(initialsOnly, "init", { type: "mark" });
+    expect(buildSignRequest(fields, initialsOnly, { kiosk: false })).not.toHaveProperty(
+      "save_adopted_signature",
+    );
+  });
+
+  it("never asks a kiosk to save one, whatever the draft says", () => {
+    let draft = withAdopted(emptyDraft, { kind: "typed", text: "Maria Alvarez" }, "MA", true);
+    draft = withValue(draft, "sig", { type: "mark" });
+    expect(draft.save).toBe(true);
+    const request = buildSignRequest(fields, draft, { kiosk: true });
+    expect(request).not.toHaveProperty("save_adopted_signature");
+    expect(request.captures).toEqual([
+      { field_id: "sig", kind: "typed", typed_text: "Maria Alvarez" },
+    ]);
+  });
+
+  it("choosing a new signature drops the request to save the old one", () => {
+    const draft = withAdopted(emptyDraft, { kind: "typed", text: "Maria" }, "MA", true);
+    expect(withAdopted(draft, adopted, "MA").save).toBe(false);
+    expect(withAdopted(draft, { kind: "drawn", dataUrl: "d", base64: "b" }, "MA").save).toBe(false);
   });
 });

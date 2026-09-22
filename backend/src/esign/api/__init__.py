@@ -39,10 +39,13 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
     app = FastAPI(title="E-signing service", version="1", docs_url=None, redoc_url=None)
     app.state.runtime = rt
 
+    from esign.api.archive_routes import router as archive_router
     from esign.api.host_routes import router as host_router
     from esign.api.signer_routes import router as signer_router
 
     app.include_router(host_router)
+    # Addendum 1 A: ``POST /v1/archives``, the host's other way to create an envelope.
+    app.include_router(archive_router)
     app.include_router(signer_router)
 
     @app.get("/healthz", include_in_schema=False)

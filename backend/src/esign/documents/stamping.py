@@ -380,6 +380,14 @@ def _capture_problems(field: FieldDef, capture: Capture, settings: Settings) -> 
         elif kind == "click":
             if capture.image_png or capture.typed_text:
                 return [f"{what}: a click capture carries no image or text"]
+        elif kind == "adopted":
+            # Addendum 1 B: a saved signature, resolved to its image or its text by the envelope
+            # service before it gets here. Either shape, never both, never neither.
+            text = (capture.typed_text or "").strip()
+            if bool(capture.image_png) == bool(text):
+                return [f"{what}: an adopted capture is the saved image or the saved text"]
+            if len(text) > settings.max_typed_signature_chars:
+                return [f"{what}: typed signature is longer than {settings.max_typed_signature_chars} characters"]
         else:
             return [f"{what}: unknown capture kind"]
         return []
@@ -479,9 +487,11 @@ def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp:
         return
 
     band = _split(field.rect)
-    if capture.kind == "drawn" and capture.image_png:
+    # An ``adopted`` capture (Addendum 1 B) is drawn exactly as the signature it saved: the stored
+    # PNG, or the stored text in the script face. Its kind is recorded, not its appearance.
+    if capture.kind in ("drawn", "adopted") and capture.image_png:
         _draw_image(canvas, band.mark, capture.image_png)
-    elif capture.kind == "typed":
+    elif capture.kind == "typed" or (capture.kind == "adopted" and capture.typed_text):
         text = (capture.typed_text or "").strip()
         _draw_text_block(canvas, band.mark, text, font=SCRIPT_FONT, size=band.mark.h * 0.8, multiline=False)
     else:  # click-to-sign: the signer's name in the plain face, never the script one

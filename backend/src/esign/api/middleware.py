@@ -49,10 +49,18 @@ class BodySizeLimit:
         self._app = app
         self._default = settings.max_request_bytes
         self._templates = settings.max_template_bytes + _TEMPLATE_UPLOAD_SLACK
+        #: Addendum 1 A: a filed scan is bounded by ``MAX_SCAN_BYTES``, not by the request limit
+        #: (SPEC section 9). Image-only pages are large, and the route refuses the part itself as
+        #: well, so this bound only has to leave room for the multipart framing and the JSON body.
+        self._scans = settings.max_scan_bytes + _TEMPLATE_UPLOAD_SLACK
 
     def _limit(self, scope: Scope) -> int:
         path = str(scope.get("path", ""))
-        return self._templates if path.startswith("/v1/templates") else self._default
+        if path.startswith("/v1/templates"):
+            return self._templates
+        if path.startswith("/v1/archives"):
+            return self._scans
+        return self._default
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":

@@ -52,6 +52,7 @@ describe("the session schema is SPEC 9, exactly", () => {
         status: "pending",
         requires_reauth: false,
         reauth_valid_until: null,
+        reauth_scope: null,
       },
       other_signers: [{ role_label: "Witness", status: "pending" }],
       fields: [
@@ -70,9 +71,133 @@ describe("the session schema is SPEC 9, exactly", () => {
         expires_at: "2026-09-21T10:30:00Z",
         kiosk: false,
       },
+      adopted_signature: null,
       decline_reasons: [{ code: "prefers_paper", label: "I would rather sign on paper" }],
     };
     expect(sessionSchema.safeParse(specExample).success).toBe(true);
+  });
+
+  /** SPEC section 14: the saved signature and the re-authentication span, as the payload has them. */
+  it("accepts the addendum's fields in every shape the SPEC allows", () => {
+    const drawn = validSession();
+    Object.assign(drawn, {
+      adopted_signature: {
+        id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+        kind: "drawn",
+        image_png_base64: "iVBORw0KGgo=",
+        created_at: "2026-09-16T09:00:00Z",
+      },
+    });
+    Object.assign(drawn.signer, {
+      reauth_valid_until: "2026-09-22T10:02:00Z",
+      reauth_scope: "span",
+    });
+    const parsed = sessionSchema.parse(drawn);
+    expect(parsed.adopted_signature?.kind).toBe("drawn");
+    expect(parsed.signer.reauth_scope).toBe("span");
+
+    const typed = validSession();
+    Object.assign(typed, {
+      adopted_signature: {
+        id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+        kind: "typed",
+        typed_text: "Priya Raman",
+        created_at: "2026-09-16T09:00:00Z",
+      },
+    });
+    Object.assign(typed.signer, {
+      reauth_valid_until: "2026-09-22T10:02:00Z",
+      reauth_scope: "session",
+    });
+    expect(sessionSchema.safeParse(typed).success).toBe(true);
+
+    // As the service actually serialises it (`api/schemas.py`): both payload keys are always
+    // present and the one that does not apply is null. The unused key is dropped, not refused.
+    const asServed = validSession();
+    Object.assign(asServed, {
+      adopted_signature: {
+        id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+        kind: "typed",
+        image_png_base64: null,
+        typed_text: "Priya Raman",
+        created_at: "2026-09-16T09:00:00.000000Z",
+      },
+    });
+    const served = sessionSchema.parse(asServed);
+    expect(served.adopted_signature).toEqual({
+      id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+      kind: "typed",
+      typed_text: "Priya Raman",
+      created_at: "2026-09-16T09:00:00.000000Z",
+    });
+    Object.assign(asServed, {
+      adopted_signature: {
+        id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+        kind: "drawn",
+        image_png_base64: "iVBORw0KGgo=",
+        typed_text: null,
+        created_at: "2026-09-16T09:00:00.000000Z",
+      },
+    });
+    expect(sessionSchema.parse(asServed).adopted_signature).not.toHaveProperty("typed_text");
+
+    // The mock's own kiosk session: a saved signature exists for the patient and is not offered.
+    setSessionToken(tokenFor("kiosk"));
+    const kiosk = sessionBody(mockDb.authenticate(`Bearer ${tokenFor("kiosk")}`));
+    expect(kiosk.adopted_signature).toBeNull();
+    expect(sessionSchema.safeParse(kiosk).success).toBe(true);
+  });
+
+  it.each([
+    [
+      "a saved signature with no id",
+      (s: ReturnType<typeof validSession>) =>
+        Object.assign(s, {
+          adopted_signature: {
+            kind: "typed",
+            typed_text: "Priya",
+            created_at: "2026-09-16T09:00:00Z",
+          },
+        }),
+    ],
+    [
+      "a drawn saved signature without its image",
+      (s: ReturnType<typeof validSession>) =>
+        Object.assign(s, {
+          adopted_signature: {
+            id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+            kind: "drawn",
+            created_at: "2026-09-16T09:00:00Z",
+          },
+        }),
+    ],
+    [
+      "a saved signature of an unknown kind",
+      (s: ReturnType<typeof validSession>) =>
+        Object.assign(s, {
+          adopted_signature: {
+            id: "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d",
+            kind: "click",
+            created_at: "2026-09-16T09:00:00Z",
+          },
+        }),
+    ],
+    [
+      "a missing adopted_signature",
+      (s: ReturnType<typeof validSession>) => Object.assign(s, { adopted_signature: undefined }),
+    ],
+    [
+      "a re-authentication scope that is not session or span",
+      (s: ReturnType<typeof validSession>) => Object.assign(s.signer, { reauth_scope: "host" }),
+    ],
+    [
+      "a missing re-authentication scope",
+      (s: ReturnType<typeof validSession>) => Object.assign(s.signer, { reauth_scope: undefined }),
+    ],
+  ])("rejects %s", (_, corrupt) => {
+    const body = validSession();
+    corrupt(body);
+    expect(sessionSchema.safeParse(body).success).toBe(false);
   });
 
   it.each([

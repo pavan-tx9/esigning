@@ -12,12 +12,20 @@ import {
   procedureFields,
   procedurePdf,
 } from "@/mocks/documents";
+import { SAVED_SIGNATURE_PNG_BASE64 } from "@/mocks/signature";
 
 export const SCENARIOS = {
   single: "One patient, two pages. Sealing takes a couple of polls, then the copy is ready.",
   multi: "Patient signs first of three. Done screen explains the copy comes later.",
   clinician: "Last signer, needs re-authentication before signing. Then seals.",
-  kiosk: "Clinic tablet. Ends on the hand-back screen and clears everything.",
+  kiosk:
+    "Clinic tablet. Ends on the hand-back screen and clears everything. The patient has a saved signature on file; a kiosk is never offered it.",
+  "saved-signature":
+    "A patient who saved their signature last time. It is offered first, and can be used, replaced or removed.",
+  "span-valid":
+    "Clinician in a signing queue: re-authenticated for an earlier document a moment ago, and the host's span still covers this one.",
+  "span-expired":
+    "Clinician in a signing queue whose earlier re-authentication has run out: the hand-off is needed again.",
   "flaky-sign":
     "The first sign request is processed but the reply is lost. Retry must reuse the key.",
   "sealing-stuck": "Sealing never finishes. The UI must stay honest.",
@@ -118,6 +126,8 @@ export const DECLINE_REASONS = [
 
 const REAUTH_MAX_AGE_MS = 120_000;
 const POLLS_UNTIL_SEALED = 2;
+/** How long ago the earlier document's re-authentication happened in each queue scenario. */
+const SPAN_AUTH_AGE_MS = { "span-valid": 20_000, "span-expired": 10 * 60_000 } as const;
 
 type SignerStatus = "pending" | "viewed" | "consented" | "signed" | "declined";
 type EnvelopeStatus =
@@ -128,12 +138,31 @@ type EnvelopeStatus =
   | "declined"
   | "voided"
   | "expired";
+type ReauthScope = "session" | "span";
+
+/**
+ * A row of `adopted_signatures`: never deleted, revoked with a reason instead. The live one is
+ * the row with no `revokedAt`, and there is at most one.
+ */
+export interface MockSavedSignature {
+  id: string;
+  kind: "drawn" | "typed";
+  imagePngBase64: string | null;
+  typedText: string | null;
+  createdAt: number;
+  revokedAt: number | null;
+  revokeReason: "replaced" | "user" | "host" | null;
+}
 
 export interface MockRecord {
   scenario: Scenario;
   signerStatus: SignerStatus;
   envelopeStatus: EnvelopeStatus;
   reauthValidUntil: number | null;
+  /** Which attestation `reauthValidUntil` rests on: this session's, or a borrowed span one. */
+  reauthScope: ReauthScope | null;
+  /** This person's saved signatures on this host, oldest first. */
+  savedSignatures: MockSavedSignature[];
   copyPolls: number;
   signRequests: { key: string | null; body: string }[];
   revisions: number;
@@ -204,11 +233,31 @@ export const mockDb = {
     let record = records.get(token);
     if (record === undefined) {
       const now = serverNow();
+      const spanAge =
+        scenario === "span-valid" || scenario === "span-expired"
+          ? SPAN_AUTH_AGE_MS[scenario]
+          : null;
       record = {
         scenario,
         signerStatus: "pending",
         envelopeStatus: scenario === "voided" ? "voided" : "in_progress",
-        reauthValidUntil: null,
+        // A queue scenario starts with an attestation made for an *earlier* document of this
+        // clinician's. Whether it still covers this one is decided when the session is read.
+        reauthValidUntil: spanAge === null ? null : now - spanAge + REAUTH_MAX_AGE_MS,
+        reauthScope: spanAge === null ? null : "span",
+        savedSignatures: hasSavedSignature(scenario)
+          ? [
+              {
+                id: SAVED_SIGNATURE_ID,
+                kind: "drawn",
+                imagePngBase64: SAVED_SIGNATURE_PNG_BASE64,
+                typedText: null,
+                createdAt: now - 6 * 86_400_000,
+                revokedAt: null,
+                revokeReason: null,
+              },
+            ]
+          : [],
         copyPolls: 0,
         signRequests: [],
         revisions: 1,
@@ -235,6 +284,15 @@ export const mockDb = {
     const record = records.get(tokenFor(scenario));
     if (record !== undefined) {
       record.reauthValidUntil = serverNow() + REAUTH_MAX_AGE_MS;
+      record.reauthScope = "session";
+    }
+  },
+
+  /** What the host does with `POST /v1/users/{id}/adopted-signature/revoke`. */
+  hostRevokedSignature(scenario: Scenario): void {
+    const record = records.get(tokenFor(scenario));
+    if (record !== undefined) {
+      revokeSavedSignature(record, "host");
     }
   },
 
@@ -263,8 +321,37 @@ export const mockDb = {
 
 // --------------------------------------------------------------------------- shape of each story
 
-const isProcedure = (scenario: Scenario) => scenario === "multi" || scenario === "clinician";
-const roleOf = (scenario: Scenario) => (scenario === "clinician" ? "clinician" : "patient");
+const isClinician = (scenario: Scenario) =>
+  scenario === "clinician" || scenario === "span-valid" || scenario === "span-expired";
+const isProcedure = (scenario: Scenario) => scenario === "multi" || isClinician(scenario);
+const roleOf = (scenario: Scenario) => (isClinician(scenario) ? "clinician" : "patient");
+/** Who has a signature on file from an earlier session. The kiosk patient does too: a shared
+ * tablet must never be offered it, and the only way to prove that is for one to exist. */
+const hasSavedSignature = (scenario: Scenario) =>
+  scenario === "saved-signature" || scenario === "kiosk";
+
+export const SAVED_SIGNATURE_ID = "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d";
+
+export const liveSavedSignature = (record: MockRecord): MockSavedSignature | null =>
+  record.savedSignatures.find((row) => row.revokedAt === null) ?? null;
+
+function revokeSavedSignature(
+  record: MockRecord,
+  reason: NonNullable<MockSavedSignature["revokeReason"]>,
+): MockSavedSignature | null {
+  const live = liveSavedSignature(record);
+  if (live !== null) {
+    live.revokedAt = serverNow();
+    live.revokeReason = reason;
+  }
+  return live;
+}
+
+/** `reauth_valid_until` is only ever a usable attestation: a lapsed one is `null`, not a past time. */
+const usableReauthUntil = (record: MockRecord): number | null =>
+  record.reauthValidUntil !== null && record.reauthValidUntil > serverNow()
+    ? record.reauthValidUntil
+    : null;
 
 export function fieldsFor(record: MockRecord): MockField[] {
   const all = isProcedure(record.scenario) ? procedureFields : hipaaFields;
@@ -285,7 +372,8 @@ export function documentFor(record: MockRecord, sealed = false): Uint8Array {
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export function sessionBody(record: MockRecord) {
-  const clinician = record.scenario === "clinician";
+  const clinician = isClinician(record.scenario);
+  const kiosk = record.scenario === "kiosk";
   const others =
     record.scenario === "multi"
       ? [
@@ -298,6 +386,8 @@ export function sessionBody(record: MockRecord) {
             { role_label: "Witness", status: "signed" },
           ]
         : [];
+  const reauthUntil = usableReauthUntil(record);
+  const saved = kiosk ? null : liveSavedSignature(record);
   return {
     envelope: {
       id: "6f1c1a52-4a0e-4c59-9d7e-0a4d5f6b7c81",
@@ -317,7 +407,8 @@ export function sessionBody(record: MockRecord) {
       on_behalf_of_label: null,
       status: record.signerStatus,
       requires_reauth: clinician,
-      reauth_valid_until: record.reauthValidUntil === null ? null : iso(record.reauthValidUntil),
+      reauth_valid_until: reauthUntil === null ? null : iso(reauthUntil),
+      reauth_scope: reauthUntil === null ? null : record.reauthScope,
     },
     other_signers: others,
     fields: fieldsFor(record).map(({ role: _role, ...field }) => ({
@@ -330,8 +421,25 @@ export function sessionBody(record: MockRecord) {
     session: {
       id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
       expires_at: iso(record.sessionExpiresAt),
-      kiosk: record.scenario === "kiosk",
+      kiosk,
     },
+    // SPEC section 14 B: the signer's own live saved signature, and always null on a kiosk.
+    adopted_signature:
+      saved === null
+        ? null
+        : saved.kind === "drawn"
+          ? {
+              id: saved.id,
+              kind: "drawn" as const,
+              image_png_base64: saved.imagePngBase64 ?? "",
+              created_at: iso(saved.createdAt),
+            }
+          : {
+              id: saved.id,
+              kind: "typed" as const,
+              typed_text: saved.typedText ?? "",
+              created_at: iso(saved.createdAt),
+            },
     decline_reasons: DECLINE_REASONS.map((reason) => ({ ...reason })),
   };
 }
@@ -413,12 +521,16 @@ export function recordDecline(record: MockRecord, reason: unknown): void {
 
 const PNG_MAGIC = "iVBORw0KGgo";
 
-function validateCaptures(record: MockRecord, captures: unknown): void {
+/** The drawn or typed signature-field capture that `save_adopted_signature` would keep. */
+type Saveable = { kind: "drawn"; png: string } | { kind: "typed"; text: string };
+
+function validateCaptures(record: MockRecord, captures: unknown): Saveable | null {
   if (!Array.isArray(captures)) {
     throw invalid("Captures are required.");
   }
   const fields = fieldsFor(record);
   const seen = new Set<string>();
+  let saveable: Saveable | null = null;
   for (const capture of captures as Record<string, unknown>[]) {
     const field = fields.find((candidate) => candidate.id === capture.field_id);
     if (field === undefined || field.type === "date_signed") {
@@ -437,9 +549,29 @@ function validateCaptures(record: MockRecord, captures: unknown): void {
         if (typeof png !== "string" || !png.startsWith(PNG_MAGIC) || png.length < 200) {
           throw invalid("The signature image is not usable.");
         }
+        if (field.type === "signature") {
+          saveable = { kind: "drawn", png };
+        }
       } else if (capture.kind === "typed") {
         if (typeof capture.typed_text !== "string" || capture.typed_text.trim() === "") {
           throw invalid("Typed text is required.");
+        }
+        if (field.type === "signature") {
+          saveable = { kind: "typed", text: capture.typed_text };
+        }
+      } else if (capture.kind === "adopted") {
+        // SPEC section 14 B: the id and nothing else, and it must be this signer's own live saved
+        // signature, never from a kiosk. Anything else is `forbidden`, not a validation error.
+        if ("image_png_base64" in capture || "typed_text" in capture) {
+          throw invalid("An adopted capture carries the saved signature's id and nothing else.");
+        }
+        const live = record.scenario === "kiosk" ? null : liveSavedSignature(record);
+        if (live === null || capture.adopted_signature_id !== live.id) {
+          throw new MockHttpError(
+            403,
+            "adopted_signature_unavailable",
+            "That saved signature is not available to this session.",
+          );
         }
       } else if (capture.kind !== "click") {
         throw invalid("Unknown capture kind.");
@@ -454,13 +586,19 @@ function validateCaptures(record: MockRecord, captures: unknown): void {
       throw invalid("A required field has no capture.");
     }
   }
+  return saveable;
+}
+
+/** `POST /v1/signing/adopted-signature/revoke`: the signer removes their own saved signature. */
+export function recordRevokeSaved(record: MockRecord): void {
+  revokeSavedSignature(record, "user");
 }
 
 /** Returns "replayed" when the key was seen before with the same body: the first answer stands. */
 export function recordSign(
   record: MockRecord,
   key: string | null,
-  body: { intent_confirmed?: unknown; captures?: unknown },
+  body: { intent_confirmed?: unknown; captures?: unknown; save_adopted_signature?: unknown },
 ): "signed" | "replayed" {
   const serialised = JSON.stringify(body);
   record.signRequests.push({ key, body: serialised });
@@ -503,17 +641,44 @@ export function recordSign(
   if (body.intent_confirmed !== true) {
     throw invalid("Intent must be confirmed.");
   }
-  if (
-    record.scenario === "clinician" &&
-    (record.reauthValidUntil === null || record.reauthValidUntil < serverNow())
-  ) {
+  if (isClinician(record.scenario) && usableReauthUntil(record) === null) {
     throw new MockHttpError(403, "forbidden", "Re-authentication is required.");
   }
-  validateCaptures(record, body.captures);
+  const saveable = validateCaptures(record, body.captures);
+  // SPEC section 14 B: everything about saving is checked before anything is signed, because the
+  // real service does both in one transaction and a refused save is a refused signature.
+  const save = body.save_adopted_signature;
+  if (save !== undefined && save !== true && save !== false) {
+    throw invalid("save_adopted_signature must be a boolean.");
+  }
+  if (save === true) {
+    if (record.scenario === "kiosk") {
+      throw new MockHttpError(
+        403,
+        "adoption_not_allowed",
+        "A signature cannot be saved from a shared tablet.",
+      );
+    }
+    if (saveable === null) {
+      throw invalid("There is no drawn or typed signature to save.");
+    }
+  }
   record.signerStatus = "signed";
   record.revisions += 1;
   if (record.scenario !== "multi") {
     record.envelopeStatus = "completed_pending_seal";
+  }
+  if (save === true && saveable !== null) {
+    revokeSavedSignature(record, "replaced");
+    record.savedSignatures.push({
+      id: crypto.randomUUID(),
+      kind: saveable.kind,
+      imagePngBase64: saveable.kind === "drawn" ? saveable.png : null,
+      typedText: saveable.kind === "typed" ? saveable.text : null,
+      createdAt: serverNow(),
+      revokedAt: null,
+      revokeReason: null,
+    });
   }
   return "signed";
 }

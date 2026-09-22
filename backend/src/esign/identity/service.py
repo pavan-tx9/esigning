@@ -42,6 +42,7 @@ from esign.contracts import (
     KioskContext,
     NotFound,
     ReauthEvidence,
+    ReauthScope,
     RequestContext,
     SessionInfo,
     Unauthorized,
@@ -49,6 +50,9 @@ from esign.contracts import (
     is_opaque_id,
 )
 from esign.db import advisory_xact_lock
+from esign.identity.adopted import adopt_signature as _adopt_signature
+from esign.identity.adopted import live_adopted_signature
+from esign.identity.adopted import revoke_adopted_signature as _revoke_adopted_signature
 from esign.identity.client_ip import client_ip, parse_trusted_proxies
 from esign.identity.consent_texts import normalise_locale, row_to_consent_text
 from esign.identity.hosts import authenticate_host as _authenticate_host
@@ -84,6 +88,50 @@ _SESSION_COLUMNS: Final = (
     "s.envelope_id AS envelope_id, s.host_user_id AS host_user_id, e.host_id AS host_id"
 )
 _SESSION_JOINS: Final = "JOIN signers s ON s.id = ss.signer_id JOIN envelopes e ON e.id = s.envelope_id"
+
+#: What ``fresh_reauth`` reads, and the filters that hold in *every* scope (Addendum 1 C): the
+#: attestation is not in the future, is no older than ``REAUTH_MAX_AGE_SECONDS`` (``:cutoff``),
+#: does not predate the session it was made for, that session is still live, and its method is one
+#: we recognise. All of it is re-checked here rather than trusted from write time, because
+#: ``reauth_attestations`` is append-only: a row written by an older or buggier path can never be
+#: corrected, only ignored. ``ras`` is the session the attestation was *made for*.
+_ATTESTATION_COLUMNS: Final = "ra.id AS id, ra.method AS method, ra.auth_time AS auth_time"
+_ATTESTATION_USABLE: Final = (
+    "ras.revoked_at IS NULL AND ras.expires_at > :now "
+    "AND ra.auth_time >= ras.created_at "
+    "AND ra.auth_time <= :now "
+    "AND ra.auth_time >= :cutoff "
+    "AND ra.method = ANY(CAST(:methods AS text[]))"
+)
+_ATTESTATION_ORDER: Final = "ORDER BY ra.auth_time DESC, ra.attested_at DESC LIMIT 1"
+
+#: Scope ``session``: an attestation made for the session asking. This is the whole of
+#: ``fresh_reauth`` when the span is off, which is the default.
+_OWN_ATTESTATION_SQL: Final = (
+    f"SELECT {_ATTESTATION_COLUMNS} FROM reauth_attestations ra "  # noqa: S608 - fixed fragments only
+    "JOIN signing_sessions ras ON ras.id = ra.session_id "
+    f"WHERE ra.session_id = :id AND {_ATTESTATION_USABLE} {_ATTESTATION_ORDER}"
+)
+
+#: Scope ``span``: an attestation made for *another* live session of the same user on the same
+#: host. The pair is read from the asking session's own signer and envelope rows, so a different
+#: user or a different host can never match however the caller asks; a row from before ``0700``
+#: has no pair at all and is never borrowed. The session asking must itself be live: a span is a
+#: shortcut through the hand-off, never a way around an expired or revoked session.
+_SPAN_ATTESTATION_SQL: Final = (
+    f"SELECT {_ATTESTATION_COLUMNS} FROM reauth_attestations ra "  # noqa: S608 - fixed fragments only
+    "JOIN signing_sessions ras ON ras.id = ra.session_id "
+    "JOIN signing_sessions asking ON asking.id = :id "
+    "JOIN signers s ON s.id = asking.signer_id "
+    "JOIN envelopes e ON e.id = s.envelope_id "
+    "WHERE ra.session_id <> :id "
+    "  AND ra.host_id IS NOT NULL "
+    "  AND ra.host_id = e.host_id "
+    "  AND ra.host_user_id = s.host_user_id "
+    "  AND asking.revoked_at IS NULL "
+    "  AND asking.expires_at > :now "
+    f"  AND {_ATTESTATION_USABLE} {_ATTESTATION_ORDER}"
+)
 
 
 def _log() -> Any:
@@ -293,12 +341,15 @@ class SqlIdentityService:
             raise Conflict("session is not live", code="session_not_live")
         if checked.auth_time < req_time(row, "created_at"):
             raise ValidationFailed("re-authentication predates the session", code="reauth_predates_session")
-        # TODO(addendum-1 C, re-authentication span): also write host_id and host_user_id (both on
-        # ``row``) so the attestation can be found by user; 0700 leaves rows without them unborrowable.
+        # Whose attestation this is, copied from the session's signer and envelope rows and never
+        # from the request (Addendum 1 C). It is what lets ``fresh_reauth`` find an attestation by
+        # user within the span; ``0700`` leaves the rows written before it without the pair, and
+        # those are never borrowed.
         db.execute(
             text(
-                "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at) "
-                "VALUES (:id, :session_id, :method, :auth_time, :attested_at)"
+                "INSERT INTO reauth_attestations "
+                "(id, session_id, method, auth_time, attested_at, host_id, host_user_id) "
+                "VALUES (:id, :session_id, :method, :auth_time, :attested_at, :host_id, :host_user_id)"
             ),
             {
                 "id": new_id(),
@@ -306,40 +357,51 @@ class SqlIdentityService:
                 "method": checked.method,
                 "auth_time": checked.auth_time,
                 "attested_at": now,
+                "host_id": req_uuid(row, "host_id"),
+                "host_user_id": req_str(row, "host_user_id"),
             },
         )
         _log().info("identity.reauth_attested", session_id=session_id, reauth_method=checked.method)
         return _row_to_session_info(row)
 
     def fresh_reauth(self, db: Session, session_id: UUID) -> ReauthEvidence | None:
-        """The most recent usable attestation for this session, or ``None``.
+        """The attestation that covers a signature in this session right now, or ``None``.
 
-        The filters are repeated here rather than trusted from write time: ``reauth_attestations``
-        is append-only, so a row written by an older or buggier path can never be corrected, only
-        ignored. A session that has expired or been revoked has no fresh re-authentication either,
-        whatever is stored against it.
+        This session's own attestation first (``scope="session"``). Only when there is none, and
+        only when ``REAUTH_SPAN_SECONDS`` is above zero, the most recent one for the same
+        ``(host_id, host_user_id)`` on another of that user's live sessions on the same host
+        (``scope="span"``) -- the signing queue of Addendum 1 C. With the span off, which is the
+        default, the answer is exactly what it was before the addendum.
 
-        TODO(addendum-1 C, re-authentication span): when ``reauth_span_seconds`` is greater than
-        zero and this session has no attestation of its own, resolve the most recent one for the
-        same ``(host_id, host_user_id)`` within the span and return it with ``scope="span"``
-        (contract: ``IdentityService.fresh_reauth``). Today every answer is ``scope="session"``.
+        The span never reaches further back than ``REAUTH_MAX_AGE_SECONDS``: an attestation older
+        than that covers nothing, span or no span. What the span weakens is *which document* an
+        attestation covers, never *how old* it may be.
         """
         now = self._now()
-        cutoff = now - timedelta(seconds=self._settings.reauth_max_age_seconds)
+        max_age_cutoff = now - timedelta(seconds=self._settings.reauth_max_age_seconds)
+        own = self._attestation(db, _OWN_ATTESTATION_SQL, session_id, now=now, cutoff=max_age_cutoff)
+        if own is not None:
+            return own
+        span_seconds = self._settings.reauth_span_seconds
+        if span_seconds <= 0:
+            # One attestation, one document. Nothing is borrowed unless a host has opted in.
+            return None
+        cutoff = max(max_age_cutoff, now - timedelta(seconds=span_seconds))
+        return self._attestation(db, _SPAN_ATTESTATION_SQL, session_id, now=now, cutoff=cutoff, scope="span")
+
+    def _attestation(
+        self,
+        db: Session,
+        sql: str,
+        session_id: UUID,
+        *,
+        now: datetime,
+        cutoff: datetime,
+        scope: ReauthScope = "session",
+    ) -> ReauthEvidence | None:
         row = (
             db.execute(
-                text(
-                    "SELECT ra.id AS id, ra.method AS method, ra.auth_time AS auth_time "
-                    "FROM reauth_attestations ra JOIN signing_sessions ss ON ss.id = ra.session_id "
-                    "WHERE ra.session_id = :id "
-                    "  AND ss.revoked_at IS NULL "
-                    "  AND ss.expires_at > :now "
-                    "  AND ra.auth_time >= ss.created_at "
-                    "  AND ra.auth_time <= :now "
-                    "  AND ra.auth_time >= :cutoff "
-                    "  AND ra.method = ANY(CAST(:methods AS text[])) "
-                    "ORDER BY ra.auth_time DESC, ra.attested_at DESC LIMIT 1"
-                ),
+                text(sql),
                 {"id": session_id, "now": now, "cutoff": cutoff, "methods": sorted(AUTH_METHODS)},
             )
             .mappings()
@@ -348,21 +410,25 @@ class SqlIdentityService:
         if row is None:
             return None
         method = req_str(row, "method")
-        if method not in AUTH_METHODS:
+        if method not in AUTH_METHODS:  # pragma: no cover - the query filters on the same set
             return None
         return ReauthEvidence(
             attestation_id=req_uuid(row, "id"),
             method=cast(AuthMethod, method),
             auth_time=req_time(row, "auth_time"),
-            scope="session",
+            scope=scope,
         )
 
     # ----------------------------------------------------------------- adopted signatures
 
     def get_adopted_signature(self, db: Session, *, host_id: UUID, host_user_id: str) -> AdoptedSignature | None:
-        # TODO(addendum-1 B, adopted signatures): the live row for (host_id, host_user_id).
-        _ = (db, host_id, host_user_id)
-        raise NotImplementedError("Addendum 1 B (adopted signatures): IdentityService.get_adopted_signature")
+        """The user's one live saved signature, or ``None`` (Addendum 1 B).
+
+        A pure lookup: asking about the right user is the caller's job, and every caller resolves
+        the pair from rows -- the session for a signer, the path plus the authenticated host for a
+        host -- never from a request body.
+        """
+        return live_adopted_signature(db, host_id=host_id, host_user_id=host_user_id)
 
     def adopt_signature(
         self,
@@ -373,16 +439,40 @@ class SqlIdentityService:
         image_sha256: bytes | None = None,
         typed_text: str | None = None,
     ) -> AdoptedSignature:
-        # TODO(addendum-1 B, adopted signatures): see the contract for everything this must enforce.
-        _ = (db, session_id, kind, image_sha256, typed_text)
-        raise NotImplementedError("Addendum 1 B (adopted signatures): IdentityService.adopt_signature")
+        """Save the signature adopted in this session, for the session's own signer.
+
+        Everything it enforces -- live non-kiosk session, the signer has signed, the payload
+        matches the kind, one live row per user -- is in :mod:`esign.identity.adopted`.
+        """
+        adopted = _adopt_signature(
+            db,
+            session_id,
+            kind=kind,
+            image_sha256=image_sha256,
+            typed_text=typed_text,
+            now=self._now(),
+            max_typed_chars=self._settings.max_typed_signature_chars,
+        )
+        # The saved signature's id belongs in the audit trail, which the API layer writes; a log
+        # line says only that this session saved one, and of which kind.
+        _log().info(
+            "identity.signature_adopted",
+            session_id=session_id,
+            envelope_id=adopted.created_in_envelope_id,
+            capture_kind=adopted.kind,
+        )
+        return adopted
 
     def revoke_adopted_signature(
         self, db: Session, *, host_id: UUID, host_user_id: str, reason: AdoptedRevokeReason
     ) -> AdoptedSignature | None:
-        # TODO(addendum-1 B, adopted signatures): revoke the live row once; None when there is none.
-        _ = (db, host_id, host_user_id, reason)
-        raise NotImplementedError("Addendum 1 B (adopted signatures): IdentityService.revoke_adopted_signature")
+        """Revoke the user's live saved signature, once. ``None`` when there was none."""
+        revoked = _revoke_adopted_signature(
+            db, host_id=host_id, host_user_id=host_user_id, reason=reason, now=self._now()
+        )
+        if revoked is not None:
+            _log().info("identity.signature_adoption_revoked", host_id=host_id, reason_code=reason)
+        return revoked
 
     # ----------------------------------------------------------------- consent
 
