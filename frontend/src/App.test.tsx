@@ -7,6 +7,7 @@ import { hasSessionToken, setSessionToken } from "@/lib/api";
 import { ParentChannel } from "@/lib/embed";
 import {
   liveSavedSignature,
+  type MockRecord,
   mockDb,
   SAVED_SIGNATURE_ID,
   type Scenario,
@@ -653,6 +654,33 @@ describe("a saved signature", () => {
     expect(live?.typedText).toBe("Maria Alvarez");
     expect(live?.id).not.toBe(SAVED_SIGNATURE_ID);
     expect(record?.savedSignatures[0]?.revokeReason).toBe("replaced");
+  }, 25_000);
+
+  it("is offered to a first-time signer too: the box is there, unticked, and kept when ticked", async () => {
+    // Nothing saved yet ("single"): drawing or typing a signature still offers to keep it. The
+    // checkbox was only ever shown beside an existing saved signature before, so a clinician
+    // could never save their first one.
+    await start("single");
+    await throughConsent();
+    expect(screen.getByRole("radio", { name: /^Draw it/ })).toBeChecked();
+    expect(screen.getByTestId("save-signature")).toBeInTheDocument();
+    await user.click(screen.getByRole("radio", { name: /Use my printed name/ }));
+    expect(screen.queryByTestId("save-signature")).toBeNull();
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+    const keep = screen.getByRole("checkbox", { name: /Save this signature for next time/ });
+    expect(keep).not.toBeChecked();
+    expect(screen.getByTestId("save-signature")).not.toHaveTextContent(
+      "replaces the one you saved",
+    );
+    await user.click(keep);
+    await click("Use this signature");
+    await placeAndSign();
+    await screen.findByTestId("step-done");
+    expect(sent("single").save_adopted_signature).toBe(true);
+    expect(liveSavedSignature(mockDb.peek("single") as MockRecord)?.typedText).toBe(
+      "Maria Alvarez",
+    );
   }, 25_000);
 
   it("can be removed, after a second look, and then the plain choices remain", async () => {

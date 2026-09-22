@@ -104,7 +104,9 @@ export function AdoptSignature({
   });
 
   const usingSaved = saved !== null && route === "saved";
-  const canSave = !kiosk && route !== "saved" && (method === "drawn" || method === "typed");
+  // Offered whenever a signature is being *made* here by drawing or typing -- a first-time signer
+  // as much as one replacing what they saved -- and never on a shared tablet.
+  const canSave = !kiosk && !usingSaved && (method === "drawn" || method === "typed");
 
   const choose = (next: Method) => {
     setMethod(next);
