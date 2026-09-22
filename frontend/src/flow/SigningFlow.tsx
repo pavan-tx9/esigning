@@ -10,7 +10,7 @@ import {
 } from "react";
 import { Button, Notice, useAnnounce } from "@/components/ui";
 import { type HostLink, HostLinkContext, useNow } from "@/flow/context";
-import { type Draft, emptyDraft } from "@/flow/draft";
+import { type Draft, emptyDraft, withoutAdopted } from "@/flow/draft";
 import { flowReducer, initialFlowState, STEPS, type Step } from "@/flow/machine";
 import { ConfirmStep } from "@/flow/steps/ConfirmStep";
 import { ConsentStep } from "@/flow/steps/ConsentStep";
@@ -67,6 +67,13 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
    * `placeFor` would ever send them back to the review step; this does, and says why.
    */
   const [readAgain, setReadAgain] = useState(false);
+  /**
+   * Set when the server refused a signature because the saved signature applied to it is no
+   * longer available (403 `adopted_signature_unavailable`): revoked by the host, or replaced from
+   * another session of this person's. Nothing about the signer has changed, so only this sends
+   * them back to choosing a signature, and it is what tells that step to say why.
+   */
+  const [signatureGone, setSignatureGone] = useState(false);
   const [submissionKeys] = useState(() => new SubmissionKeys());
   const reauthListeners = useRef(new Set<() => void>());
   const shell = useRef<HTMLDivElement>(null);
@@ -90,6 +97,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
     queryClient.clear();
     setDraft(emptyDraft);
     setReadAgain(false);
+    setSignatureGone(false);
     submissionKeys.reset();
   }, [queryClient, submissionKeys]);
 
@@ -256,8 +264,12 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
         <SignStep
           session={session}
           draft={draft}
+          signatureGone={signatureGone}
           onDraft={setDraft}
-          onContinue={() => go("confirm")}
+          onContinue={() => {
+            setSignatureGone(false);
+            go("confirm");
+          }}
         />
       ),
       confirm: (
@@ -271,6 +283,14 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
             setReadAgain(true);
             announce("The document has changed. Please read it again before you sign.");
             go("review");
+          }}
+          onSignatureUnavailable={() => {
+            // The signature they chose is gone, so the marks made with it go too; everything
+            // else they filled in stays. Nothing has been signed.
+            setDraft((current) => withoutAdopted(current));
+            setSignatureGone(true);
+            announce("Your saved signature is no longer available. Please choose a signature.");
+            go("sign");
           }}
           onSigned={() => {
             channel.post({ type: "esign:signed" });

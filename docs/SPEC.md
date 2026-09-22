@@ -185,6 +185,10 @@ to the kind). Its pipeline is steps 1, 7, 8 and 9 with the scan in place of the 
    original, the scan's SHA-256, the envelope id, and what the seal does and does not prove),
    places it *before* the scan, appends the archive variant of the certificate (the attestation in
    place of the signer table) and seals the whole thing exactly as for an electronic envelope.
+   The cover is one page and never overflows it: a filing with more paper signers than the page
+   holds prints as many as fit and then "and N more, listed on the certificate of completion",
+   which paginates and names every one of them. Nothing else on the cover gives way -- who
+   attested, the scan's digest and the sentence about what the seal proves are reserved first.
 
 ```
 created -> completed_pending_seal -> sealed
@@ -373,7 +377,7 @@ Requests outside the scope of section 1 (`POST /v1/envelopes/bulk`, `.../email-l
 | `GET /v1/signing/document` | current revision PDF; records `document.presented` |
 | `POST /v1/signing/viewed` | `{pages_viewed: int}` must equal the page count |
 | `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?}` (`locale` as shown in the session payload; default locale when omitted) |
-| `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...], save_adopted_signature?: bool}` + `Idempotency-Key`. `save_adopted_signature: true` (section 14 B) saves the drawn or typed signature just applied, after the signature succeeds and in the same transaction; refused (422) with no drawn or typed capture, and always from a kiosk session |
+| `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...], save_adopted_signature?: bool}` + `Idempotency-Key`. `save_adopted_signature: true` (section 14 B) saves the drawn or typed signature just applied, after the signature succeeds and in the same transaction; what is saved is the first such capture landing on a **signature** field, never an initials one (initials are the signer's own typed text and a template may ask for them first); refused (422 `no_signature_to_save`) when the request has no such capture, and always (403) from a kiosk session |
 | `POST /v1/signing/adopted-signature/revoke` | section 14 B: the signer removes their own saved signature (`reason: user`). No body. 200 `{"revoked": bool}` whether or not there was one |
 | `POST /v1/signing/decline` | `{reason_code}` from a fixed list including `prefers_paper` |
 | `GET /v1/signing/copy` | sealed PDF (records `document.downloaded`), or 202 `{status: "sealing"}` while the seal is pending, or 409 `envelope_not_complete` while other signers are outstanding |

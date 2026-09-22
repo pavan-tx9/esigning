@@ -17,6 +17,7 @@ session's rows, a host's from the path plus the key it authenticated with.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
@@ -29,11 +30,14 @@ from esign.contracts import (
     AdoptedSignatureKind,
     Capture,
     EventType,
+    FieldType,
     Forbidden,
     RequestContext,
     SessionInfo,
     ValidationFailed,
 )
+from esign.db import advisory_xact_lock
+from esign.ids import advisory_lock_key
 from esign.runtime import Runtime
 
 __all__ = ["adoption_source", "revoke_and_record", "save_adopted_signature", "signer_actor"]
@@ -44,15 +48,23 @@ def signer_actor(session: SessionInfo, capacity: str | None = None) -> Actor:
     return Actor(user_id=session.host_user_id, capacity=capacity)  # type: ignore[arg-type]  # Capacity literal
 
 
-def adoption_source(captures: list[Capture]) -> Capture:
+def adoption_source(captures: list[Capture], field_types: Mapping[str, FieldType]) -> Capture:
     """The capture whose signature ``save_adopted_signature: true`` saves.
 
-    The UI adopts one signature per session and applies it to each field, so the first drawn or
-    typed capture *is* the signature that was adopted. An ``adopted`` capture is not one: it is
+    A saved signature is offered back for *signature* fields, so only a capture landing on one is a
+    candidate. The UI builds its captures in reading order and fills an initials field with the
+    signer's initials, which on a template that asks for initials before the signature (page 2 of
+    ``procedure_consent``, say) is the first drawn-or-typed capture in the request -- and saving
+    that would keep "MO" as the signature the next session offers and stamps.
+
+    Past that, the UI adopts one signature per session and applies it to every field, so the first
+    such capture *is* the signature that was adopted. An ``adopted`` capture is not one: it is
     already saved, and saving it again would revoke the row it was read from and replace it with
     a copy of itself.
     """
-    source = next((c for c in captures if c.kind in ("drawn", "typed")), None)
+    source = next(
+        (c for c in captures if c.kind in ("drawn", "typed") and field_types.get(c.field_id) == "signature"), None
+    )
     if source is None:
         raise ValidationFailed("there is no drawn or typed signature to save", code="no_signature_to_save")
     return source
@@ -80,6 +92,14 @@ def save_adopted_signature(
         # moment ago, so the saved signature is tied to the hash chain, never to the client's bytes.
         image_sha256 = _applied_image_sha256(rt, db, session, source.field_id)
 
+    # The row named in ``signature.adoption_revoked`` has to be the row that was actually revoked.
+    # ``adopt_signature`` takes this same per-user lock before replacing whatever is live, but it
+    # takes it *after* this read: without the lock here, two signatures by the same user (a
+    # clinician working a queue from two tabs) interleave as "T1 reads A, T2 replaces A with B,
+    # T1 replaces B" -- and T1 would then record A as revoked a second time while B, the row that
+    # really stopped being offered, is never named on an append-only stream that cannot be
+    # corrected. Taking it before the read serialises the pair.
+    advisory_xact_lock(db, advisory_lock_key("identity.adopted", f"{session.host_id}:{session.host_user_id}"))
     replaced = rt.identity.get_adopted_signature(db, host_id=session.host_id, host_user_id=session.host_user_id)
     adopted = rt.identity.adopt_signature(
         db, session.id, kind=kind, image_sha256=image_sha256, typed_text=source.typed_text

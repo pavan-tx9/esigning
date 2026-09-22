@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ApiError, ApiNetworkError, ApiValidationError, setSessionToken } from "@/lib/api";
 import {
   copyPollDelay,
+  isReauthLapsed,
+  isSignatureUnavailable,
   postConsent,
   postSign,
   type SignRequest,
@@ -402,6 +404,31 @@ describe("idempotent signing", () => {
     const failure = await postSign(different, "fixed-key").catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(ApiError);
     expect((failure as ApiError).code).toBe("conflict");
+  });
+});
+
+/**
+ * `POST /v1/signing/sign` refuses a lapsed re-authentication and an unusable saved signature with
+ * the same 403 (`api/errors.py`), and they want opposite things from the signer: one more
+ * hand-off to the host, or a different signature. Reading the status alone left a clinician whose
+ * saved signature had been revoked pressing "Confirm again" for ever, so each is told by its code.
+ */
+describe("telling the two 403s on the sign route apart", () => {
+  it("is the code that decides, never the status", () => {
+    expect(isReauthLapsed(new ApiError(403, "reauth_required", ""))).toBe(true);
+    expect(isReauthLapsed(new ApiError(403, "adopted_signature_unavailable", ""))).toBe(false);
+    expect(isReauthLapsed(new ApiError(403, "adoption_not_allowed", ""))).toBe(false);
+    expect(isSignatureUnavailable(new ApiError(403, "adopted_signature_unavailable", ""))).toBe(
+      true,
+    );
+    expect(isSignatureUnavailable(new ApiError(403, "reauth_required", ""))).toBe(false);
+    // And neither is anything but a 403 from the server.
+    expect(isReauthLapsed(new ApiError(401, "reauth_required", ""))).toBe(false);
+    expect(isSignatureUnavailable(new ApiError(409, "adopted_signature_unavailable", ""))).toBe(
+      false,
+    );
+    expect(isReauthLapsed(new ApiNetworkError())).toBe(false);
+    expect(isSignatureUnavailable(new ApiNetworkError())).toBe(false);
   });
 });
 

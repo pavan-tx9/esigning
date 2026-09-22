@@ -21,6 +21,7 @@ from esign.config import Settings
 from esign.contracts import ArchiveCoverSummary, Attestation, DocumentService, PaperSigner, ValidationFailed
 from esign.documents import build_document_service
 from tests.archives.conftest import scan_pdf
+from tests.documents.helpers import placed_text
 
 ENVELOPE_ID = UUID("6f1c7bd6-1f5a-4a6c-9f4f-9f0d9f7b1a55")
 ATTESTED_AT = datetime(2026, 3, 17, 14, 30, tzinfo=UTC)
@@ -113,6 +114,73 @@ def test_a_long_name_does_not_break_the_page(documents: DocumentService) -> None
     )
     assert len(PdfReader(io.BytesIO(pdf)).pages) == 1
     assert "destroyed under the practice's retention policy" in _text(pdf)
+
+
+#: What ``archives.service`` lets through: twenty paper signers, each named up to 200 characters.
+#: The cover has to survive the worst filing the API will accept, not the typical one.
+MAX_PAPER_SIGNERS = 20
+MAX_NAME_CHARS = 200
+
+#: Where the footer sits. Anything drawn below it is outside the page a reader ever sees.
+PAGE_FLOOR = 54.0 - 18.0
+
+
+def crowded_name(seed: str) -> str:
+    return (f"{seed} " + "Featherstonehaugh-Ngata " * 20)[:MAX_NAME_CHARS].strip()
+
+
+def crowded_cover() -> ArchiveCoverSummary:
+    return summary(
+        attestation=replace(
+            ATTESTATION,
+            staff_display_name=crowded_name("Bernadette"),
+            original_disposition="destroyed_per_policy",
+            paper_signers=tuple(
+                PaperSigner(display_name=crowded_name(f"Signatory {index}"), capacity="witness")
+                for index in range(MAX_PAPER_SIGNERS)
+            ),
+        )
+    )
+
+
+def test_the_most_crowded_cover_the_api_accepts_still_fits_on_the_page(documents: DocumentService) -> None:
+    """Nothing is drawn off the bottom of the cover, whatever was filed.
+
+    The page is fixed at one page, so a signer list long enough to run past the bottom margin used
+    to push the attestation, the scan's hash and the "what the seal proves" sentence to a negative
+    y -- outside the MediaBox, inside the sealed bytes, and silently: the seal succeeded and the
+    document was stored. The sentence is the reason the page exists, so it is the one thing that
+    may never be crowded out.
+    """
+    pdf = documents.build_archive_cover(crowded_cover())
+
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 1
+    lowest = min(run.origin[1] for run in placed_text(pdf))
+    assert lowest >= PAGE_FLOOR, f"a line was drawn at y={lowest}, below the page's footer"
+
+    printed = _text(pdf)
+    assert "does not prove that the signature on the paper is genuine" in printed
+    assert bytes(range(32)).hex() in printed.replace(" ", "")  # the scan's digest
+    assert "2026-03-17 14:30:00 UTC" in printed  # who attested, and when
+
+
+def test_the_signers_it_cannot_fit_are_counted_and_pointed_at_the_certificate(documents: DocumentService) -> None:
+    """A truncated list says it is truncated, and says where the rest is.
+
+    The certificate of completion paginates and lists every paper signer, so the information is
+    not lost from the sealed bytes -- but a reader of the cover has to be told that.
+    """
+    printed = _text(documents.build_archive_cover(crowded_cover()))
+
+    shown = printed.count("Signatory ")
+    assert 0 < shown < MAX_PAPER_SIGNERS
+    assert f"and {MAX_PAPER_SIGNERS - shown} more, listed on the certificate of completion" in printed
+
+
+def test_a_short_list_is_printed_whole_with_no_notice(documents: DocumentService) -> None:
+    printed = _text(documents.build_archive_cover(COVER))
+    assert "Aurelio Vandenbrouck-Mbeki" in printed and "Perpetua Thistlewood" in printed
+    assert "listed on the certificate of completion" not in printed
 
 
 def test_inspect_scan_pdf_applies_the_scan_bounds_and_scan_codes(settings_no_db: Settings) -> None:

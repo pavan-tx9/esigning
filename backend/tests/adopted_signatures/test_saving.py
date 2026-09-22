@@ -17,6 +17,7 @@ from tests.adopted_signatures.conftest import (
     PATIENT,
     adopt,
     adopted_rows,
+    capture_rows,
     envelope_for,
     offered,
     sign,
@@ -72,6 +73,72 @@ def test_a_typed_signature_is_saved_as_the_text_that_was_stamped(ehr: Ehr, world
     assert row.kind == "typed"
     assert row.image_sha256 is None
     assert row.typed_text
+
+
+def test_an_initials_field_earlier_in_the_document_is_not_what_gets_saved(ehr: Ehr, world: World) -> None:
+    """The saved signature is the *signature*, whatever order the fields come in.
+
+    ``procedure_consent`` asks the patient to initial the risks on page 2 before signing on page 3,
+    and the UI builds its captures in reading order. Saving the first drawn-or-typed capture would
+    keep the two-letter initials and offer them back as "your saved signature" -- and the document
+    the next session stamps would carry "MO" in the signature box.
+    """
+    envelope = envelope_for(ehr, template_key="procedure_consent")
+    signer = ehr.open_session(envelope, "patient")
+    payload = signer.review_and_consent()
+    field_types = {field["id"]: field["type"] for field in payload["fields"]}
+    assert list(field_types.values())[:2] == ["initials", "signature"], "the initials must come first"
+
+    response = sign(signer, payload, key=f"initials-first-{envelope['id']}", save=True)
+
+    assert response.status_code == 200, response.text
+    row = adopted_rows(world)[0]
+    assert row.kind == "drawn"
+    assert row.typed_text is None
+    # And it is the ink from the signature field, not from an initials field that happens to be drawn.
+    event = _adopted_events(ehr, envelope["id"])[0]
+    assert event["data"]["image_sha256"] == bytes(row.image_sha256).hex()
+    signature_capture = next(c for c in capture_rows(world, signer.signer_id) if c.field_id == "patient_signature")
+    assert bytes(signature_capture.image_sha256) == bytes(row.image_sha256)
+
+
+def test_a_typed_signature_saved_from_a_document_with_initials_keeps_the_name(ehr: Ehr, world: World) -> None:
+    envelope = envelope_for(ehr, template_key="procedure_consent")
+    signer = ehr.open_session(envelope, "patient")
+    payload = signer.review_and_consent()
+
+    response = sign(signer, payload, key=f"typed-initials-{envelope['id']}", kind="typed", save=True)
+
+    assert response.status_code == 200, response.text
+    row = adopted_rows(world)[0]
+    assert row.kind == "typed"
+    # The name that was stamped into the signature box, not the initials from page 2.
+    assert row.typed_text == payload["signer"]["display_name"]
+
+
+def test_saving_needs_a_signature_field_not_just_initials(ehr: Ehr, world: World) -> None:
+    """Initials alone are not a signature to save: the refusal comes before anything is applied."""
+    envelope = envelope_for(ehr, template_key="procedure_consent")
+    signer = ehr.open_session(envelope, "patient")
+    payload = signer.review_and_consent()
+    captures = [
+        {"field_id": field["id"], "kind": "typed", "typed_text": "MO"}
+        if field["type"] == "initials"
+        else {"field_id": field["id"], "kind": "click"}
+        for field in payload["fields"]
+        if field["type"] in ("signature", "initials")
+    ]
+
+    response = signer.post(
+        "/sign",
+        sign_body(signer, payload, save=True, captures=captures),
+        **{"Idempotency-Key": f"only-initials-{envelope['id']}"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "no_signature_to_save"
+    assert adopted_rows(world) == []
+    assert ehr.envelope(envelope["id"])["signers"][0]["status"] == "consented"
 
 
 def test_saving_again_revokes_the_earlier_row(ehr: Ehr, world: World) -> None:

@@ -189,7 +189,13 @@ def post_sign(
         captures = body.to_contract(rt.settings)
         # Which signature would be saved is decided before anything is applied, so "there is
         # nothing here to save" is a refusal the signer sees instead of a rolled-back signature.
-        source = adoption_source(captures) if body.save_adopted_signature else None
+        # The field types come from the template, because only a capture on a *signature* field is
+        # the signature to save: an initials field earlier in the document is not one.
+        source = (
+            adoption_source(captures, {f.id: f.type for f in rt.envelopes.signing_view(db, session).fields})
+            if body.save_adopted_signature
+            else None
+        )
         view = rt.envelopes.sign(db, session, captures, ctx)
         ack = signer_ack_json(view, session.signer_id)
         if source is not None:

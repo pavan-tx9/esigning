@@ -22,10 +22,14 @@ export const SCENARIOS = {
     "Clinic tablet. Ends on the hand-back screen and clears everything. The patient has a saved signature on file; a kiosk is never offered it.",
   "saved-signature":
     "A patient who saved their signature last time. It is offered first, and can be used, replaced or removed.",
+  "initials-only":
+    "A signer the document asks only to initial. There is no signature to keep, so nothing offers to keep one.",
   "span-valid":
     "Clinician in a signing queue: re-authenticated for an earlier document a moment ago, and the host's span still covers this one.",
   "span-expired":
     "Clinician in a signing queue whose earlier re-authentication has run out: the hand-off is needed again.",
+  "span-saved":
+    "Clinician in a signing queue signing with their saved signature. The host can revoke it mid-flow (__esignMock.hostRevokedSignature) to see the signature go out from under them.",
   "flaky-sign":
     "The first sign request is processed but the reply is lost. Retry must reuse the key.",
   "sealing-stuck": "Sealing never finishes. The UI must stay honest.",
@@ -127,7 +131,11 @@ export const DECLINE_REASONS = [
 const REAUTH_MAX_AGE_MS = 120_000;
 const POLLS_UNTIL_SEALED = 2;
 /** How long ago the earlier document's re-authentication happened in each queue scenario. */
-const SPAN_AUTH_AGE_MS = { "span-valid": 20_000, "span-expired": 10 * 60_000 } as const;
+const SPAN_AUTH_AGE_MS = {
+  "span-valid": 20_000,
+  "span-saved": 20_000,
+  "span-expired": 10 * 60_000,
+} as const;
 
 type SignerStatus = "pending" | "viewed" | "consented" | "signed" | "declined";
 type EnvelopeStatus =
@@ -236,7 +244,7 @@ export const mockDb = {
     if (record === undefined) {
       const now = serverNow();
       const spanAge =
-        scenario === "span-valid" || scenario === "span-expired"
+        scenario === "span-valid" || scenario === "span-saved" || scenario === "span-expired"
           ? SPAN_AUTH_AGE_MS[scenario]
           : null;
       record = {
@@ -292,6 +300,17 @@ export const mockDb = {
     }
   },
 
+  /**
+   * The attestation runs out where the real one does: on the server, between a session being read
+   * and a signature being sent. The UI's cached session still says the signer is covered.
+   */
+  lapseReauth(scenario: Scenario): void {
+    const record = records.get(tokenFor(scenario));
+    if (record !== undefined) {
+      record.reauthValidUntil = serverNow() - 1;
+    }
+  },
+
   /** What the host does with `POST /v1/users/{id}/adopted-signature/revoke`. */
   hostRevokedSignature(scenario: Scenario): void {
     const record = records.get(tokenFor(scenario));
@@ -326,13 +345,17 @@ export const mockDb = {
 // --------------------------------------------------------------------------- shape of each story
 
 const isClinician = (scenario: Scenario) =>
-  scenario === "clinician" || scenario === "span-valid" || scenario === "span-expired";
-const isProcedure = (scenario: Scenario) => scenario === "multi" || isClinician(scenario);
+  scenario === "clinician" ||
+  scenario === "span-valid" ||
+  scenario === "span-saved" ||
+  scenario === "span-expired";
+const isProcedure = (scenario: Scenario) =>
+  scenario === "multi" || scenario === "initials-only" || isClinician(scenario);
 const roleOf = (scenario: Scenario) => (isClinician(scenario) ? "clinician" : "patient");
 /** Who has a signature on file from an earlier session. The kiosk patient does too: a shared
  * tablet must never be offered it, and the only way to prove that is for one to exist. */
 const hasSavedSignature = (scenario: Scenario) =>
-  scenario === "saved-signature" || scenario === "kiosk";
+  scenario === "saved-signature" || scenario === "kiosk" || scenario === "span-saved";
 
 export const SAVED_SIGNATURE_ID = "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d";
 
@@ -359,7 +382,13 @@ const usableReauthUntil = (record: MockRecord): number | null =>
 
 export function fieldsFor(record: MockRecord): MockField[] {
   const all = isProcedure(record.scenario) ? procedureFields : hipaaFields;
-  return all.filter((field) => field.role === roleOf(record.scenario));
+  const mine = all.filter((field) => field.role === roleOf(record.scenario));
+  // A template can ask a signer for initials and nothing else. The signature they adopt would
+  // land nowhere -- initials go over as their own typed text -- so there is nothing to save, and
+  // the service refuses `save_adopted_signature` from such a request (`no_signature_to_save`).
+  return record.scenario === "initials-only"
+    ? mine.filter((field) => field.type !== "signature")
+    : mine;
 }
 
 export function pageCountFor(record: MockRecord): number {
@@ -649,7 +678,9 @@ export function recordSign(
     throw invalid("Intent must be confirmed.");
   }
   if (isClinician(record.scenario) && usableReauthUntil(record) === null) {
-    throw new MockHttpError(403, "forbidden", "Re-authentication is required.");
+    // The service's own code for it (`api/errors.py`): the UI tells a lapsed re-authentication
+    // apart from the other 403s on this route by the code, never by the status alone.
+    throw new MockHttpError(403, "reauth_required", "Please confirm it is you before signing.");
   }
   const saveable = validateCaptures(record, body.captures);
   // SPEC section 14 B: everything about saving is checked before anything is signed, because the

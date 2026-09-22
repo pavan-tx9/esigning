@@ -6,7 +6,9 @@ import { buildSignRequest, type Draft } from "@/flow/draft";
 import { ApiError } from "@/lib/api";
 import {
   isNetworkError,
+  isReauthLapsed,
   isSessionGone,
+  isSignatureUnavailable,
   mustReadAgain,
   postSign,
   type SigningSession,
@@ -45,6 +47,12 @@ interface ConfirmStepProps {
   onSigned: () => void;
   /** The document moved on under this signer: they have to read it again before they can sign. */
   onReadAgain: () => void;
+  /**
+   * The saved signature they applied is no longer theirs to use -- the host revoked it, or
+   * another session of theirs replaced it (SPEC section 14 B). Nothing on this screen can mend
+   * that, so the flow hands them back to choosing a signature and says why.
+   */
+  onSignatureUnavailable: () => void;
 }
 
 export function ConfirmStep({
@@ -55,6 +63,7 @@ export function ConfirmStep({
   onBack,
   onSigned,
   onReadAgain,
+  onSignatureUnavailable,
 }: ConfirmStepProps) {
   const queryClient = useQueryClient();
   const host = useHostLink();
@@ -109,10 +118,20 @@ export function ConfirmStep({
       onSigned();
     },
     onError: (error) => {
-      if (error instanceof ApiError && error.status === 403 && signer.requires_reauth) {
+      // Which 403 it is, by the server's code and never by the status: this route refuses a
+      // lapsed re-authentication and an unusable saved signature with the same status, and the
+      // two want opposite things from the signer.
+      if (isReauthLapsed(error) && signer.requires_reauth) {
         setReauth({ status: "lapsed" });
         // The server has stopped vouching for them; the cached session still says otherwise.
         void queryClient.invalidateQueries({ queryKey: signingKeys.session });
+      }
+      if (isSignatureUnavailable(error)) {
+        // The saved signature was revoked or replaced between this session being read and the
+        // signature being sent. Confirming their identity again would not help, and the session
+        // in the cache still offers a signature the server will not accept.
+        void queryClient.invalidateQueries({ queryKey: signingKeys.session });
+        onSignatureUnavailable();
       }
       if (error instanceof ApiError && error.status === 409) {
         // Already signed from another attempt, or the envelope moved on. The session knows.
@@ -321,7 +340,7 @@ export function ConfirmStep({
                 safe to retry: the document can't be signed twice.
               </p>
             </>
-          ) : signError instanceof ApiError && signError.status === 403 ? (
+          ) : isReauthLapsed(signError) ? (
             <p>We need you to confirm it's you once more before signing.</p>
           ) : signError instanceof ApiError && signError.status === 422 ? (
             <p>

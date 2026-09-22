@@ -106,6 +106,19 @@ export function withAdopted(
   return { adopted, initials, values, save: save && isSaveable(adopted) };
 }
 
+/**
+ * Un-choose the signature, keeping everything else the signer typed or ticked. Used when the
+ * server refuses the one they chose -- a saved signature revoked or replaced under them (SPEC
+ * section 14 B) -- and they have to choose again. The marks go with it, because applying a
+ * signature is a per-field act and a mark left behind would stand for a signature nobody picked.
+ */
+export function withoutAdopted(draft: Draft): Draft {
+  const values = Object.fromEntries(
+    Object.entries(draft.values).filter(([, value]) => value.type !== "mark"),
+  );
+  return { ...draft, adopted: null, values, save: false };
+}
+
 export function withValue(draft: Draft, fieldId: string, value: FieldValue | null): Draft {
   const values = { ...draft.values };
   if (value === null) {

@@ -308,6 +308,30 @@ export function mustReadAgain(error: unknown): boolean {
   return error instanceof ApiError && error.status === 409 && error.code === "not_viewed";
 }
 
+/**
+ * The server refused the signature because it will not vouch for this signer's re-authentication
+ * any more: it lapsed between the session being read and the signature being sent (SPEC section
+ * 14 C). The way out is another hand-off to the host.
+ */
+export function isReauthLapsed(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403 && error.code === "reauth_required";
+}
+
+/**
+ * The server refused the signature because the saved signature it applied is not this session's
+ * to use (SPEC section 14 B): the host revoked it, another session of this person's replaced it,
+ * or the id is not theirs. It shares its status with a lapsed re-authentication and has nothing
+ * to do with one -- confirming their identity again would only produce the same refusal -- so the
+ * signer has to choose a signature again.
+ */
+export function isSignatureUnavailable(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 403 &&
+    error.code === "adopted_signature_unavailable"
+  );
+}
+
 /** Retry what might work next time (network, 5xx, 429); never a 4xx the server meant. */
 export function shouldRetryQuery(failureCount: number, error: unknown): boolean {
   if (failureCount >= 2) {

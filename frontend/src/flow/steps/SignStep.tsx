@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useId, useRef, useState } from "react";
 import { FieldCloseUp } from "@/components/FieldCloseUp";
-import { Button, CheckRow, Sheet, StepScreen, useAnnounce } from "@/components/ui";
+import { Button, CheckRow, Notice, Sheet, StepScreen, useAnnounce } from "@/components/ui";
 import {
   type AdoptedSignature,
   actionableFields,
@@ -44,14 +44,29 @@ function leftMessage(count: number): string {
 interface SignStepProps {
   session: SigningSession;
   draft: Draft;
+  /**
+   * True when the signer is back here because the saved signature they applied was no longer
+   * available when they tried to sign (SPEC section 14 B). Nothing has been signed and nothing
+   * they filled in is lost: all that is needed is a signature to use instead.
+   */
+  signatureGone?: boolean;
   onDraft: (draft: Draft) => void;
   onContinue: () => void;
 }
 
-export function SignStep({ session, draft, onDraft, onContinue }: SignStepProps) {
+export function SignStep({
+  session,
+  draft,
+  signatureGone = false,
+  onDraft,
+  onContinue,
+}: SignStepProps) {
   const fields = actionableFields(session.fields);
   const needsSignature = fields.some(isMarkField);
   const needsInitials = fields.some((field) => field.type === "initials");
+  // Only a signature field can hold the signature they adopt: initials are their own typed text,
+  // so a signer asked for initials alone has nothing to save for next time.
+  const hasSignatureField = fields.some((field) => field.type === "signature");
   const remaining = remainingRequired(session.fields, draft);
   // Parsed once for the whole step, not once per field.
   const document_ = useQuery(documentQueryOptions());
@@ -80,9 +95,22 @@ export function SignStep({ session, draft, onDraft, onContinue }: SignStepProps)
         title="Choose your signature"
         lead={<p>You'll choose it once, then place it wherever the document asks for it.</p>}
       >
+        {signatureGone ? (
+          <Notice tone="warn" alert className="mb-5">
+            <p className="font-semibold" data-testid="signature-gone">
+              Your saved signature is no longer available.
+            </p>
+            <p className="mt-1">
+              It was removed or replaced, so it couldn't be used. Nothing has been signed and
+              nothing else you filled in is lost. Please choose a signature below, place it again,
+              and carry on.
+            </p>
+          </Notice>
+        ) : null}
         <AdoptSignature
           displayName={session.signer.display_name}
           needsInitials={needsInitials}
+          hasSignatureField={hasSignatureField}
           defaultInitials={initialsFrom(session.signer.display_name)}
           current={draft.adopted}
           currentInitials={draft.initials}

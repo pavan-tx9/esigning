@@ -683,6 +683,33 @@ describe("a saved signature", () => {
     );
   }, 25_000);
 
+  it("is not offered where the document asks only for initials", async () => {
+    // Initials are never the saved signature: they go over as their own typed text, and the
+    // service refuses `save_adopted_signature` from a request with no signature field in it
+    // (`no_signature_to_save`). A box offering to keep a signature that would never be kept is
+    // worse than no box, so this signer is not shown one.
+    await start("initials-only");
+    await throughConsent();
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+    expect(screen.queryByTestId("save-signature")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /Save this signature/ })).toBeNull();
+    await click("Use this signature");
+
+    await click("Add my initials here");
+    await click("Next");
+    await click("Check your answers");
+    await screen.findByTestId("step-sign-summary");
+    expect(screen.queryByTestId("summary-save-note")).toBeNull();
+    await click("Continue");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    await screen.findByTestId("step-done");
+    expect(sent("initials-only")).not.toHaveProperty("save_adopted_signature");
+    expect(mockDb.peek("initials-only")?.savedSignatures).toHaveLength(0);
+  }, 25_000);
+
   it("can be removed, after a second look, and then the plain choices remain", async () => {
     await start("saved-signature");
     await throughConsent();
@@ -745,6 +772,123 @@ describe("a saved signature", () => {
     expect(JSON.stringify(body)).not.toContain("adopted");
     expect(mockDb.peek("kiosk")?.savedSignatures).toHaveLength(1);
   }, 25_000);
+});
+
+/**
+ * SPEC section 14 B: a saved signature can stop being available between the session being read
+ * and the signature being sent -- the host revokes it, or another session of this person's
+ * replaces it. The server refuses that signature with 403 `adopted_signature_unavailable`, which
+ * shares its status with a lapsed re-authentication and means the opposite thing: no amount of
+ * confirming who you are will make a revoked signature usable again. The only way on is a
+ * different signature, so the flow hands the signer back to choosing one and says so.
+ */
+describe("a saved signature revoked before the signature lands", () => {
+  it("sends a clinician back to choose a signature instead of looping on re-authentication", async () => {
+    const host = await start("span-saved");
+    await throughConsent();
+    // Their saved signature is the one on offer, and the queue's earlier confirmation covers
+    // this document, so the confirm screen has no hand-off to make.
+    expect(screen.getByTestId("saved-signature")).toBeInTheDocument();
+    await click("Use this signature");
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+    expect(screen.getByTestId("reauth-verified")).toHaveAttribute("data-reauth-scope", "span");
+
+    // The host takes the signature off the file while the clinician is on the last screen.
+    mockDb.hostRevokedSignature("span-saved");
+    await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    // Not "confirm it's you again": that hand-off would succeed and the signature still fail.
+    expect(await screen.findByTestId("step-sign-adopt")).toBeInTheDocument();
+    expect(screen.getByTestId("signature-gone")).toHaveTextContent(
+      "saved signature is no longer available",
+    );
+    expect(screen.queryByText(/confirm once more/i)).toBeNull();
+    expect(screen.queryByText(/confirm it's you once more/i)).toBeNull();
+    expect(types(host)).not.toContain("esign:reauth_required");
+    expect(mockDb.peek("span-saved")?.signerStatus).toBe("consented");
+    // The refetched session no longer offers it, so the plain choices are what is left.
+    await waitFor(() => expect(screen.queryByTestId("saved-signature")).toBeNull());
+    expect(screen.getByText("How would you like to sign?")).toBeInTheDocument();
+
+    // And the way out works: a signature made here and now, placed again, signs.
+    await user.click(screen.getByRole("radio", { name: /Use my printed name/ }));
+    await click("Use this signature");
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+    await screen.findByTestId("step-done");
+    expect(mockDb.peek("span-saved")?.signerStatus).toBe("signed");
+    const captures = JSON.parse(
+      mockDb.peek("span-saved")?.signRequests.at(-1)?.body ?? "{}",
+    ).captures;
+    expect(captures).toEqual([{ field_id: "clinician_sig", kind: "click" }]);
+  }, 30_000);
+
+  it("never tells a patient, who has no re-authentication at all, to confirm their identity", async () => {
+    await start("saved-signature");
+    await throughConsent();
+    await click("Use this signature");
+    await user.click(await screen.findByRole("checkbox"));
+    await click("Next");
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+
+    mockDb.hostRevokedSignature("saved-signature");
+    await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    expect(await screen.findByTestId("step-sign-adopt")).toBeInTheDocument();
+    expect(screen.queryByText(/confirm it's you/i)).toBeNull();
+    expect(screen.getByTestId("signature-gone")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("announcer")).toHaveTextContent("no longer available"),
+    );
+    // Nothing signed, and the box they ticked is still ticked: only the signature was dropped.
+    expect(mockDb.peek("saved-signature")?.signerStatus).toBe("consented");
+    await user.click(screen.getByRole("radio", { name: /Use my printed name/ }));
+    await click("Use this signature");
+    await click("Next");
+    await click("Sign here");
+    await click("Check your answers");
+    expect(screen.getByTestId("step-sign-summary")).toHaveTextContent("✓ Ticked");
+  }, 30_000);
+
+  it("still treats a re-authentication that lapses at the last moment as one", async () => {
+    const host = await start("span-valid");
+    await throughConsent();
+    await adoptPrintedName();
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+    expect(screen.getByTestId("reauth-verified")).toBeInTheDocument();
+
+    // The attestation runs out on the server while they are reading this screen.
+    mockDb.lapseReauth("span-valid");
+    await user.click(screen.getByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    expect(
+      await screen.findByText(/confirmation ran out before the document was signed/),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("signature-gone")).toBeNull();
+    expect(screen.getByTestId("step-confirm")).toBeInTheDocument();
+    // The hand-off is back, and it is the way out of this one.
+    const [tryAgain] = screen.getAllByRole("button", { name: "Try again" });
+    await user.click(tryAgain as HTMLElement);
+    expect(host.posted.at(-1)).toEqual({
+      type: "esign:reauth_required",
+      session_id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
+    });
+  }, 30_000);
 });
 
 /**

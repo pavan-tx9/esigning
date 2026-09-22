@@ -68,16 +68,32 @@ export async function agree(frame: FrameLocator): Promise<void> {
   await frame.getByRole("button", { name: "Agree and continue" }).click();
 }
 
+/**
+ * Get to the part of the adopt step where a signature is *made*.
+ *
+ * The signing service's database outlives a demo run -- only the demo host's worklist is fresh --
+ * so a clinician who kept their signature in an earlier run is offered it again here, and the
+ * ways of making a new one are behind "Create a new one" until they ask for them (SPEC section
+ * 14 B). A helper that means "make one now" has to say so rather than assume nothing is on file.
+ */
+async function makeANewSignature(frame: FrameLocator): Promise<void> {
+  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+  const anotherOne = frame.getByRole("radio", { name: /Create a new one/ });
+  if (await anotherOne.isVisible()) {
+    await anotherOne.check();
+  }
+}
+
 /** Adopt a signature by typing a name. Steadier than drawing, and exercises the font embedding. */
 export async function adoptTyped(frame: FrameLocator, name: string): Promise<void> {
-  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+  await makeANewSignature(frame);
   await frame.getByRole("radio", { name: /Type it/ }).check();
   await frame.getByLabel("Type your full name").fill(name);
   await frame.getByRole("button", { name: "Use this signature" }).click();
 }
 
 export async function adoptDrawn(page: Page, frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+  await makeANewSignature(frame);
   const pad = frame.getByTestId("signature-pad");
   await pad.scrollIntoViewIfNeeded();
   const box = await pad.boundingBox();
@@ -197,7 +213,7 @@ export function looksSealed(pdf: Buffer, envelopeId?: string): void {
 
 /** Adopt a typed signature and tick the box that keeps it for next time (SPEC section 14 B). */
 export async function adoptTypedAndSave(frame: FrameLocator, name: string): Promise<void> {
-  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+  await makeANewSignature(frame);
   await frame.getByRole("radio", { name: /Type it/ }).check();
   await frame.getByLabel("Type your full name").fill(name);
   const keep = frame.getByRole("checkbox", { name: /Save this signature for next time/ });

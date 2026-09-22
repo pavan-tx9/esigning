@@ -40,6 +40,13 @@ function savedOn(iso: string, locale: string): string {
 interface AdoptSignatureProps {
   displayName: string;
   needsInitials: boolean;
+  /**
+   * Whether this signer has a signature field at all. A signer asked only for initials has
+   * nothing to save: initials go over as their own typed text, so the server would refuse
+   * `save_adopted_signature` with `no_signature_to_save` -- and a box promising to keep a
+   * signature that will never be kept is worse than no box.
+   */
+  hasSignatureField: boolean;
   defaultInitials: string;
   current: AdoptedSignature | null;
   currentInitials: string;
@@ -59,6 +66,7 @@ interface AdoptSignatureProps {
 export function AdoptSignature({
   displayName,
   needsInitials,
+  hasSignatureField,
   defaultInitials,
   current,
   currentInitials,
@@ -105,8 +113,10 @@ export function AdoptSignature({
 
   const usingSaved = saved !== null && route === "saved";
   // Offered whenever a signature is being *made* here by drawing or typing -- a first-time signer
-  // as much as one replacing what they saved -- and never on a shared tablet.
-  const canSave = !kiosk && !usingSaved && (method === "drawn" || method === "typed");
+  // as much as one replacing what they saved -- never on a shared tablet, and never where this
+  // document has no signature field for it to land in.
+  const canSave =
+    !kiosk && hasSignatureField && !usingSaved && (method === "drawn" || method === "typed");
 
   const choose = (next: Method) => {
     setMethod(next);

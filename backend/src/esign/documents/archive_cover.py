@@ -42,6 +42,13 @@ _LABEL_W: Final[float] = 150.0
 _VALUE_W: Final[float] = _CONTENT_W - _LABEL_W
 _BODY: Final[float] = 9.5
 _LEADING: Final[float] = 13.0
+#: What :func:`_heading` consumes, from the row above it to the first row under its rule.
+_HEADING_H: Final[float] = 18.0 + 6.0 + 13.0
+#: No line is drawn below this. The footer sits under it, outside the body.
+_FLOOR: Final[float] = _MARGIN
+#: A single row never grows past this, so no one value can push the page over on its own. The
+#: certificate of completion paginates and prints these values in full.
+_MAX_ROW_LINES: Final[int] = 2
 _INK = (0.08, 0.10, 0.16)
 _MUTED = (0.38, 0.41, 0.48)
 _RULE = (0.80, 0.82, 0.86)
@@ -77,7 +84,14 @@ def _split_hex(value: str) -> list[str]:
 
 
 class _Cursor:
-    """A one-column layout. The page is fixed: the content is bounded, so it always fits."""
+    """A one-column layout on a page that never grows.
+
+    The contract says exactly one page, so there is nowhere to overflow *to*: a row that does not
+    fit has to be left out knowingly, not drawn at a negative y outside the MediaBox where the
+    seal still covers it and no reader ever sees it. So the one section that may give way measures
+    itself against :meth:`budget` -- the room above the floor, less what the sections below it
+    have reserved -- before it draws anything.
+    """
 
     def __init__(self, canvas: Canvas, y: float) -> None:
         self.canvas = canvas
@@ -85,6 +99,11 @@ class _Cursor:
 
     def space(self, amount: float) -> None:
         self.y -= amount
+
+    def budget(self, reserve: float) -> float:
+        """How much room is left above the floor, once ``reserve`` is set aside for the sections
+        still to be drawn below."""
+        return self.y - _FLOOR - reserve
 
 
 def _heading(cursor: _Cursor, text: str) -> None:
@@ -100,8 +119,22 @@ def _heading(cursor: _Cursor, text: str) -> None:
     cursor.space(13)
 
 
-def _row(cursor: _Cursor, label: str, value: str, *, mono_wrap: bool = False) -> None:
+def _value_lines(value: str, *, mono_wrap: bool = False) -> list[str]:
+    """How a value wraps, capped. A 200-character display name would otherwise take four lines,
+    and a handful of those would push the rest of the page past the bottom margin."""
     lines = _split_hex(value) if mono_wrap else wrap_text(value or "—", PLAIN_FONT, _BODY, _VALUE_W)
+    if len(lines) > _MAX_ROW_LINES:
+        lines = lines[:_MAX_ROW_LINES]
+        lines[-1] = truncate_to_width(lines[-1] + "…", PLAIN_FONT, _BODY, _VALUE_W)
+    return lines
+
+
+def _row_height(value: str, *, mono_wrap: bool = False) -> float:
+    return len(_value_lines(value, mono_wrap=mono_wrap)) * _LEADING
+
+
+def _row(cursor: _Cursor, label: str, value: str, *, mono_wrap: bool = False) -> None:
+    lines = _value_lines(value, mono_wrap=mono_wrap)
     canvas = cursor.canvas
     canvas.setFont(PLAIN_FONT, _BODY)
     canvas.setFillColorRGB(*_MUTED)
@@ -121,8 +154,68 @@ def _paragraph(cursor: _Cursor, text: str, *, size: float = 9.0, colour: tuple[f
         cursor.space(size + 3.5)
 
 
+def _paragraph_height(text: str, *, size: float = 9.0) -> float:
+    return len(wrap_text(text, PLAIN_FONT, size, _CONTENT_W)) * (size + 3.5)
+
+
+def _more(count: int) -> str:
+    """What a truncated signer list says. The certificate paginates and lists every one of them,
+    so the names are still inside the sealed bytes -- the reader of the cover is told where."""
+    return f"and {count} more, listed on the certificate of completion"
+
+
+def _tail_height(summary: ArchiveCoverSummary) -> float:
+    """Everything below the paper-signer list: drawn last, reserved first.
+
+    These sections are the ones that may never be crowded out -- who attested, the scan's digest,
+    and the sentence this page exists for -- so the list above them is what gives way.
+    """
+    attestation = summary.attestation
+    values = (
+        attestation.staff_display_name,
+        attestation.staff_user_id,
+        _when(summary.attested_at),
+        _STATEMENT_LABELS.get(attestation.statement, attestation.statement),
+        _DISPOSITION_LABELS.get(attestation.original_disposition, attestation.original_disposition),
+    )
+    return (
+        3 * _HEADING_H
+        + sum(_row_height(value) for value in values)
+        + _row_height(summary.scan_sha256.hex(), mono_wrap=True)
+        + _paragraph_height(WHAT_THE_SEAL_PROVES)
+    )
+
+
+def _paper_signers(cursor: _Cursor, summary: ArchiveCoverSummary, reserve: float) -> None:
+    """As much of the paper-signer list as the page holds, and an honest count of the rest."""
+    signers = summary.attestation.paper_signers
+    budget = cursor.budget(reserve)
+    used = 0.0
+    shown = 0
+    for index, signer in enumerate(signers):
+        # Room for this row, and for the notice that would stand in for everything after it.
+        notice = 0.0 if index == len(signers) - 1 else _row_height(_more(len(signers) - index - 1))
+        height = _row_height(signer.display_name)
+        if used + height + notice > budget:
+            break
+        used += height
+        shown += 1
+    for signer in signers[:shown]:
+        _row(cursor, signer.capacity, signer.display_name)
+    left = len(signers) - shown
+    if left and used + _row_height(_more(left)) <= budget:
+        _row(cursor, "", _more(left))
+
+
 def build_archive_cover(summary: ArchiveCoverSummary) -> bytes:
-    """Implements ``DocumentService.build_archive_cover``: exactly one page, before the scan."""
+    """Implements ``DocumentService.build_archive_cover``: exactly one page, before the scan.
+
+    One page is the contract, and the input is not bounded tightly enough to guarantee it by
+    arithmetic: twenty paper signers named up to 200 characters each is a filing the API accepts.
+    So the page gives way in one place only -- the paper-signer list, which is truncated with a
+    count and a pointer at the certificate of completion, where every name is printed in full.
+    Everything else is reserved before that list is drawn.
+    """
     ensure_fonts_registered()
     buffer = io.BytesIO()
     canvas = new_canvas(buffer, _PAGE_W, _PAGE_H)
@@ -148,8 +241,7 @@ def build_archive_cover(summary: ArchiveCoverSummary) -> bytes:
     _row(cursor, "Envelope id", str(summary.envelope_id))
 
     _heading(cursor, "Signed on paper by")
-    for signer in attestation.paper_signers:
-        _row(cursor, signer.capacity, signer.display_name)
+    _paper_signers(cursor, summary, reserve=_tail_height(summary))
 
     _heading(cursor, "Attested by")
     _row(cursor, "Staff member", attestation.staff_display_name)

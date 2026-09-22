@@ -12,6 +12,7 @@ import {
   savedLook,
   TEXT_FIELD_MAX,
   withAdopted,
+  withoutAdopted,
   withValue,
 } from "@/flow/draft";
 import type { SigningField } from "@/lib/signing-api";
@@ -179,6 +180,33 @@ describe("saved signatures in the draft", () => {
       { field_id: "sig", kind: "adopted", adopted_signature_id: adopted.id },
     ]);
     expect(JSON.stringify(buildCaptures(fields, draft))).not.toMatch(/image_png|dataUrl|base64/);
+  });
+
+  /**
+   * The server can refuse the saved signature after it was chosen and placed -- the host revoked
+   * it, or another session replaced it -- and then the signer has to choose again. What they
+   * typed and ticked is theirs and stays; the marks cannot, because a mark stands for a signature
+   * applied on purpose, field by field, and the signature behind these is gone.
+   */
+  it("un-choosing a signature drops its marks and keeps every other answer", () => {
+    let draft = withAdopted(emptyDraft, adopted, "PR", true);
+    draft = withValue(draft, "sig", { type: "mark" });
+    draft = withValue(draft, "init", { type: "mark" });
+    draft = withValue(draft, "ack", { type: "checkbox", checked: true });
+    draft = withValue(draft, "note", { type: "text", text: "A question" });
+
+    const gone = withoutAdopted(draft);
+    expect(gone.adopted).toBeNull();
+    expect(gone.save).toBe(false);
+    expect(gone.initials).toBe("PR");
+    expect(gone.values).toEqual({
+      ack: { type: "checkbox", checked: true },
+      note: { type: "text", text: "A question" },
+    });
+    expect(buildCaptures(fields, gone)).toEqual([
+      { field_id: "ack", checked: true },
+      { field_id: "note", text_value: "A question" },
+    ]);
   });
 
   it("asks to save only a drawn or typed signature that was actually placed", () => {
