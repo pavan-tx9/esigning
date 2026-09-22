@@ -110,8 +110,8 @@ service with a five-minute re-authentication span (`REAUTH_SPAN_SECONDS=300` tog
 both are off or default in production; `demo-host/README.md` says why) so the clinician's signing
 queue can be shown.
 
-Open <http://localhost:8100> and sign in as any of `maria`, `grace`, `ben`, `priya`, `tomas` or
-`alice` with the password `demo1234`. Worth doing in this order:
+Open <http://localhost:8100> and sign in as any of `maria`, `sam`, `grace`, `ben`, `priya`,
+`tomas` or `alice` with the password `demo1234`. Worth doing in this order:
 
 1. **maria** — a patient with a privacy acknowledgement to sign. The whole flow in one signer.
 2. **grace** — a parent signing a consent to treatment on behalf of her child. The signature is
@@ -128,7 +128,12 @@ Open <http://localhost:8100> and sign in as any of `maria`, `grace`, `ben`, `pri
    signed in turn without being asked again. Every signature's record says which confirmation it
    rests on and whether it was borrowed.
 8. **tomas** — the same queue; tick "Save this signature for next time" on the first order and the
-   second offers it back. "People" (as alice) removes anybody's saved signature.
+   second offers it back.
+9. **sam** — the saved signature from the other side, in three documents: sign the annual
+   acknowledgement and keep the signature, then have **alice** start the hydrotherapy consent on
+   the "Clinic tablet" (a kiosk is offered nothing, whatever Sam kept on the portal), then have
+   alice remove it from "People" — the review consent is offered nothing either, and Sam adopts a
+   fresh one. "People" is the only thing a host may do about a saved signature: remove it.
 
 Logs from everything `make demo` started are in `.demo/logs/`.
 
@@ -754,7 +759,7 @@ in KMS and only its *identifier* is configuration.
 | `MAX_SIGNATURE_PNG_DIMENSION` / `MIN_SIGNATURE_PNG_DIMENSION` | `4000` / `8` | a 4000×1 image passes a pixel budget and is not a signature |
 | `MAX_TYPED_SIGNATURE_CHARS` | `200` | stamped into the document and kept for years |
 | `MAX_TEXT_FIELD_CHARS` | `2000` | likewise |
-| `MAX_REQUEST_BYTES` | 8 MiB | enforced while the body is arriving, not after |
+| `MAX_REQUEST_BYTES` | 8 MiB | enforced while the body is arriving, not after. Two routes carry files and are bounded by their own limit plus 1 MiB of multipart framing instead: `POST /v1/templates` by `MAX_TEMPLATE_BYTES`, `POST /v1/archives` by `MAX_SCAN_BYTES`. Over the bound is `413 payload_too_large`; an oversized `scan` part inside a legal request is `scan_too_large` |
 
 ### API and worker
 

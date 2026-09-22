@@ -254,10 +254,12 @@ rather than a flat refusal, and its trigger states it: a row may be updated exac
 `revoked_at` *and* `revoke_reason` together; a revoked row is immutable; no column other than those
 two may ever change; `DELETE` and `TRUNCATE` are refused outright. That is deliberate — a
 `signature_captures` row may point at a saved signature, so removing one would orphan evidence
-inside a sealed document. That trigger is the one guard with no direct test of its own (the suite
-proves the behaviour through the API: a revoked row stays, and a replacement revokes exactly the
-row it names); if you are auditing the database rules rather than the service, try a `DELETE` on a
-throwaway row yourself and expect both layers to refuse it (`docs/COMPLIANCE-CHECKLIST.md` G12):
+inside a sealed document. Both layers are tested directly — the grants in
+`tests/foundation/test_roles.py`, the trigger case by case in
+`tests/adopted_signatures/test_write_once.py` (a revocation with no reason, a revocation that also
+rewrites the signature, a second revocation or an un-revocation, and the owner's `DELETE`). If you
+are auditing the database rules rather than the service, try a `DELETE` on a throwaway row
+yourself and expect both layers to refuse it:
 
 ```
 esign_app=>   DELETE FROM adopted_signatures WHERE id = '…';
@@ -832,8 +834,28 @@ Stored evidence does not match its recorded hash, or is gone. Treat as data loss
 
 ### 6.5 `audit_chain_broken`, or a verification that reports a chain problem
 
-The chain does not verify. Getting here requires database access the application does not have.
+The chain does not verify. Getting here usually requires database access the application does not
+have — with one exception, which is worth ruling out first because it is the only benign one.
 
+0. **Is every sub-problem `data keys do not match <event type> at N`, with no `hash mismatch`, no
+   `sequence gap` and no `wrong prev_event_hash`?** Then nothing was edited. An event's key set is
+   compared against the model the *running build* declares, so every event of that type written
+   before a release that added a field to it reports this, for ever, with its hash still correct.
+   Addendum 1 did this to `signer.signed`: a document signed before migration `0700` now reports
+
+   ```
+   FAILED  audit_chain  data keys do not match signer.signed at 7
+   FAILED  reauth_attestations_match_trail  <signer id>: signer.signed does not say which
+                                            attestation covered the signature
+   ```
+
+   while every revision hash, the seal, `envelope_row_matches_trail` and `certificate_head_hash`
+   pass. Confirm it is that and not something else: the events named are older than the release
+   (`SELECT occurred_at FROM audit_events WHERE stream_id = '<envelope id>' AND sequence = N`), the
+   same line appears on every envelope of that vintage and on none signed since, and §2(e) of
+   `docs/HOW-SIGNATURES-WORK.md` — which hashes the stored columns and knows nothing about our
+   models — reports `problems: none`. Record the finding against those envelopes and move on; do
+   not rebuild anything. If any of that does not hold, continue below.
 1. Snapshot immediately, including WAL if you have it.
 2. Run the standalone re-check in `docs/HOW-SIGNATURES-WORK.md` §2(e). It names the first bad row
    and the kind of problem.
@@ -1109,6 +1131,14 @@ uv --directory backend run esign consent add \
    and another worker takes it over.
 3. After any upgrade, seal one document and verify it — including in Acrobat if the sealing path
    changed at all.
+4. **If the release adds a field to an audit event's `data`** — Addendum 1 did, to `signer.signed`
+   — then every event of that type written before it will report `data keys do not match <type>`
+   from then on, and those envelopes verify `FAILED` although nothing was touched (§6.5 step 0).
+   Before upgrading, run `esign verify --json` over a sample and keep the reports: a verification
+   recorded as `ok` on the old build, plus the `verification.performed` events already in each
+   trail, is what dates the finding to the release rather than to an incident. Tell whoever runs
+   the weekly sample verification (below) which envelopes are affected, so it is not re-triaged
+   every week.
 
 ### Weekly
 
@@ -1116,7 +1146,9 @@ uv --directory backend run esign consent add \
 - `seal.failed` count for the week is zero, or every entry is explained.
 - Webhook deliveries with `attempts >= 6` and no `delivered_at` — a host endpoint is down.
 - Sample five sealed envelopes and `esign verify` them. This is cheap and it is how a slow
-  corruption gets found before someone in a deposition finds it.
+  corruption gets found before someone in a deposition finds it. Sample from *recent* envelopes;
+  one signed before a release that changed an event's data shape fails on that alone (§6.5 step 0)
+  and tells you nothing about this week.
 
 ### Quarterly
 
