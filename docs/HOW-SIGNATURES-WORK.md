@@ -487,7 +487,8 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `no_sealed_document_before_sealing` | A sealed revision exists for an envelope that is not sealed |
 | `trail_presented_hash` / `trail_signed_revision_hashes` / `trail_sealed_hash` / `trail_final_unsealed_hash` | The hashes the trail recorded are not the hashes of the stored revisions. Either the blobs were swapped or the trail was rewritten — and the trail has a hash chain to say which |
 | `capture_images_intact` | A stored drawn-signature image is missing or no longer hashes to its digest |
-| `captures_match_trail` | The capture `signer.signed` recorded is gone, or the row now points at a different image. The ink was swapped after the fact |
+| `captures_match_trail` | The capture `signer.signed` recorded is gone, or the row now points at a different image. The ink was swapped after the fact. An `adopted` capture (a saved signature, Addendum 1 B) keeps no ink of its own and points at the `adopted_signatures` row; the check follows that pointer, so the saved image is re-hashed and compared too |
+| `reauth_attestations_match_trail` | A signature that says it rested on a re-authentication names an attestation row that is missing, made for another user or host, made in a different session than `reauth_scope` claims, or whose method or `auth_time` (to within five seconds of `occurred_at - reauth_age_seconds`) is not what `signer.signed` recorded (Addendum 1 C) |
 | `envelope_row_matches_trail` | `created_at`, `document_type`, `template_version_id`, template key or version differ from what `envelope.created` recorded |
 | `signer_rows_match_trail` | A `signers` row disagrees with the trail: a timestamp more than 60 seconds from the event that recorded it, a status that does not match whether `signer.signed` exists, a rewritten `role_key`, `capacity`, `on_behalf_of` or `consent_text_id`, or no `document.viewed` covering the revision the signature was built on |
 
@@ -542,7 +543,31 @@ Two properties of the validator worth being able to state:
 
 ---
 
-## 5. Things a careful reader will ask
+## 5. Addendum 1: what changed in the evidence
+
+Three additions (`docs/SPEC-ADDENDUM-1.md`), each with its own weakening and its own containment:
+
+- **A paper archive** is an envelope of `kind = paper_archive`: a scan the host filed, with a
+  staff member's attestation, stored write-once as revision 1 (`scan`) and sealed exactly as above
+  behind a one-page cover. The seal proves the scan has not changed since filing and who attested
+  to it -- `archive.created` and `archive.attested` are the first two events -- and *not* that the
+  ink is genuine; the cover page and the certificate say so in those words. Verification runs the
+  same checks; a scan replaced in storage fails `revision_1_scan_hash`.
+- **A saved signature** (`adopted_signatures`) is created only by the signer, from inside their own
+  non-kiosk session, after a signature succeeded, and is never deleted, only revoked. Applying one
+  is still an explicit action per field; the capture row records `kind = adopted` and the row's
+  id, `signer.signed` carries the digest of what was stamped and `adopted_signature_id`, and the
+  certificate says "signed with a saved signature adopted on <date>". A kiosk session is never
+  offered one and cannot save one.
+- **A re-authentication span** (`REAUTH_SPAN_SECONDS`, default 0, at most 900) lets one attestation
+  cover a clinician's other sessions on the same host for that long after its `auth_time`, never
+  beyond `REAUTH_MAX_AGE_SECONDS`. What is weakened is per-document proof of the re-authentication;
+  what contains it is that every `signer.signed` records `reauth_attestation_id`, `reauth_scope`
+  (`session` or `span`) and `reauth_age_seconds`, the certificate prints "re-authenticated at
+  <time> for this document" or "... in an earlier session, N seconds before signing", and
+  `reauth_attestations_match_trail` checks the row against all of it.
+
+## 6. Things a careful reader will ask
 
 **"The signer's own copy — is it the same document?"** Yes, byte for byte. `GET /v1/signing/copy`
 returns the sealed blob and nothing else; while the seal is pending it returns `202 {"status":

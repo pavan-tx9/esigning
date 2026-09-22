@@ -753,6 +753,11 @@ contract. Made once, by the integration owner, with the reasons recorded here:
   `image_sha256` out of the `signer.signed` event's `CaptureRef` for the field it is saving from,
   rather than sanitising the client's PNG a second time and trusting the result to hash to the
   blob `sign` stored. `adopt_signature` still checks that blob exists and is a `signature_image`.
+- **Verification follows an `adopted` capture to its saved signature**: `captures_match_trail`
+  compared the digest in `signer.signed` with the capture row's own `image_sha256` / `typed_text`,
+  and an `adopted` row has neither (it points at `adopted_signatures`), so every envelope signed
+  with a saved signature failed verification. The check now resolves the pointer, and
+  `capture_images_intact` re-hashes the saved image with the rest.
 - **The effective borrow window is `min(REAUTH_MAX_AGE_SECONDS, REAUTH_SPAN_SECONDS)`**, by the
   addendum's own rule that the attestation must be within the maximum age in every scope. A host
   configuring a five-minute queue sets both (the demo does); `.env.example` and the README say so.
