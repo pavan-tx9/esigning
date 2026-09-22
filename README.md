@@ -12,7 +12,7 @@ afterwards. Every design decision follows from that.
 
 ## What you get
 
-| | |
+| Area | What it does |
 |---|---|
 | **Signing UI** | Embeddable, accessible, patient-friendly. Draw, type or click to sign. Works on a phone or a shared clinic tablet. |
 | **Host API** | Server-to-server: create envelopes from templates or from generated per-patient reports, open sessions, attest re-authentication, fetch sealed PDFs, receive signed webhooks. |
