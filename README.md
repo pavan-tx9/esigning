@@ -105,8 +105,10 @@ make demo         # everything, in the foreground; Ctrl-C stops it
 a demo EHR (keeping its credentials in `.demo/env`, because `esign hosts create` prints the API key
 exactly once), imports the four sample templates, starts the worker, and starts a stand-in EHR on
 :8100. It then prints where to click. Everything it does is safe to repeat. The demo runs the
-service with a five-minute re-authentication span (`REAUTH_SPAN_SECONDS=300`, off by default;
-`demo-host/README.md` says why) so the clinician's signing queue can be shown.
+service with a five-minute re-authentication span (`REAUTH_SPAN_SECONDS=300` together with
+`REAUTH_MAX_AGE_SECONDS=300`, because the span never reaches further back than the maximum age —
+both are off or default in production; `demo-host/README.md` says why) so the clinician's signing
+queue can be shown.
 
 Open <http://localhost:8100> and sign in as any of `maria`, `grace`, `ben`, `priya`, `tomas` or
 `alice` with the password `demo1234`. Worth doing in this order:
@@ -459,43 +461,175 @@ curl -s -X POST $API/v1/archives -H "$AUTH" -H 'Idempotency-Key: paper-5531' \
                             "paper_signers": [{"display_name": "Maria Alvarez", "capacity": "self"}]}}'
 ```
 
-It answers an `EnvelopeView` with `"kind": "paper_archive"`, no template and no signers, in
-`completed_pending_seal`; the seal is attempted inline and retried by the worker, `envelope.sealed`
-fires, and `/document`, `/audit`, `/verification` and `/void` work as for any envelope. The sealed
-PDF opens with a cover page stating what it is, the paper signing date, who attested and when, the
-disposition of the original, the scan's SHA-256, and what the seal does and does not prove: that
-the scan is unchanged since filing and who filed it, not that the ink is genuine. The scan passes
-the template hygiene rules under `MAX_SCAN_BYTES` / `MAX_SCAN_PAGES`; `staff_user_id` and
-`patient_ref` must be opaque, and the paper signers' names reach the cover page and the certificate
-only, never the audit trail.
+`201`, and an `EnvelopeView` with no template and no signers:
 
-### 8. Saved signatures and the signing queue
+```json
+{
+  "id": "d46a3548-f58d-485e-b9e4-a0fef192ef5e",
+  "status": "completed_pending_seal",
+  "kind": "paper_archive",
+  "document_type": "patient_consent",
+  "template_key": null, "template_version": null, "signing_order": null, "signers": [],
+  "presented_sha256": "a3a74b64…8240",
+  "current_revision_sha256": "a3a74b64…8240",
+  "sealed_sha256": null,
+  "created_at": "2026-09-22T08:06:07.700592Z",
+  "expires_at": "2026-10-06T08:06:07.700592Z",
+  "paper_signed_on": "2026-09-01",
+  "attested_at": "2026-09-22T08:06:07.700592Z",
+  "supersedes_envelope_id": null, "superseded_by_envelope_id": null
+}
+```
 
-A signer can save the signature they adopt so their next session offers it again
-(`save_adopted_signature: true` on `POST /v1/signing/sign`; `adopted_signature` in the session
-payload; `{"kind": "adopted", "adopted_signature_id": ...}` as a capture). Only the signer can
-create one, from inside their own session, and never from a kiosk. A host may remove one:
+Nobody has to sign, so filing *is* completion: the scan is stored write-once as revision 1 (kind
+`scan`), `archive.created` and `archive.attested` are the first two events, and the envelope goes
+straight to `completed_pending_seal`. The seal is attempted once inline and retried by the worker
+exactly as for the last signature, `envelope.sealed` fires when it lands, and `/document`,
+`/audit`, `/verification` and `/void` work as for any envelope. (`expires_at` is filled in for
+every envelope; an archive never expires — it is complete the moment it is filed.)
+
+The sealed PDF is **cover page, scan, certificate of completion**, in that order, under one seal.
+The cover states what it is, the document type, the paper signing date, the number of pages
+scanned, the envelope id, who signed on paper, who attested and when, what became of the original,
+the scan's SHA-256, and, in these words:
+
+> The seal on this document proves that this scan has not changed since it was filed, and who filed
+> and attested to it. It does not prove that the signature on the paper is genuine: that rests on
+> the paper original and on the person who attested to this copy.
+
+The certificate prints the same sentence, the attestation in place of the signer table, and the
+audit head hash. `docs/HOW-SIGNATURES-WORK.md` §5 explains what that is and is not evidence of, and
+§2(g) shows how to check an attestation by hand.
+
+Things worth knowing here:
+
+- The scan goes through the template hygiene rules — no encryption, JavaScript, XFA, embedded
+  files or existing signatures — under `MAX_SCAN_BYTES` / `MAX_SCAN_PAGES` (20 MiB, 100 pages)
+  rather than the template limits, because image-only pages are large. The codes say `scan_`
+  (`scan_too_large`, `scan_too_many_pages`, `scan_encrypted`, …) so you know which file they are
+  about. Rasterised pages are expected and fine.
+- `document_type` must be on `APPROVED_DOCUMENT_TYPES`: compliance decides what may be filed this
+  way, exactly as it decides what may be signed electronically.
+- `patient_ref` and `attestation.staff_user_id` must be opaque (`patient_ref_invalid`,
+  `host_user_id_invalid`). The paper signers' and staff member's **names reach the cover page and
+  the certificate only** — `archive.attested` records the opaque staff id, the statement, the
+  disposition and a *count* of paper signers.
+- `paper_signed_on` is a date, and one in the future is refused (`paper_signed_on_in_future`).
+- `statement` is a closed vocabulary of one: `true_copy`. `original_disposition` is `retained`,
+  `returned_to_signer` or `destroyed_per_policy`, and it is printed on the cover. What actually
+  happens to the paper is your records policy — this service records the claim and never judges it
+  (`docs/COMPLIANCE-CHECKLIST.md` C11).
+- `Idempotency-Key` hashes the scan bytes as well as the body, so a retry files one archive and
+  the same key with a different document is refused (`409 idempotency_key_reused`) rather than
+  replaying the first answer.
+- A paper archive may be voided while it is still unsealed, and may supersede — or be superseded
+  by — a sealed envelope of either kind. Once sealed it is corrected the same way everything else
+  is: a new envelope with `supersedes_envelope_id`.
+
+Then verify it like anything else — a real run, cover page and all:
+
+```
+$ uv --directory backend run esign verify d46a3548-f58d-485e-b9e4-a0fef192ef5e
+envelope d46a3548-f58d-485e-b9e4-a0fef192ef5e: sealed
+  PASSED  revision_numbers_gapless
+  PASSED  revision_1_scan_hash  a3a74b6443ae260bf5663136d66d3782d6fec39520d3e00a6304dd1f0aee8240
+  PASSED  revision_2_final_unsealed_hash  028df7a5…
+  PASSED  revision_3_sealed_hash  fa92d74f…
+  …
+  PASSED  sealed_pages_match_final_revision
+  PASSED  certificate_head_hash_in_document
+audit trail: 5 events
+RESULT: verified. The seal, every stored hash and the audit chain all check out.
+```
+
+### 8. Saved signatures
+
+A signer can keep the signature they adopted so their next session offers it back. The host does
+nothing for this — it happens inside the signing UI — but it is worth knowing what the host can
+see and do.
+
+**Only the signer creates one**, from inside their own live session, after their signature has
+succeeded, and never from a kiosk: a patient on a shared tablet must not leave a signature behind
+for the next person handed the tablet. There is no host API that uploads a signature for a user,
+because staff must not be able to manufacture a doctor's signature.
+
+- The UI sends `"save_adopted_signature": true` on `POST /v1/signing/sign` beside a drawn or typed
+  capture. The row is written in the same transaction as the signature, and names the *stored*
+  image the trail recorded — never bytes from the request.
+- The next session's `GET /v1/signing/session` carries
+  `"adopted_signature": {"id", "kind", "image_png_base64" | "typed_text", "created_at"}` (`null`
+  on a kiosk session, and for anyone else). The image is served only to a session belonging to
+  the same `(host, host_user_id)`.
+- Using it is `{"field_id": "…", "kind": "adopted", "adopted_signature_id": "…"}` as a capture —
+  one explicit action per field, as before. The trail records `kind = adopted`, the row's id, and
+  the digest of what was stamped; the certificate says
+  "signed with a saved signature adopted on 2026-09-22".
+- There is at most one live saved signature per user per host. Saving another revokes the old one
+  (`reason: replaced`). Rows are never deleted — a signature already applied points at one.
+
+Either side can remove it. The signer does it from their own session
+(`POST /v1/signing/adopted-signature/revoke`); a host does it for a user:
 
 ```sh
-curl -s -X POST "$API/v1/users/user-0311/adopted-signature/revoke" -H "$AUTH" -d '{}'
+curl -s -X POST "$API/v1/users/user-0311/adopted-signature/revoke" \
+  -H "$AUTH" -H 'Content-Type: application/json' -d '{"reason": "left the practice"}'
 ```
 
 ```json
 {"revoked": true}
 ```
 
-200 either way; another host's user and a user with nothing saved both answer `false`.
+200 either way: another host's user, an id that is not opaque, and a user with nothing saved all
+answer `false`, so the call says nothing about who exists. `reason` is accepted for your own logs
+and deliberately not stored — the trail records `reason: host` and free text is how a name gets in.
+Send JSON or no body at all; `-d '{}'` without a `Content-Type` is form-encoded and is refused.
+
+Revoking stops the signature being offered and applied from now on. It does not — and must not —
+touch documents already signed with it: those are sealed, and the row survives so the capture that
+points at it can still be verified.
+
+### 9. The signing queue (`REAUTH_SPAN_SECONDS`)
 
 With `REAUTH_SPAN_SECONDS` above zero (default `0`, at most `900`), a re-authentication attested on
-one of a user's sessions also covers their other sessions on the same host for that long after its
-`auth_time`, so a clinician confirms once and signs a queue. The host still calls
-`POST /v1/sessions/{id}/reauth` once, on the first document; `GET /v1/signing/session` then reports
-`reauth_valid_until`, `reauth_scope` (`session` or `span`) and `reauth_at` for the others, and
-every `signer.signed` event and the certificate record which attestation was used, whether it was
-borrowed, and how old it was. The attestation must still be within `REAUTH_MAX_AGE_SECONDS`, so
-the queue's window is the smaller of the two settings.
+one of a user's sessions also covers that user's **other sessions on the same host** for that long
+after its `auth_time`, so a clinician confirms their identity once and signs a queue of orders.
+The host still calls `POST /v1/sessions/{id}/reauth` once, on the first document, and nothing else
+changes: each document is its own envelope, its own session, its own review, consent and signature.
 
-### 9. Reading the record back
+```sh
+# attested on the first document's session only
+curl -s -X POST "$API/v1/sessions/$FIRST_SESSION_ID/reauth" -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"method": "password", "auth_time": "2026-09-22T08:08:05Z"}'
+# {"session_id":"36fbc470-…","reauth_valid_until":"2026-09-22T08:10:05Z"}
+
+# the *second* document's session, which was never attested for
+curl -s $API/v1/signing/session -H "Authorization: Bearer $SECOND_TOKEN"
+```
+
+```json
+{"signer": {"…": "…",
+            "requires_reauth": true,
+            "reauth_valid_until": "2026-09-22T08:10:05Z",
+            "reauth_scope": "span",
+            "reauth_at": "2026-09-22T08:08:05Z"}}
+```
+
+`reauth_scope` is `session` for an attestation made for this session and `span` for a borrowed one,
+and `reauth_at` is when the person actually confirmed their identity, so the UI can say "you
+confirmed your identity at 08:08" instead of asking again. Every `signer.signed` event then records
+`reauth_attestation_id`, `reauth_scope` and `reauth_age_seconds`, and the certificate prints
+"password, at 2026-09-22 08:00:10 UTC in an earlier session, 5 seconds before signing" rather than
+"for this document". Verification re-checks all of it against the attestation row.
+
+**Set both windows together.** An attestation older than `REAUTH_MAX_AGE_SECONDS` (default 120 s)
+covers nothing, span or no span — so `REAUTH_SPAN_SECONDS=300` on its own still gives a two-minute
+queue, as the `reauth_valid_until` above shows. `make demo` exports `REAUTH_SPAN_SECONDS=300` **and**
+`REAUTH_MAX_AGE_SECONDS=300` for this reason. The default is off, and turning it on is a compliance
+decision, not an engineering one: it weakens per-document proof that the clinician re-authenticated
+for *that* document (`docs/COMPLIANCE-CHECKLIST.md` C10, `docs/RUNBOOK.md` §7).
+
+### 10. Reading the record back
 
 ```sh
 curl -s "$API/v1/envelopes/$ENVELOPE_ID"               -H "$AUTH"   # EnvelopeView

@@ -26,7 +26,7 @@ A signed document is not one artefact. It is five, and they corroborate each oth
 | 1 | **The sealed PDF** — the document, the signature marks, and the certificate of completion, under one PAdES certification signature with an RFC 3161 timestamp | blob store, content-addressed by its own SHA-256; S3 Object Lock in production | No. Any byte change breaks the seal |
 | 2 | **Every intermediate revision** — what was presented, and what the document looked like after each signer | same blob store, one blob per revision; `document_revisions` is the index | No. Append-only table, write-once object, re-hashed on every read |
 | 3 | **The audit trail** — a hash-chained event per step, per envelope | `audit_events` | No. The runtime role has `SELECT, INSERT` only; a database trigger refuses `UPDATE`, `DELETE` and `TRUNCATE` even for the owner |
-| 4 | **The raw signer input** — the drawn PNG as it left the pad, or the typed text | `signature_captures` plus a blob for the image | No. Append-only since migration `0502` |
+| 4 | **The raw signer input** — the drawn PNG as it left the pad, or the typed text | `signature_captures` plus a blob for the image; a saved signature (§5) keeps its ink once, in `adopted_signatures`, and the capture points at that row | No. Append-only since migration `0502`; `adopted_signatures` rows are never deleted and take exactly one UPDATE, the revocation |
 | 5 | **The working rows** — `envelopes`, `signers`, `signing_sessions` | ordinary tables | **Yes.** They are mutable, and that is why nothing depends on them alone |
 
 Row 5 is the important admission. `signers.signed_at`, `capacity`, `role_key` and the rest are
@@ -171,7 +171,9 @@ A check that could not be run is reported `skipped`, never silently passed.
 
 ### The slow way: by hand, trusting nothing
 
-Five things to check. Everything you need is a database dump, the blob files and Python.
+Six things to check for any document, and two more for the evidence Addendum 1 added — a paper
+archive's attestation (g) and a saved signature (h). Everything you need is a database dump, the
+blob files and Python.
 
 #### (a) The sealed file is the file the record names
 
@@ -252,9 +254,23 @@ exactly what the `certificate_head_hash` check does, and `certificate_head_hash_
 confirms the value is really printed on a page inside the seal rather than merely recorded.
 
 Also on those pages, for every signer: name, role, capacity, signer id, authentication method,
-re-authentication method (or "not required"), consent version, the viewed/consented/signed times in
-UTC, IP, user agent, and any kiosk staff member and identity check. That page is designed to stand
-alone in front of a reader who has none of this infrastructure.
+re-authentication, consent version, the viewed/consented/signed times in UTC, IP, user agent, and
+any kiosk staff member and identity check. That page is designed to stand alone in front of a
+reader who has none of this infrastructure.
+
+Two of those lines say more than they used to, and both are Addendum 1 (section 5):
+
+- **Re-authentication** is "not required", or the method with *when and for what*. A real one:
+  `password, at 2026-09-22 08:00:10 UTC for this document` — or, when the confirmation was borrowed
+  from an earlier document in the same signing queue, `password, at 2026-09-22 08:00:10 UTC in an
+  earlier session, 5 seconds before signing`. The second wording is the weakening stated on the
+  page a court reads, in words, rather than left in a configuration file.
+- **Saved signature** appears only when the mark was one the signer had saved earlier: `signed with
+  a saved signature adopted on 2026-09-22`.
+
+A paper archive's certificate has no signer table at all. In its place it prints the attestation —
+who attested, their staff id, the statement, what became of the original, and the paper signers by
+name and capacity — plus the sentence about what the seal proves (see (g)).
 
 #### (e) Re-verify the audit chain from the dump
 
@@ -332,6 +348,123 @@ will report the signature as *valid but of unknown validity* unless that CA is i
 list — that is a purchasing decision (see `docs/RUNBOOK.md`), not a defect in the document. What
 Acrobat must never show is a signature that fails: if it does, and `esign verify` passes, believe
 Acrobat and escalate.
+
+#### (g) A paper archive: checking the attestation
+
+A paper archive (section 5) is verified by exactly the procedure above — the seal, the pointers,
+the chain — with one difference in what the evidence *is*. Revision 1 is the scan rather than a
+rendered template, and the two facts a reader cares about are "this is the scan that was filed" and
+"this is who said it was a true copy". A real run:
+
+```
+$ uv --directory backend run esign verify d46a3548-f58d-485e-b9e4-a0fef192ef5e
+envelope d46a3548-f58d-485e-b9e4-a0fef192ef5e: sealed
+  PASSED  revision_numbers_gapless
+  PASSED  revision_1_scan_hash  a3a74b6443ae260bf5663136d66d3782d6fec39520d3e00a6304dd1f0aee8240
+  PASSED  revision_2_final_unsealed_hash  028df7a5a0d39111fe5052c1678f19f98bccfa41e6c667c0fc84b467c28e8db5
+  PASSED  revision_3_sealed_hash  fa92d74f4f165f4132a06451e65174643699f69a0d8c7a16d3f645204c30a3ea
+  PASSED  envelope_row_matches_trail
+  PASSED  sealed_pages_match_final_revision
+  PASSED  certificate_head_hash_in_document
+  …
+audit trail: 5 events
+RESULT: verified. The seal, every stored hash and the audit chain all check out.
+```
+
+There are no signers, so `signer_rows_match_trail` and `reauth_attestations_match_trail` pass with
+nothing to compare, and `capture_images_intact` reports "no drawn or typed signature was captured".
+The check that carries the weight here is `sealed_pages_match_final_revision`: it compares the
+pages inside the seal against the stored scan, **one page in**, because the cover page precedes it.
+A scan swapped inside the sealed bytes is caught there; a scan swapped in the blob store is caught
+by `revision_1_scan_hash`.
+
+By hand, the attestation is two records that have to agree, plus a page you can read:
+
+```sh
+# what the mutable envelope row says
+psql -At -c "SELECT jsonb_pretty(attestation) FROM envelopes WHERE id = '<envelope id>'"
+# {"statement": "true_copy", "paper_signers": [{"capacity": "self", "display_name": "Maria Alvarez"}],
+#  "staff_user_id": "staff-3310", "staff_display_name": "Alice Wu", "original_disposition": "retained"}
+
+# what the append-only trail recorded at the moment of filing
+psql -At -c "SELECT jsonb_pretty(data) FROM audit_events
+             WHERE stream_type='envelope' AND stream_id='<envelope id>'
+               AND event_type='archive.attested'"
+# {"statement": "true_copy", "staff_user_id": "staff-3310",
+#  "paper_signer_count": 1, "original_disposition": "retained"}
+```
+
+The trail holds the opaque staff id, the statement, the disposition and a *count* — the names are
+PHI, and they live in the row and inside the sealed PDF, nowhere else. Verification compares the
+two as `envelope_row_matches_trail`, so an edited `attestation` column is a finding rather than a
+new truth. `archive.created` carries the scan's hash, size and page count, and its `occurred_at` is
+the filing time the cover page and the certificate print.
+
+Then read page 1 of the sealed PDF. It is inside the seal, so it cannot have been changed after the
+fact, and it says in plain words what this document is worth:
+
+> The seal on this document proves that this scan has not changed since it was filed, and who filed
+> and attested to it. It does not prove that the signature on the paper is genuine: that rests on
+> the paper original and on the person who attested to this copy.
+
+**The honest formulation for an archive:** the seal and the chain are evidence about the *scan and
+the filing*; the ink is evidence about the signing, and it lives on paper. Where the original was
+destroyed under a retention policy (`original_disposition`), this attestation is what remains of
+it — which is why who attested, and when, is on the cover page, on the certificate, and in the
+trail as an actor with the `staff` role.
+
+#### (h) A saved signature: follow the pointer
+
+A capture of kind `adopted` (section 5) holds no ink of its own. It names the `adopted_signatures`
+row whose image or text was stamped, and the numbers still have to add up:
+
+```sh
+# the capture, and the row it points at
+psql -At -F ' | ' -c "SELECT c.field_id, c.kind, c.adopted_signature_id
+                      FROM signature_captures c JOIN signers s ON s.id = c.signer_id
+                      WHERE s.envelope_id = '<envelope id>'"
+# clinician_signature | adopted | aae3234d-a5ee-46ce-abd9-d4f35a87b4c1
+
+psql -At -F ' | ' -c "SELECT kind, encode(sha256(convert_to(typed_text,'UTF8')),'hex'),
+                             created_by_session_id, created_in_envelope_id, created_at, revoked_at
+                      FROM adopted_signatures WHERE id = 'aae3234d-a5ee-46ce-abd9-d4f35a87b4c1'"
+# typed | e2935ea1e1d93a150b2f1ef8b48a757a5ba9f8afe21bd628d3edb40f643f2426 | fec905f9-… | 1ed8d217-… | 2026-09-22 08:00:10+00 |
+```
+
+Three comparisons turn that mark into evidence rather than an assertion:
+
+1. **The trail of the signature that used it.** `signer.signed.captures[]` for that field records
+   `{"kind": "adopted", "image_sha256": null, "typed_text_sha256": "e2935ea1…"}` — the digest of
+   what was actually stamped. It must equal the digest of the row above. Verification does this as
+   `captures_match_trail`, following the pointer; for a drawn signature `capture_images_intact`
+   also re-reads the stored PNG and re-hashes it.
+2. **The trail of the adoption.** `signature.adopted`, on the envelope stream of the session the
+   signature was *created* in, carries the same id and the same digest:
+
+   ```sh
+   psql -At -F ' | ' -c "SELECT stream_id, sequence, data->>'typed_text_sha256'
+                         FROM audit_events WHERE event_type='signature.adopted'
+                           AND data->>'adopted_signature_id' = 'aae3234d-a5ee-46ce-abd9-d4f35a87b4c1'"
+   # 1ed8d217-ce9a-44d2-9d4c-1a8911e519c8 | 10 | e2935ea1e1d93a150b2f1ef8b48a757a5ba9f8afe21bd628d3edb40f643f2426
+   ```
+
+   That stream is a different envelope — the document this person was signing when they saved it —
+   and it is hash-chained in the same way. `created_by_session_id` names the session, which
+   `session.created` in that stream dates and attributes.
+3. **The certificate.** The sealed certificate of completion prints, under that signer: "Saved
+   signature — signed with a saved signature adopted on 2026-09-22". A reader holding only the PDF
+   knows the mark was not drawn in this session, and knows when it was.
+
+What a saved signature does **not** weaken: the signer still reviewed this document, consented in
+this session, applied the signature to each field by an explicit action, and confirmed intent
+before it was sent. What it does mean is that the ink was captured once, earlier, by that same
+person in their own authenticated session — never by staff, never on a kiosk, and never through a
+host API, because none exists.
+
+A revoked row still verifies. Revocation stops the signature being *offered*; `revoked_at` and
+`revoke_reason` (`replaced`, `user`, `host`) say when and at whose request,
+`signature.adoption_revoked` on the `system` stream for that host records the same, and the row is
+never deleted — precisely so that the documents already signed with it stay checkable.
 
 ---
 
@@ -461,7 +594,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `document.viewed` | the signer confirmed every page, and against which bytes |
 | `consent.accepted` | which disclosure, which version, which locale, and the hash of its body |
 | `auth.reauthenticated` | the host attested a fresh re-authentication for this session |
-| `signer.signed` | the whole act: what they were shown, what the marks went onto, what came out, how each field was filled, the digest of the ink, the consent version, whether re-authentication was used and by what method |
+| `signer.signed` | the whole act: what they were shown, what the marks went onto, what came out, how each field was filled, the digest of the ink, the consent version, whether re-authentication was used and by what method — and, since Addendum 1, *which* attestation covered it (`reauth_attestation_id`), whether that attestation was made in this session or borrowed (`reauth_scope`), how old it was (`reauth_age_seconds`), and the saved signature applied, if any (`adopted_signature_id`) |
 | `signer.declined` / `envelope.declined` | the refusal and its reason code |
 | `envelope.completed` | the last signature landed |
 | `document.finalized` | the certificate of completion was appended, over this many events ending in this head hash |
@@ -471,6 +604,10 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `seal.failed` | an attempt failed, with the error code, which attempt it was, and when the next one is due |
 | `envelope.voided` / `expired` / `superseded` | how the envelope ended, or what replaced it |
 | `verification.performed` | somebody checked, and what they found |
+| `archive.created` | a scan of a paper-signed document was filed: which host, which document type, how many pages, how many bytes, the scan's hash — and `occurred_at` is the filing time the cover page prints |
+| `archive.attested` | who said it is a true copy: the staff member by opaque id, as the actor and in the data, the statement, what became of the original, and how many people signed the paper. Never a name |
+| `signature.adopted` | a signer saved the signature they had just applied: which row, of what kind, and the digest of the image or the typed text. On the envelope stream of the session that created it, one event after the `signer.signed` it came from |
+| `signature.adoption_revoked` | a saved signature stopped being offered: which row, whose, and why (`replaced`, `user`, `host`). On the **`system`** stream, one chain per host, because a saved signature outlives any one envelope |
 
 ---
 
@@ -489,7 +626,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `capture_images_intact` | A stored drawn-signature image is missing or no longer hashes to its digest |
 | `captures_match_trail` | The capture `signer.signed` recorded is gone, or the row now points at a different image. The ink was swapped after the fact. An `adopted` capture (a saved signature, Addendum 1 B) keeps no ink of its own and points at the `adopted_signatures` row; the check follows that pointer, so the saved image is re-hashed and compared too |
 | `reauth_attestations_match_trail` | A signature that says it rested on a re-authentication names an attestation row that is missing, made for another user or host, made in a different session than `reauth_scope` claims, or whose method or `auth_time` (to within five seconds of `occurred_at - reauth_age_seconds`) is not what `signer.signed` recorded (Addendum 1 C) |
-| `envelope_row_matches_trail` | `created_at`, `document_type`, `template_version_id`, template key or version differ from what `envelope.created` recorded |
+| `envelope_row_matches_trail` | `created_at`, `document_type`, `template_version_id`, template key or version differ from what `envelope.created` recorded. For a paper archive the same check runs against `archive.created` and `archive.attested`: the filing and attestation times, the document type, and the `attestation` column's staff id, statement, disposition and paper-signer count (the scan's own hash is covered by `revision_1_scan_hash` and `trail_presented_hash`). That column is an ordinary jsonb column the application can update, so it is compared exactly as a signer row is |
 | `signer_rows_match_trail` | A `signers` row disagrees with the trail: a timestamp more than 60 seconds from the event that recorded it, a status that does not match whether `signer.signed` exists, a rewritten `role_key`, `capacity`, `on_behalf_of` or `consent_text_id`, or no `document.viewed` covering the revision the signature was built on |
 
 ### The seal
@@ -563,9 +700,26 @@ Three additions (`docs/SPEC-ADDENDUM-1.md`), each with its own weakening and its
   cover a clinician's other sessions on the same host for that long after its `auth_time`, never
   beyond `REAUTH_MAX_AGE_SECONDS`. What is weakened is per-document proof of the re-authentication;
   what contains it is that every `signer.signed` records `reauth_attestation_id`, `reauth_scope`
-  (`session` or `span`) and `reauth_age_seconds`, the certificate prints "re-authenticated at
-  <time> for this document" or "... in an earlier session, N seconds before signing", and
+  (`session` or `span`) and `reauth_age_seconds`, the certificate prints the method "at <time>
+  for this document" or "at <time> in an earlier session, N seconds before signing", and
   `reauth_attestations_match_trail` checks the row against all of it.
+
+How to check each of them by hand is (g) and (h) in section 2, and the certificate wording is
+under (d). Two consequences worth stating plainly, because they are the questions an opposing
+expert would ask:
+
+- **A paper archive's seal is not evidence that anybody signed anything.** It is evidence about a
+  scan and about a filing. The signature it depicts was made on paper, and what stands behind it is
+  the paper original and the person who attested to the copy — named on the cover page, in the
+  certificate, and in the trail. If the original has been destroyed under policy, say so plainly:
+  the disposition is recorded for exactly that reason.
+- **A borrowed re-authentication is visible everywhere it matters.** The trail names the
+  attestation row, the scope and the age; the certificate prints it in words; and verification
+  re-derives the age from the row's `auth_time` (to within five seconds) and refuses a `span`
+  attestation that was really made in this session, or one belonging to another user or host. What
+  the record cannot show is a *second* deliberate identity proof for the second document, because
+  there was not one — which is why the span is off by default and switching it on is a compliance
+  decision (`docs/COMPLIANCE-CHECKLIST.md` C10, `docs/RUNBOOK.md` §7).
 
 ## 6. Things a careful reader will ask
 

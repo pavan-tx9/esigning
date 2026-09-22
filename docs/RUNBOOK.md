@@ -242,12 +242,29 @@ CREATE DATABASE esign OWNER esign_owner;
 | Role | Used by | Privileges |
 |---|---|---|
 | `esign_owner` | `esign migrate` only | owns every object; runs DDL |
-| `esign_app` | every running process | `SELECT, INSERT` on `audit_events`, `blobs`, `document_revisions`, `consent_texts`, `reauth_attestations`; `SELECT, INSERT, UPDATE` on the rest; `DELETE` on `idempotency_keys` alone; no DDL, no `TRUNCATE` |
+| `esign_app` | every running process | `SELECT, INSERT` on `audit_events`, `blobs`, `document_revisions`, `consent_texts`, `reauth_attestations`, `signature_captures`; `SELECT, INSERT, UPDATE` on `adopted_signatures`, where the only permitted `UPDATE` is the one revocation (below), and on the ordinary working tables; `DELETE` on `idempotency_keys` alone; no DDL, no `TRUNCATE` |
 
 The grants are the first line of defence. Database triggers are the second: `BEFORE UPDATE OR
-DELETE` and `BEFORE TRUNCATE` on all five append-only tables, which stop even the owner role. Both
+DELETE` and `BEFORE TRUNCATE` on every append-only table, which stop even the owner role. Both
 are tested (`tests/foundation/test_roles.py`, `tests/audit/test_roles.py`,
 `tests/storage/test_roles.py`).
+
+`adopted_signatures` (the saved signatures of Addendum 1 B) is the one table with a narrower rule
+rather than a flat refusal, and its trigger states it: a row may be updated exactly once, to set
+`revoked_at` *and* `revoke_reason` together; a revoked row is immutable; no column other than those
+two may ever change; `DELETE` and `TRUNCATE` are refused outright. That is deliberate — a
+`signature_captures` row may point at a saved signature, so removing one would orphan evidence
+inside a sealed document. That trigger is the one guard with no direct test of its own (the suite
+proves the behaviour through the API: a revoked row stays, and a replacement revokes exactly the
+row it names); if you are auditing the database rules rather than the service, try a `DELETE` on a
+throwaway row yourself and expect both layers to refuse it (`docs/COMPLIANCE-CHECKLIST.md` G12):
+
+```
+esign_app=>   DELETE FROM adopted_signatures WHERE id = '…';
+ERROR:  permission denied for table adopted_signatures
+esign_owner=> DELETE FROM adopted_signatures WHERE id = '…';
+ERROR:  DELETE on adopted_signatures is forbidden: rows are revoked, never removed
+```
 
 Then:
 
@@ -332,6 +349,10 @@ rather than silent. Request and response bodies are never logged; the access lin
 - [ ] A webhook arrives at the host, its HMAC verifies, and the host filed the sealed PDF
 - [ ] Counsel has approved the consent wording, the certificate of completion and
       `APPROVED_DOCUMENT_TYPES` (see `docs/COMPLIANCE-CHECKLIST.md`)
+- [ ] `REAUTH_SPAN_SECONDS` is `0`, or compliance has recorded a decision to turn it on and
+      `REAUTH_MAX_AGE_SECONDS` was set with it (§7, "The re-authentication span")
+- [ ] If paper archives will be filed: the records rule for the scanned **originals** is written
+      down and matches the `original_disposition` values staff will send (§4, C11)
 
 ---
 
@@ -568,6 +589,24 @@ The `blobs` table keeps the date agreed at first write, because it is append-onl
 the effective one, and the backend is what actually resists deletion. Note that divergence when
 auditing.
 
+### Scans of paper-signed documents
+
+A paper archive (`POST /v1/archives`) is retained exactly like anything else: the scan is a blob of
+kind `scan_pdf`, written with `retain_until` from the schedule for its **document type**, and the
+sealed output, the cover page and the certificate are inside the same regime. Nothing extra to
+configure — but two things to decide, and neither is ours:
+
+- **The document types that may be filed this way** are the same `APPROVED_DOCUMENT_TYPES` list,
+  and a scan of anything else is refused (`document_type_not_approved`). Adding a type for paper
+  filing is the procedure in §7, with the same compliance approval.
+- **What happens to the paper original** is a records-management question this service only
+  *records*. The host states one of `retained`, `returned_to_signer` or `destroyed_per_policy`, it
+  is printed on the cover page and the certificate, and it is in `archive.attested` — but the
+  service has no opinion on whether destroying an original after scanning is lawful for that
+  document type in your state, and it cannot enforce one. Get that rule in writing before staff
+  start sending `destroyed_per_policy` (`docs/COMPLIANCE-CHECKLIST.md` C11). Where the original is
+  gone, the scan plus the attestation is the whole record.
+
 ### What must never touch this data
 
 Write these into whatever governs your cleanup tooling, and check them when any of it changes:
@@ -576,8 +615,9 @@ Write these into whatever governs your cleanup tooling, and check them when any 
 - No account-deletion or right-to-erasure flow that reaches these objects or these tables. A
   signed consent is a medical record, not user-generated content.
 - No database `DELETE` job against `audit_events`, `blobs`, `document_revisions`, `consent_texts`,
-  `reauth_attestations` or `signature_captures`. The grants and triggers will refuse, which is the
-  design, but the job should not exist to be refused.
+  `reauth_attestations`, `signature_captures` or `adopted_signatures`. The grants and triggers will
+  refuse, which is the design, but the job should not exist to be refused. A saved signature is
+  removed by *revoking* it, never by deleting the row (§6.9).
 - The only routine deletion anywhere in this system is `idempotency_keys` older than
   `IDEMPOTENCY_TTL_HOURS`, which the worker does on its own tick. That table holds request digests
   and response ids, no evidence.
@@ -877,6 +917,68 @@ columns). If you see it on an envelope created before that fix, say so in the re
 5. The most likely bypass is a process that did not go through `esign serve` and so kept uvicorn's
    own non-propagating loggers. There is exactly one correct way to start the API.
 
+### 6.9 A saved signature is compromised
+
+Somebody else got at a clinician's account, or a saved signature was captured by the wrong person
+and is now being offered in that person's sessions (Addendum 1 B). The saved signature itself is
+not a credential — it cannot be used without an authenticated session for that user, and a
+clinician's signature additionally needs a re-authentication — so this is usually the *second*
+thing to deal with, after the account.
+
+1. **Deal with the account first**, in the EHR. A saved signature is only reachable from a live
+   session of that `host_user_id`; while the account is compromised, revoking the signature stops a
+   convenience, not an attack. The host should also stop opening sessions for that user.
+2. **Revoke the saved signature.** One call, through the host API, idempotent:
+   ```sh
+   curl -s -X POST "$API/v1/users/<host_user_id>/adopted-signature/revoke" \
+     -H "Authorization: Bearer $ESIGN_API_KEY" -H 'Content-Type: application/json' \
+     -d '{"reason": "suspected compromise"}'
+   # {"revoked": true}     ("revoked": false = there was nothing live to revoke)
+   ```
+   `reason` is for your own logs and is deliberately not stored; the trail records `reason: host`.
+   Send JSON or no body at all — `-d '{}'` with no `Content-Type` is form-encoded and is refused.
+   The signer can do the same from their own session (`POST /v1/signing/adopted-signature/revoke`,
+   recorded as `reason: user`). The next session is offered nothing and must adopt a fresh
+   signature.
+3. **Record what it was and what used it.** Nothing is deleted, so this is answerable afterwards:
+   ```sql
+   -- the row, live or revoked
+   SELECT id, kind, created_at, created_by_session_id, created_in_envelope_id,
+          revoked_at, revoke_reason
+   FROM adopted_signatures
+   WHERE host_id = '<host id>' AND host_user_id = '<host_user_id>'
+   ORDER BY created_at DESC;
+
+   -- every signature that applied it, and on which document
+   SELECT s.envelope_id, c.signer_id, c.field_id, c.created_at
+   FROM signature_captures c JOIN signers s ON s.id = c.signer_id
+   WHERE c.adopted_signature_id = '<adopted signature id>'
+   ORDER BY c.created_at;
+   ```
+   The trail says the same from the other side: `signature.adopted` on the envelope stream of the
+   session that created it, `signature.adoption_revoked` on the `system` stream for that host, and
+   `signer.signed.adopted_signature_id` on every signature that used it.
+   ```sql
+   SELECT occurred_at, event_type, actor_user_id, data
+   FROM audit_events
+   WHERE stream_type = 'system' AND stream_id = '<host id>'
+     AND event_type = 'signature.adoption_revoked'
+   ORDER BY sequence DESC LIMIT 20;
+   ```
+4. **Do not delete the row**, and do not ask the owner role to. The trigger refuses, which is the
+   design: a sealed document's capture points at it, and verification follows that pointer to
+   re-hash what was stamped. A deleted row would turn a verifiable signature into an unverifiable
+   one — the compromise would have destroyed evidence rather than being contained.
+5. **The documents already signed stand until somebody decides otherwise.** Each one still has its
+   own session, consent, re-authentication (if the role required it) and audit chain; the question
+   "was this person really the one signing?" is answered by that evidence, not by the saved image.
+   Re-verify the affected envelopes (`esign verify`), list them for the host, and work with counsel
+   on whether any need to be re-executed — the same conversation as §6.2, with a much smaller blast
+   radius.
+6. If the span is on (§7), note that a compromised session inside the window could sign several
+   documents on one confirmation. `SELECT ... WHERE data->>'reauth_scope' = 'span'` (the query in
+   §7) lists exactly which signatures those were.
+
 ---
 
 ## 7. Routine operations
@@ -910,6 +1012,62 @@ carrying attachments, and one whose definitions are inconsistent — including a
 
 Retiring a version (`POST /v1/templates/{key}/versions/{n}/retire`) stops new envelopes using it and
 touches nothing already signed.
+
+### The re-authentication span
+
+`REAUTH_SPAN_SECONDS` decides whether a clinician re-authenticates once per **document** (the
+default, `0`) or once per **queue of documents** (any value up to 900). Turning it on is not a
+tuning decision: it is the one documented deviation from the guide's per-document rule, and it
+needs a recorded decision from compliance (`docs/COMPLIANCE-CHECKLIST.md` C10) before it is set.
+
+**What changes when it is on.** An attestation made for one of a user's sessions also covers that
+same user's other sessions **on the same host**, for that many seconds after its `auth_time`. Every
+signature still needs its own envelope, session, review, consent and explicit sign action; what it
+no longer needs is its own trip through the host's re-authentication screen.
+
+**Set both windows together.**
+
+```sh
+REAUTH_MAX_AGE_SECONDS=300     # how fresh an attestation must be to cover any signature
+REAUTH_SPAN_SECONDS=300        # how long it may also cover the user's other sessions
+```
+
+An attestation older than `REAUTH_MAX_AGE_SECONDS` covers nothing, span or no span, so the
+effective queue window is the **smaller** of the two. Raising the span alone changes nothing you
+would notice: with the shipped `REAUTH_MAX_AGE_SECONDS=120`, `REAUTH_SPAN_SECONDS=300` still gives
+a two-minute queue. Both are validated at startup (`0 ≤ span ≤ 900`), and `make demo` sets both to
+300 for exactly this reason.
+
+Pick the window from how long a real queue takes, not from what is convenient: long enough that a
+clinician signing five orders is not re-prompted mid-queue, short enough that an unattended
+workstation is not a signing machine. Five minutes is a defensible starting point; anything
+approaching the 900-second cap should be argued for in writing.
+
+**Auditing it afterwards.** Every signature says which attestation covered it and whether it was
+borrowed, so "how often is the span actually used, and how stale were those confirmations?" is one
+query:
+
+```sql
+SELECT date_trunc('day', occurred_at) AS day,
+       data->>'reauth_scope'          AS scope,
+       count(*),
+       max((data->>'reauth_age_seconds')::int) AS oldest_seconds
+FROM audit_events
+WHERE event_type = 'signer.signed' AND data->>'reauth_used' = 'true'
+GROUP BY 1, 2 ORDER BY 1 DESC, 2;
+```
+
+A `span` row whose `oldest_seconds` is near the window is the case a reviewer will ask about; a
+sudden rise in `span` against `session` means the host changed how it drives the queue. A row with
+a **null** scope is a signature recorded before migration `0700`, when `signer.signed` did not yet
+name its attestation — verification reports those as a finding
+(`reauth_attestations_match_trail`) rather than a pass, so they should not appear for anything
+signed after the upgrade. The certificate of completion prints the same fact per signature, in
+words, so nothing here depends on the query being run.
+
+**Turning it off** is setting it back to `0` and restarting: nothing is migrated, nothing already
+signed changes, and every past signature keeps its recorded scope. Do that first and investigate
+afterwards if the span is ever implicated in an incident.
 
 ### Rolling out a new consent disclosure
 
