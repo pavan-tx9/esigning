@@ -74,9 +74,10 @@ _SHORT_SUFFIXES: Final[dict[str, FieldType]] = {
 #: mode to say so in as many words.
 _SIGNING_TYPES: Final[frozenset[str]] = frozenset({"signature"})
 
-#: The marks a signer makes, as opposed to the values a form collects: always required, whatever
-#: the widget's own ``/Ff`` says, because the document asking for a mark is the point of it.
-_MARK_TYPES: Final[frozenset[str]] = frozenset({"signature", "initials"})
+#: The values a form collects, as opposed to the marks a signer makes. These are the only fields
+#: whose ``required`` comes from the widget's own ``/Ff``: a mark or the date beside it is the
+#: document asking for it, whatever flag the generator happened to set.
+_VALUE_TYPES: Final[frozenset[str]] = frozenset({"text", "checkbox"})
 
 #: What a field's generated label says it is. Labels are shown in the signing UI, so they are built
 #: from the role label the host declared in the request body rather than from the widget's name.
@@ -318,7 +319,7 @@ def resolve_named_fields(pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[
             signing_roles.add(role_key)
         # A mark and the date beside it are the document asking for them; only the host's own
         # ``/Ff`` decides whether a text or checkbox field has to be filled in.
-        required = widget.required if field_type in ("text", "checkbox") else True
+        required = widget.required if field_type in _VALUE_TYPES else True
         label = f"{labels.get(role_key, role_key)} {_TYPE_WORDS[field_type]}"[:MAX_LABEL_CHARS]
         fields.append(
             FieldDef(
