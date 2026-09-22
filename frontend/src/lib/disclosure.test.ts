@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { CONSENT } from "@/mocks/db";
 import { type DisclosureBlock, parseDisclosure } from "@/lib/disclosure";
+import { CONSENT } from "@/mocks/db";
 
 const text = (blocks: DisclosureBlock[]) =>
   blocks
@@ -10,7 +10,9 @@ const text = (blocks: DisclosureBlock[]) =>
 
 describe("parseDisclosure", () => {
   it("makes headings out of heading lines, and keeps their words", () => {
-    const blocks = parseDisclosure("# Agreement\n\nSome words.\n\n## Getting a copy\n\nMore words.");
+    const blocks = parseDisclosure(
+      "# Agreement\n\nSome words.\n\n## Getting a copy\n\nMore words.",
+    );
     expect(blocks).toEqual([
       { kind: "heading", level: 2, text: "Agreement" },
       { kind: "paragraph", text: "Some words." },
@@ -27,7 +29,9 @@ describe("parseDisclosure", () => {
   });
 
   it("gathers bullets into one list, continuation lines included", () => {
-    const blocks = parseDisclosure("You need:\n\n- a browser,\n- a screen, so you can\n  sign, and\n- a printer.");
+    const blocks = parseDisclosure(
+      "You need:\n\n- a browser,\n- a screen, so you can\n  sign, and\n- a printer.",
+    );
     expect(blocks).toEqual([
       { kind: "paragraph", text: "You need:" },
       { kind: "list", items: ["a browser,", "a screen, so you can sign, and", "a printer."] },

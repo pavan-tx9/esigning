@@ -105,7 +105,9 @@ test.describe("a patient with a phone in the waiting room", () => {
     // The webhook arrives, the EHR verifies it and files the sealed PDF without being asked.
     await expect(page.getByTestId("filed-link")).toBeVisible({ timeout: 120_000 });
     await page.getByTestId("filed-link").click();
-    await expect(page.getByRole("heading", { name: "Acknowledgement of privacy practices" })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "Acknowledgement of privacy practices" }),
+    ).toBeVisible();
     await shot(page, "phone-06-filed-in-the-chart");
 
     // And anybody can make the service re-check the seal, the hashes and the chain on the spot.
@@ -123,9 +125,13 @@ test("the webhook log is verified deliveries and nothing about the patient", asy
 
   const rows = page.locator('[data-testid="webhook-row"]');
   await expect(rows.first()).toBeVisible();
-  const verified = await rows.evaluateAll((items) => items.map((i) => (i as HTMLElement).dataset.verified));
+  const verified = await rows.evaluateAll((items) =>
+    items.map((i) => (i as HTMLElement).dataset.verified),
+  );
   expect(verified).not.toContain("false");
-  const events = await rows.evaluateAll((items) => items.map((i) => (i as HTMLElement).dataset.event));
+  const events = await rows.evaluateAll((items) =>
+    items.map((i) => (i as HTMLElement).dataset.event),
+  );
   expect(events).toContain("envelope.completed");
   expect(events).toContain("envelope.sealed");
 
@@ -158,14 +164,18 @@ test.describe("a procedure consent needing three people", () => {
       await fillEveryField(frame);
       await confirmAndSign(frame);
 
-      await expect(frame.getByTestId("waiting-on-others")).toContainText("the witness and the clinician");
+      await expect(frame.getByTestId("waiting-on-others")).toContainText(
+        "the witness and the clinician",
+      );
       await shot(page, "tablet-04-waiting-on-others");
     });
   });
 
   test("the clinician cannot jump the queue", async ({ page }) => {
     await signIn(page, "priya");
-    await expect(task(page, "Consent to a procedure").getByTestId("task-waiting")).toContainText("witness");
+    await expect(task(page, "Consent to a procedure").getByTestId("task-waiting")).toContainText(
+      "witness",
+    );
   });
 
   test("the witness signs next", async ({ page }) => {

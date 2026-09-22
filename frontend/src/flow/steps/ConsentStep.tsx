@@ -4,8 +4,21 @@ import { Button, CheckRow, Notice, Sheet, StepScreen } from "@/components/ui";
 import { type DisclosureBlock, parseDisclosure } from "@/lib/disclosure";
 import { isNetworkError, postConsent, type SigningSession, signingKeys } from "@/lib/signing-api";
 
-const blockKey = (block: DisclosureBlock) =>
-  (block.kind === "list" ? block.items.join(" ") : block.text).slice(0, 48);
+/**
+ * A key for each block of the disclosure. The body is immutable stored text, so the blocks never
+ * reorder; the key is the block's own content, with a counter so that two identical paragraphs
+ * (a repeated "Yes." for instance) still get distinct keys.
+ */
+const keyedBlocks = (blocks: DisclosureBlock[]) => {
+  const seen = new Map<string, number>();
+  return blocks.map((block) => {
+    const content = block.kind === "list" ? block.items.join(" ") : block.text;
+    const base = `${block.kind}:${content.slice(0, 48)}`;
+    const count = seen.get(base) ?? 0;
+    seen.set(base, count + 1);
+    return { key: count === 0 ? base : `${base}#${count}`, block };
+  });
+};
 
 /**
  * One block of the stored disclosure. The text is shown exactly as it is stored; only the marker
@@ -51,7 +64,7 @@ export function ConsentStep({ session, onContinue, onPreferPaper }: ConsentStepP
     },
   });
 
-  const blocks = parseDisclosure(session.consent.body);
+  const blocks = keyedBlocks(parseDisclosure(session.consent.body));
 
   return (
     <StepScreen
@@ -71,8 +84,8 @@ export function ConsentStep({ session, onContinue, onPreferPaper }: ConsentStepP
           data-testid="disclosure"
           className="mt-3 space-y-3 text-ink-700 leading-relaxed"
         >
-          {blocks.map((block, index) => (
-            <Block key={`${block.kind}:${index}:${blockKey(block)}`} block={block} />
+          {blocks.map(({ key, block }) => (
+            <Block key={key} block={block} />
           ))}
         </div>
         <p className="mt-4 text-ink-500 text-sm">Version {session.consent.version}</p>

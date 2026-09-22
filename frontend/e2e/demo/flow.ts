@@ -26,7 +26,9 @@ export async function signIn(page: Page, username: string): Promise<void> {
 }
 
 export function task(page: Page, title: string) {
-  return page.locator('[data-testid="task"]').filter({ has: page.getByRole("heading", { name: title }) });
+  return page
+    .locator('[data-testid="task"]')
+    .filter({ has: page.getByRole("heading", { name: title }) });
 }
 
 export async function openTask(page: Page, title: string): Promise<FrameLocator> {
@@ -43,11 +45,17 @@ export async function readEveryPage(frame: FrameLocator): Promise<number> {
   const pages = await frame.locator("[data-page]").count();
   expect(pages).toBeGreaterThan(0);
   for (let n = 1; n <= pages; n += 1) {
-    await frame.locator(`[data-page="${n}"]`).evaluate((node) => node.scrollIntoView({ block: "start" }));
+    await frame
+      .locator(`[data-page="${n}"]`)
+      .evaluate((node) => node.scrollIntoView({ block: "start" }));
     await expect
-      .poll(async () => (await frame.getByTestId("page-progress").getAttribute("data-seen"))?.split(","), {
-        timeout: 30_000,
-      })
+      .poll(
+        async () =>
+          (await frame.getByTestId("page-progress").getAttribute("data-seen"))?.split(","),
+        {
+          timeout: 30_000,
+        },
+      )
       .toContain(String(n));
   }
   await expect(frame.getByTestId("page-progress")).toContainText("All pages seen");
@@ -142,7 +150,9 @@ export async function reauthenticate(page: Page, frame: FrameLocator): Promise<v
 
 /** Every message that crossed the iframe boundary, as the host page recorded it. */
 export const heard = (page: Page) =>
-  page.locator("#log li").evaluateAll((items) => items.map((item) => (item as HTMLElement).dataset.message));
+  page
+    .locator("#log li")
+    .evaluateAll((items) => items.map((item) => (item as HTMLElement).dataset.message));
 
 /** A sealed PDF, as bytes, with the cheap structural checks a reader can do by eye. */
 export function looksSealed(pdf: Buffer, envelopeId?: string): void {
