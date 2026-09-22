@@ -174,7 +174,10 @@ class SignerRoleBody(_Body):
     label: str = Field(max_length=120)
     allowed_capacities: list[Capacity] = Field(min_length=1, max_length=6)
     requires_reauth: bool = False
-    order_index: int = Field(default=0, ge=0, le=1_000)
+    # No default. Two roles that both left it out would collide on 0 and be refused for an
+    # "ambiguous" order the host never chose; a default that is only ever right for a one-role
+    # document is not a default.
+    order_index: int = Field(ge=0, le=1_000)
     required: bool = True
 
     def to_contract(self) -> SignerRoleDef:

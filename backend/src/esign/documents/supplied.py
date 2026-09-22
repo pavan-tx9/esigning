@@ -19,10 +19,16 @@ Two rules worth stating out loud, because they are what keeps this from being a 
   role it belongs to, never because it sits near the bottom of the last page. A widget no role
   claims is dropped here and removed from the bytes by :func:`flatten_supplied`; it never becomes
   a field by accident.
-* **The host's strings stay out of the error.** ``fields_unresolved`` names the signer roles the
-  host declared in its own request body and nothing from inside the file: a widget name in a
-  per-patient report is host-generated text of unknown provenance, and an error message goes into
-  logs and back over the wire.
+* **The host's strings stay out of the error, and out of the evidence.** ``fields_unresolved``
+  names the signer roles the host declared in its own request body and nothing from inside the
+  file: a widget name in a per-patient report is host-generated text of unknown provenance, and an
+  error message goes into logs and back over the wire. The same reasoning decides what a field's
+  *id* is: an id is stored on the envelope, served to the signing UI and written into
+  ``signer.signed.data.captures[].field_id``, which is append-only and has no delete path. So an id
+  is built from the role key and the field type -- both values the host sent in the request body,
+  both already in the trail -- and a widget name is never any part of one. A generator that
+  uniquified its widget names per document (``clinician__mrn_00991122_signature``) would otherwise
+  write that identifier into the audit trail for ever.
 """
 
 from __future__ import annotations
@@ -34,9 +40,9 @@ from typing import Any, Final
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NameObject, NumberObject
 
 from esign.contracts import FieldDef, FieldType, Rect, SignerRoleDef, ValidationFailed
-from esign.documents.definitions import MAX_ID_CHARS, MAX_LABEL_CHARS
+from esign.documents.definitions import ID_PATTERN, MAX_ID_CHARS, MAX_LABEL_CHARS
 from esign.documents.geometry import PageGeometry
-from esign.documents.pdfutil import geometries, open_reader, sanitize_document, to_bytes, writer_from_bytes
+from esign.documents.pdfutil import geometries, open_reader, sanitized_bytes, writer_from_bytes
 
 __all__ = ["flatten_supplied", "resolve_named_fields"]
 
@@ -90,7 +96,12 @@ _TYPE_WORDS: Final[dict[str, str]] = {
 }
 
 #: ``/FT`` to the field type meant when the name carries no suffix of its own.
-_FT_TYPES: Final[dict[str, FieldType]] = {"/Btn": "checkbox", "/Tx": "text", "/Ch": "text", "/Sig": "signature"}
+#:
+#: ``/Sig`` is deliberately absent. A supplied document may not contain an AcroForm signature field
+#: at all -- ``inspect_supplied_pdf`` refuses one, empty placeholder or not, long before this map
+#: is consulted -- so an entry for it would imply support the hygiene rules forbid. A host places a
+#: signature slot by naming an ordinary text widget ``<role_key>_signature``.
+_FT_TYPES: Final[dict[str, FieldType]] = {"/Btn": "checkbox", "/Tx": "text", "/Ch": "text"}
 
 #: ``/Ff`` bit 2 (PDF 12.7.3.1): the field must have a value before the form is submitted.
 _FIELD_FLAG_REQUIRED: Final[int] = 1 << 1
@@ -107,12 +118,13 @@ def _resolve(value: Any) -> Any:
 
 
 def _normalise(raw: str) -> str:
-    """A widget's name as a field id: lowercase, ``[a-z0-9_]`` only.
+    """A widget's name as a matching key: lowercase, ``[a-z0-9_]`` only.
 
     Partial field names are joined with ``.`` per the PDF spec, and a generator may use characters
-    an id cannot hold, so every run of anything else collapses to a single underscore. Two widgets
-    whose names differ only in those characters therefore collide; :func:`_unique` breaks the tie,
-    and the ids stay inside ``[a-z0-9_]+`` where ``validate_definitions`` needs them.
+    a role key cannot hold, so every run of anything else collapses to a single underscore. That
+    makes ``Clinician.Signature`` and ``clinician_signature`` the same name to us, which is what a
+    host would reasonably expect. The result is compared against the declared role keys and then
+    discarded: it is never any part of a field id (see the module docstring).
     """
     return _NON_ID.sub("_", raw.lower()).strip("_")
 
@@ -278,8 +290,8 @@ def _unique(candidate: str, taken: set[str]) -> str:
     """``candidate``, shortened to fit and suffixed until it is not already used.
 
     Ids have to be unique within the envelope and no longer than ``validate_definitions`` allows.
-    A host whose report puts the same field name on two pages gets two fields rather than a
-    rejection, because two widgets *are* two places to sign.
+    A host whose report puts two signature widgets for one role on two pages gets two fields rather
+    than a rejection, because two widgets *are* two places to sign; the second is ``..._2``.
     """
     base = candidate[:MAX_ID_CHARS] or "field"
     if base not in taken:
@@ -289,8 +301,8 @@ def _unique(candidate: str, taken: set[str]) -> str:
         attempt = f"{base[: MAX_ID_CHARS - len(suffix)]}{suffix}"
         if attempt not in taken:
             return attempt
-    raise ValidationFailed(  # pragma: no cover - 999 widgets sharing one normalised name
-        "the document has too many fields with the same name", code="fields_unresolved"
+    raise ValidationFailed(  # pragma: no cover - 999 widgets of one type for one role
+        "the document has too many fields of the same kind for one role", code="fields_unresolved"
     )
 
 
@@ -298,6 +310,20 @@ def resolve_named_fields(pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[
     """Implements ``DocumentService.resolve_named_fields``."""
     if not signer_roles:
         raise ValidationFailed("no signer roles were declared", code="fields_unresolved")
+
+    # A key that is not a valid id is answered *here*, before a single widget is looked at, and
+    # with the code the explicit-rects path gives it. Matching is by prefix against normalised
+    # (lowercase, ``[a-z0-9_]``) widget names, so a key like ``Clinician`` could never claim
+    # anything: the host would have been told "the document has no signature block for one of the
+    # roles you declared" about a document whose signature block is exactly where they put it,
+    # and the capital letter -- which ``validate_definitions`` would have named a moment later --
+    # would never have been mentioned. Both modes now refuse the same key the same way.
+    malformed = sorted({role.key for role in signer_roles if not ID_PATTERN.match(role.key)})
+    if malformed:
+        raise ValidationFailed(
+            f"signer role key(s) must match [a-z][a-z0-9_]*: {', '.join(malformed)}",
+            code="supplied_definitions_invalid",
+        )
 
     # Longest first: see ``_claim``. Sorting by key as well keeps the order deterministic when two
     # role keys are the same length, so the same document always resolves the same way.
@@ -313,7 +339,11 @@ def resolve_named_fields(pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[
         if claimed is None:
             continue  # not ours: dropped here, and removed from the bytes by flatten_supplied
         role_key, field_type = claimed
-        field_id = _unique(widget.name, taken)
+        # The id is a function of the role key and the field type, never of ``widget.name``. The
+        # name decided *which* role and *which* type a moment ago and its job is done: it is host
+        # text from inside a per-patient file, and an id ends up in the append-only trail. See the
+        # module docstring.
+        field_id = _unique(f"{role_key}_{field_type}", taken)
         taken.add(field_id)
         if field_type in _SIGNING_TYPES:
             signing_roles.add(role_key)
@@ -352,8 +382,13 @@ def flatten_supplied(pdf: bytes) -> bytes:
     # appearance into the page would draw the empty signature box -- ink the host did not put in
     # the report -- into the bytes that are about to be hashed as "what the signer was shown". The
     # widgets are removed, not printed.
-    sanitize_document(writer, flatten_annotations=False)
-    out = to_bytes(writer)
+    #
+    # ``sanitized_bytes`` is what makes "removed" true rather than "unlinked": it re-materialises
+    # from the sanitised page tree, so a widget dictionary and its appearance stream -- with
+    # whatever a report generator put in ``/V`` or ``/TU`` (an MRN, a name, a date) -- are not
+    # sitting invisibly inside the write-once revision 1. Every revision this service stores is
+    # produced that way; this path is only the one where the input is the host's own file.
+    out = sanitized_bytes(writer, flatten_annotations=False)
 
     after = len(open_reader(out).pages)
     if after != before:

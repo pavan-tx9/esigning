@@ -28,11 +28,16 @@ from esign.documents import build_document_service, pdfutil
 from tests.documents.helpers import (
     NamedWidget,
     generated_report,
+    inflated_streams,
     make_pdf,
+    page_content,
     pdf_with_acroform_javascript,
+    pdf_with_applied_signature,
     pdf_with_embedded_file,
+    pdf_with_inked_annotation,
     pdf_with_javascript,
     pdf_with_launch_action,
+    pdf_with_link_annotation,
     pdf_with_named_widgets,
     pdf_with_page_additional_actions,
     pdf_with_signature_field,
@@ -78,10 +83,12 @@ def test_the_short_names_map_to_the_role_and_the_type(documents: DocumentService
     )
     fields = _by_id(documents.resolve_named_fields(pdf, [CLINICIAN]))
 
-    assert set(fields) == {"clinician_signature", "clinician_initials", "clinician_date"}
+    # The id is the role key and the field type, not the widget's name. See
+    # ``test_a_widget_name_never_becomes_a_field_id``.
+    assert set(fields) == {"clinician_signature", "clinician_initials", "clinician_date_signed"}
     assert fields["clinician_signature"].type == "signature"
     assert fields["clinician_initials"].type == "initials"
-    assert fields["clinician_date"].type == "date_signed"
+    assert fields["clinician_date_signed"].type == "date_signed"
     assert all(field.signer_role == "clinician" for field in fields.values())
     assert all(field.page == 1 for field in fields.values())
 
@@ -111,8 +118,11 @@ def test_the_double_underscore_form_takes_an_optional_type_suffix(
             NamedWidget(name=name, rect=(72.0, 200.0, 292.0, 250.0), ft=ft),
         ]
     )
-    fields = _by_id(documents.resolve_named_fields(pdf, [CLINICIAN]))
-    assert fields[name].type == expected
+    # In widget order: the block's own signature first, then the one this case is about. Read by
+    # position rather than by id, because ids are built from the role and the type and two
+    # signature widgets for one role are ``clinician_signature`` and ``clinician_signature_2``.
+    fields = documents.resolve_named_fields(pdf, [CLINICIAN])
+    assert [field.type for field in fields] == ["signature", expected]
 
 
 def test_a_hierarchical_field_name_resolves_through_its_parent(documents: DocumentService) -> None:
@@ -201,6 +211,26 @@ def test_a_role_with_no_signature_field_is_refused(documents: DocumentService) -
     assert "clinician" not in str(excinfo.value)
 
 
+@pytest.mark.parametrize("key", ["Clinician", "clinician-2", "attending clinician", "2nd_clinician", ""])
+def test_a_role_key_that_is_not_an_id_is_refused_as_a_definition_problem(documents: DocumentService, key: str) -> None:
+    """Not ``fields_unresolved``: the key, not the document, is what is wrong.
+
+    Widget names are matched after being normalised to ``[a-z0-9_]``, so a key with a capital
+    letter, a hyphen or a space can never claim anything. Answering "the document has no signature
+    block for one of the roles you declared" would send an integrator looking at a report whose
+    signature block is exactly where they put it. ``supplied_definitions_invalid`` is what the
+    explicit-rects path already answers for the same key, and what `docs/INTEGRATION.md` §1b
+    promises for it.
+    """
+    pdf = pdf_with_named_widgets([NamedWidget(name="clinician_signature", rect=SIGNATURE_RECT)])
+    role = SignerRoleDef(
+        key=key, label="Attending", allowed_capacities=("clinician",), requires_reauth=True, order_index=0
+    )
+    with pytest.raises(ValidationFailed) as excinfo:
+        documents.resolve_named_fields(pdf, [role])
+    assert excinfo.value.code == "supplied_definitions_invalid"
+
+
 def test_a_document_with_no_form_at_all_is_refused(documents: DocumentService) -> None:
     with pytest.raises(ValidationFailed) as excinfo:
         documents.resolve_named_fields(make_pdf(pages=3), [CLINICIAN])
@@ -217,6 +247,30 @@ def test_the_refusal_never_echoes_a_widget_name(documents: DocumentService) -> N
         documents.resolve_named_fields(pdf, [CLINICIAN])
     assert "00441" not in str(excinfo.value)
     assert "hodgkins" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "widget_name",
+    [
+        "clinician__mrn_00991122_signature",
+        "clinician__hodgkins_sarah_j_signature",
+        "clinician__2026-01-01_signature",
+    ],
+)
+def test_a_widget_name_never_becomes_a_field_id(documents: DocumentService, widget_name: str) -> None:
+    """A field id is evidence, so it is built from the request body and never from the file.
+
+    The id reaches ``envelopes.field_definitions``, the signing UI and -- the part that cannot be
+    undone -- ``signer.signed.data.captures[].field_id`` in the append-only trail, where SPEC
+    section 4 says a name, a date of birth or free text can never appear. A report generator that
+    uniquifies widget names per document (an MRN, a surname, a date of service) is doing the normal
+    thing; it must not be able to write that into the evidence chain. Both halves of the id are
+    values the host sent us: the role key it declared and the type we resolved.
+    """
+    pdf = pdf_with_named_widgets([NamedWidget(name=widget_name, rect=SIGNATURE_RECT)])
+    (field,) = documents.resolve_named_fields(pdf, [CLINICIAN])
+    assert field.id == "clinician_signature"
+    assert field.type == "signature"
 
 
 def test_an_initials_only_role_is_refused_and_the_role_is_named(documents: DocumentService) -> None:
@@ -257,10 +311,12 @@ def test_required_follows_the_field_flag_for_value_fields(documents: DocumentSer
             NamedWidget(name="clinician__aside_text", rect=(72.0, 300.0, 292.0, 350.0)),
         ]
     )
-    fields = _by_id(documents.resolve_named_fields(pdf, [CLINICIAN]))
-    assert fields["clinician_signature"].required is True
-    assert fields["clinician__note_text"].required is True
-    assert fields["clinician__aside_text"].required is False
+    fields = documents.resolve_named_fields(pdf, [CLINICIAN])
+    assert [(field.id, field.required) for field in fields] == [
+        ("clinician_signature", True),
+        ("clinician_text", True),
+        ("clinician_text_2", False),
+    ]
 
 
 def test_labels_are_built_from_the_declared_role(documents: DocumentService) -> None:
@@ -403,7 +459,13 @@ def test_explicit_rects_are_validated_against_the_real_page_sizes(documents: Doc
         (pdf_with_xfa, "supplied_xfa"),
         (pdf_with_embedded_file, "supplied_embedded_file"),
         (pdf_with_launch_action, "supplied_forbidden_action"),
-        (pdf_with_signature_field, "supplied_already_signed"),
+        # An *empty* AcroForm signature field is the integration trap: docs/INTEGRATION.md
+        # Â§1b says to name a widget ``<role_key>_signature``, and the natural way to place one
+        # in a PDF toolkit is ``/FT /Sig``. It is refused -- but as a signature field, not as a
+        # signature, so the integrator is not sent looking for a signature nobody made.
+        (pdf_with_signature_field, "supplied_signature_field"),
+        (pdf_with_applied_signature, "supplied_already_signed"),
+        (pdf_with_inked_annotation, "supplied_annotation_not_removable"),
     ],
 )
 def test_forbidden_features_are_refused_on_a_supplied_document(
@@ -412,6 +474,52 @@ def test_forbidden_features_are_refused_on_a_supplied_document(
     with pytest.raises(ValidationFailed) as excinfo:
         documents.inspect_supplied_pdf(builder())  # type: ignore[operator]
     assert excinfo.value.code == code
+
+
+def test_an_annotation_that_carries_no_ink_is_still_allowed_through_intake(documents: DocumentService) -> None:
+    """``/Link`` and ``/Popup`` draw nothing of their own, so dropping them loses nothing.
+
+    The same exemption ``pdfutil._flatten_page_annotations`` makes on the template path, and the
+    reason the refusal above is about *ink* rather than about annotations in general.
+    """
+    assert documents.inspect_supplied_pdf(pdf_with_link_annotation()).page_count == 1
+
+
+@pytest.mark.parametrize("flags", [2, 32])
+def test_an_annotation_no_reader_draws_is_allowed_through_intake(documents: DocumentService, flags: int) -> None:
+    """Hidden (bit 2) and NoView (bit 6): nothing is displayed, so nothing is lost."""
+    assert documents.inspect_supplied_pdf(pdf_with_inked_annotation(flags=flags)).page_count == 1
+
+
+@pytest.mark.parametrize("subtype", ["/FreeText", "/Stamp", "/Square", "/Ink", "/Highlight"])
+def test_a_visible_mark_drawn_as_an_annotation_is_refused_at_intake(documents: DocumentService, subtype: str) -> None:
+    """An "AMENDED -- see addendum" note, a redaction box, a PROVISIONAL stamp.
+
+    ``flatten_supplied`` removes annotations without rendering them -- which is what the addendum
+    specifies and what keeps an empty signature box out of the presented bytes. The consequence is
+    that ink drawn as an annotation would silently not be there: the host's reader shows the mark,
+    the bytes the clinician reads and attests to do not, and ``document.supplied``'s two differing
+    hashes look exactly like a legitimate flattening. So the file is refused while the host can
+    still fix it, rather than quietly altered.
+    """
+    with pytest.raises(ValidationFailed) as excinfo:
+        documents.inspect_supplied_pdf(pdf_with_inked_annotation(subtype))
+    assert excinfo.value.code == "supplied_annotation_not_removable"
+
+
+def test_a_template_may_still_carry_an_annotation_because_its_ink_is_burned_in(
+    documents: DocumentService,
+) -> None:
+    """The template path keeps its behaviour: ``prepare`` draws the appearance into the page."""
+    pdf = pdf_with_inked_annotation()
+    assert documents.inspect_template_pdf(pdf).page_count == 1
+    out = documents.prepare(pdf, [], {})
+    # The mark ends up in the *page's own* content stream, which is why losing the annotation costs
+    # a template nothing and costs a supplied document the mark. Read from the page rather than
+    # from the whole file: the annotation's appearance stream is no longer in the bytes at all
+    # (``pdfutil.sanitized_bytes``), so the one copy left is the one a reader draws. ``-`` is
+    # written as the escape ``\055`` inside a literal string.
+    assert b"(AMENDED 2026-01-01) Tj" in page_content(out).replace(b"\\055", b"-")
 
 
 def test_a_supplied_documents_widgets_are_allowed_through_intake(documents: DocumentService) -> None:
@@ -499,6 +607,36 @@ def test_flattening_removes_the_widgets_and_the_form(documents: DocumentService)
         assert "/Annots" not in page
 
 
+def test_flattening_leaves_no_widget_object_anywhere_in_the_bytes(documents: DocumentService) -> None:
+    """Revision 1 is the hash of record for what the signer was shown; nothing may hide in it.
+
+    A report generator that fills its own form puts an MRN, a name or a date of birth in a widget's
+    ``/V`` and its tooltip, and draws it in an appearance stream. Deleting ``/Annots`` and
+    ``/AcroForm`` unlinks those objects but does not remove them from the file, so without the
+    round trip in ``flatten_supplied`` the text is still physically present in the write-once
+    presented revision -- invisible to every reader, permanent, and served to the first signer.
+    """
+    pdf = pdf_with_named_widgets(
+        [
+            NamedWidget(name="clinician_signature", rect=SIGNATURE_RECT),
+            NamedWidget(
+                name="mrn",  # unclaimed: no role wants it, so it is dropped rather than resolved
+                rect=(72.0, 300.0, 292.0, 330.0),
+                value="LEAK-MRN-00991122",
+                tooltip="TOOLTIP-SECRET",
+            ),
+        ]
+    )
+    assert b"LEAK-MRN-00991122" in inflated_streams(pdf)
+
+    out = documents.flatten_supplied(pdf)
+    assert b"/Widget" not in out
+    assert b"/AcroForm" not in out
+    inflated = inflated_streams(out)
+    assert b"LEAK-MRN-00991122" not in inflated
+    assert b"TOOLTIP-SECRET" not in inflated
+
+
 def test_flattening_keeps_the_page_content(documents: DocumentService) -> None:
     pdf = generated_report(pages=4, widgets=[NamedWidget(name="clinician_signature", rect=SIGNATURE_RECT, page=4)])
     out = documents.flatten_supplied(pdf)
@@ -542,11 +680,11 @@ def test_a_flattening_that_changed_the_page_count_is_refused(
     """The guard is on the produced bytes, not on the intention, so it is provoked by making the
     step that produces them lose a page."""
 
-    def losing_a_page(writer: PdfWriter, **kwargs: object) -> None:
-        pdfutil.sanitize_document(writer, **kwargs)  # type: ignore[arg-type]
+    def losing_a_page(writer: PdfWriter, **kwargs: object) -> bytes:
         writer.remove_page(len(writer.pages) - 1)
+        return pdfutil.sanitized_bytes(writer, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("esign.documents.supplied.sanitize_document", losing_a_page)
+    monkeypatch.setattr("esign.documents.supplied.sanitized_bytes", losing_a_page)
     with pytest.raises(ValidationFailed) as excinfo:
         documents.flatten_supplied(make_pdf(pages=3))
     assert excinfo.value.code == "supplied_flatten_changed_pages"

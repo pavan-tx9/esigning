@@ -14,6 +14,7 @@ from esign.config import Settings
 from esign.contracts import DocumentService, ValidationFailed
 from tests.documents.helpers import (
     make_pdf,
+    pdf_with_applied_signature,
     pdf_with_embedded_file,
     pdf_with_javascript,
     pdf_with_launch_action,
@@ -50,7 +51,8 @@ def test_page_sizes_follow_the_cropbox(documents: DocumentService) -> None:
         (pdf_with_xfa, "template_xfa"),
         (pdf_with_embedded_file, "template_embedded_file"),
         (pdf_with_launch_action, "template_forbidden_action"),
-        (pdf_with_signature_field, "template_already_signed"),
+        (pdf_with_signature_field, "template_signature_field"),
+        (pdf_with_applied_signature, "template_already_signed"),
     ],
 )
 def test_forbidden_features_are_refused(documents: DocumentService, builder: object, code: str) -> None:

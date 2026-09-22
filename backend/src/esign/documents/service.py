@@ -29,7 +29,7 @@ from esign.documents import certificate as certificate_module
 from esign.documents import definitions as definitions_module
 from esign.documents import images, inspection, stamping, supplied
 from esign.documents.fonts import ensure_fonts_registered
-from esign.documents.pdfutil import open_reader, sanitize_document, to_bytes, writer_from_bytes
+from esign.documents.pdfutil import open_reader, sanitized_bytes, writer_from_bytes
 from esign.logging import get_logger
 
 __all__ = ["PdfDocumentService"]
@@ -100,10 +100,14 @@ class PdfDocumentService:
         """The template hygiene rules under the supplied-document bounds (Addendum 2).
 
         A generated report is 20 to 30 pages where a template is one to five, so the bounds differ;
-        the rules do not. Widgets are still allowed through here on purpose -- they are how
+        one rule differs too. Widgets are still allowed through here on purpose -- they are how
         ``resolve_named_fields`` finds the signature block -- and ``flatten_supplied`` removes them
         before the bytes become revision 1. A widget carrying JavaScript, in ``/AA`` or anywhere
         else, is still refused: ``inspection`` walks the whole object graph, AcroForm included.
+
+        Any *other* visible annotation is refused here and not on the template path, because
+        ``flatten_supplied`` drops annotations without drawing them: accepting a ``/FreeText``
+        "AMENDED" note would store a revision 1 the host's reader shows and ours does not.
         """
         bounds = self._settings.model_copy(
             update={
@@ -112,7 +116,7 @@ class PdfDocumentService:
             }
         )
         try:
-            info = inspection.inspect_template(pdf, bounds)
+            info = inspection.inspect_template(pdf, bounds, reject_inked_annotations=True)
         except ValidationFailed as exc:
             raise ValidationFailed("the supplied document was refused", code=_recoded(exc.code, "supplied")) from None
         log.info("documents.supplied_inspected", page_count=info.page_count, sha256=info.sha256, size_bytes=len(pdf))
@@ -207,8 +211,7 @@ class PdfDocumentService:
             raise ValidationFailed("certificate has no pages", code="certificate_empty")
         for page in certificate_writer.pages:
             writer.add_page(page)
-        sanitize_document(writer)
-        out = to_bytes(writer)
+        out = sanitized_bytes(writer)
         log.info(
             "documents.finalized",
             page_count=len(writer.pages),

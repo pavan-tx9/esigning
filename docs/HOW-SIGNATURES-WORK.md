@@ -100,6 +100,25 @@ revision N+1 "sealed"  ──────────▶   envelopes.sealed_sha2
                                      document.sealed.signer_cert_sha256
 ```
 
+For a host-supplied document (Addendum 2, section 6) the first two rows of that diagram are the
+only thing that differs — everything from revision 2 down is identical:
+
+```
+host's upload  ──sha256──▶  blob (kind supplied_pdf)
+                            document.supplied.upload_sha256
+      │ flatten_supplied (every widget and annotation removed, nothing drawn, nothing added)
+      ▼
+revision 1 "supplied"  ───▶  envelopes.presented_sha256
+                             document_revisions(1), kind 'supplied', page_count
+                             blob (kind presented_pdf)
+                             document.supplied.document_sha256 = .presented_sha256
+                             document.presented / document.viewed, exactly as above
+```
+
+There is no template and no `document.prepared`; `document.supplied` is the event that says which
+bytes revision 1 is, and it carries *both* ends of the transformation so that "we showed the signer
+what you sent us" is checkable rather than asserted.
+
 `signer.signed` records all three hashes deliberately. In a parallel envelope another signer may
 move the document between the moment this one read it and the moment they sign, and that has to be
 visible rather than smoothed over — which is also why signing is refused (`409 not_viewed`) when
@@ -615,6 +634,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 |---|---|
 | `envelope.created` | which template version, which document type, how many signers, when the clock says it started |
 | `document.prepared` | the hash of the exact bytes the server rendered, and how many prefill fields went in (a count, never the values) |
+| `document.supplied` | Addendum 2, and a host document's `document.prepared`: the hash of the upload the host sent (`upload_sha256`), the hash of the flattened bytes revision 1 became (`presented_sha256`, which is also the event's own `document_sha256`), the `page_count` persisted on the revision, whether the fields came from the PDF's widget names or the request's rects (`field_source`), the digest of the signer roles the envelope was created with (`signer_roles_sha256`), and the host's opaque `host_document_ref`. No prefill exists on this path, and nothing from inside the file — not a widget name, not a field value — appears anywhere in it |
 | `session.created` | the host's attestation: how and when this person authenticated, and the kiosk context |
 | `session.rejected` | a refused attempt to open a session. Committed separately, because the refused request is rolled back and the refusal is still evidence |
 | `document.presented` | the hash of the bytes actually served to this session |
@@ -653,8 +673,11 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `capture_images_intact` | A stored drawn-signature image is missing or no longer hashes to its digest |
 | `captures_match_trail` | The capture `signer.signed` recorded is gone, or the row now points at a different image. The ink was swapped after the fact. An `adopted` capture (a saved signature, Addendum 1 B) keeps no ink of its own and points at the `adopted_signatures` row; the check follows that pointer, so the saved image is re-hashed and compared too |
 | `reauth_attestations_match_trail` | A signature that says it rested on a re-authentication names an attestation row that is missing, made for another user or host, made in a different session than `reauth_scope` claims, or whose method or `auth_time` (to within five seconds of `occurred_at - reauth_age_seconds`) is not what `signer.signed` recorded (Addendum 1 C) |
-| `envelope_row_matches_trail` | `created_at`, `document_type`, `template_version_id`, template key or version differ from what `envelope.created` recorded. For a paper archive the same check runs against `archive.created` and `archive.attested`: the filing and attestation times, the document type, and the `attestation` column's staff id, statement, disposition and paper-signer count (the scan's own hash is covered by `revision_1_scan_hash` and `trail_presented_hash`). That column is an ordinary jsonb column the application can update, so it is compared exactly as a signer row is |
+| `envelope_row_matches_trail` | `created_at`, `document_type`, `template_version_id`, template key or version differ from what `envelope.created` recorded. For a paper archive the same check runs against `archive.created` and `archive.attested`: the filing and attestation times, the document type, and the `attestation` column's staff id, statement, disposition and paper-signer count (the scan's own hash is covered by `revision_1_scan_hash` and `trail_presented_hash`). That column is an ordinary jsonb column the application can update, so it is compared exactly as a signer row is. For a host document (Addendum 2) the comparison is against `envelope.created` and `document.supplied`: `template_version_id`, `template_key` and `template_version` must all be absent, `host_document_ref` must be the one recorded, and the SHA-256 of `envelopes.field_definitions['signer_roles']` must equal `document.supplied.signer_roles_sha256` — that column is UPDATE-able and holds the `requires_reauth` flags the certificate prints, so the digest is what stands in for a template version's immutability |
 | `signer_rows_match_trail` | A `signers` row disagrees with the trail: a timestamp more than 60 seconds from the event that recorded it, a status that does not match whether `signer.signed` exists, a rewritten `role_key`, `capacity`, `on_behalf_of` or `consent_text_id`, or no `document.viewed` covering the revision the signature was built on |
+| `supplied_document_recorded` | (Addendum 2, host documents only.) The envelope's stream does not hold exactly one `document.supplied` event. Either it was never written — which cannot happen through the application, since it is appended in the same transaction as the envelope row — or the stream holds two, which means two creations were recorded against one envelope. Nothing else in the report can be trusted about where this document came from until this passes |
+| `supplied_upload_intact` | The upload named by `document.supplied.upload_sha256` cannot be produced from storage: `blob_missing` (the object is gone) or `integrity_failure`/`blob_corrupt` (the stored bytes no longer hash to the name they are filed under — a swapped upload). The half of the evidence that says *what the host sent us* is what is damaged; revision 1, what the signer actually saw, is covered separately by `supplied_revision_matches_trail` and `revision_1_supplied_hash`. The check also reports the blob's `kind` as text and does not assert it: `blobs` is content-addressed and global, so the same bytes stored earlier as a `template_pdf` keep that kind for ever, legitimately |
+| `supplied_revision_matches_trail` | The presented hash does not agree across the four places it is written: `document.supplied`'s own `data.presented_sha256`, the event row's `document_sha256`, the stored `supplied` revision, and `envelopes.presented_sha256`. The detail names which pair disagrees. A swapped revision cannot agree with all four, so this is where it shows |
 
 ### The seal
 
@@ -748,7 +771,78 @@ expert would ask:
   there was not one — which is why the span is off by default and switching it on is a compliance
   decision (`docs/COMPLIANCE-CHECKLIST.md` C10, `docs/RUNBOOK.md` §7).
 
-## 6. Things a careful reader will ask
+## 6. Addendum 2: a document the host supplied
+
+Some documents cannot come from a template: a report the EHR renders for one patient, twenty or
+thirty pages of their own record, different every time, with a signature block at the end
+(`docs/SPEC-ADDENDUM-2.md`). Such an envelope has `source = 'host_document'`, no
+`template_version_id`, and its field and role definitions on its own row in
+`envelopes.field_definitions` instead of on a published template version.
+
+**What this changes in the evidence, and what it does not.** Nothing downstream of revision 1
+differs: the bytes are hashed before anybody sees them, `document.presented` and `document.viewed`
+record what was served and confirmed, every signature builds a new revision, and the certificate
+and seal are the same. What differs is *provenance* — the content came from the host rather than
+from a template somebody published and reviewed — and the trail says so in as many words:
+`document.supplied` instead of `document.prepared`, and "Document supplied by the host" on the
+certificate, with the upload's hash and the host's document reference printed beside it.
+
+Two things are done so that provenance is still evidence rather than a claim:
+
+- **Both ends of the transformation are kept.** The upload is stored as its own blob
+  (`supplied_pdf`), the flattened bytes as revision 1 (`supplied`), and `document.supplied` carries
+  both hashes. A reader holding the host's own copy of the report can hash it and match
+  `upload_sha256` before asking anything about what happened afterwards.
+- **The flattening adds nothing and hides nothing.** `flatten_supplied` removes every widget, every
+  annotation and the form itself, draws none of them into the page, and embeds nothing new — and
+  re-materialises the document from its page tree, so the removed objects are not merely unlinked
+  but absent from the bytes. The page content is untouched and the page count is re-checked on the
+  output. It is deterministic: the same upload always produces the same revision 1, which is what
+  lets that hash be evidence rather than a property of the moment it was built.
+
+### (i) Checking a host-supplied signature by hand
+
+The walk-through in section 2 applies unchanged from revision 2 onwards. The first two steps are
+these instead:
+
+```sh
+# 1. The event that says where the document came from, and what it became.
+psql -c "SELECT data, encode(document_sha256,'hex')
+         FROM audit_events
+         WHERE stream_id = '<envelope id>' AND event_type = 'document.supplied'"
+# data: {"upload_sha256": "b31c…",        the file the host POSTed
+#        "presented_sha256": "260d…",     revision 1, the bytes the clinician was shown
+#        "page_count": 30, "field_source": "named_fields",
+#        "signer_roles_sha256": "9a7e…", "host_document_ref": "report-88120"}
+# document_sha256: 260d…                  the event's own hash column, the same value
+
+# 2. Both hashes, re-derived from what is stored rather than read from a row.
+#    Blobs are content-addressed, so the path is the claimed hash (see (a)).
+shasum -a 256 upload-as-the-host-still-holds-it.pdf   # must equal upload_sha256
+shasum -a 256 .blobstore/26/0d/260d…                  # must equal presented_sha256
+
+# 3. The same presented hash in the two rows that point at it.
+psql -c "SELECT encode(presented_sha256,'hex') FROM envelopes WHERE id = '<envelope id>'"
+psql -c "SELECT revision_no, kind, page_count, encode(sha256,'hex')
+         FROM document_revisions WHERE envelope_id = '<envelope id>' ORDER BY revision_no"
+#  1 | supplied | 30 | 260d…
+```
+
+All four of those must be the same value; `supplied_revision_matches_trail` is exactly that
+comparison, and section 4 says what each failure means. Opening the `260d…` blob should show a
+document with no form fields and no annotations whose pages read the same as the host's upload —
+that is the whole of what the flattening did, and it is why the two hashes legitimately differ.
+
+**What an opposing expert should ask, and the honest answer.** "Who says the report the clinician
+signed is the report the EHR generated?" The service can prove the bytes it presented, that they
+came from the upload it was given, and that nothing has changed since. It cannot prove the EHR
+generated that upload from the right patient's record — that is the host's evidence, which is why
+`host_document_ref` is recorded in the trail and printed on the certificate, and why it must be an
+opaque identifier that resolves inside the EHR rather than a description of the patient.
+
+---
+
+## 7. Things a careful reader will ask
 
 **"The signer's own copy — is it the same document?"** Yes, byte for byte. `GET /v1/signing/copy`
 returns the sealed blob and nothing else; while the seal is pending it returns `202 {"status":

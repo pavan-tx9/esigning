@@ -9,6 +9,8 @@ Three jobs:
 * strip everything interactive -- appearance-flattened widgets, then no ``/AcroForm``, no
   ``/Annots``, no JavaScript, no additional actions, no stale metadata -- so what is stored, hashed
   and eventually sealed is exactly what a reader draws, with nothing left that could redraw itself.
+  :func:`sanitized_bytes` is the one way those bytes are produced, because unlinking an object is
+  not the same as removing it.
 
 The output is deterministic: the same input bytes and the same drawing produce the same output
 bytes, so a revision hash is a property of the evidence rather than of the moment it was built.
@@ -47,6 +49,7 @@ __all__ = [
     "new_canvas",
     "open_reader",
     "sanitize_document",
+    "sanitized_bytes",
     "to_bytes",
     "writer_from_bytes",
 ]
@@ -374,3 +377,28 @@ def to_bytes(writer: PdfWriter) -> bytes:
     buffer = io.BytesIO()
     writer.write(buffer)
     return buffer.getvalue()
+
+
+def sanitized_bytes(writer: PdfWriter, *, flatten_annotations: bool = True) -> bytes:
+    """``sanitize_document(writer)``, then bytes holding only what the pages still reach.
+
+    This is the one definition of "produce the bytes of a sanitised document", and every revision
+    this service stores goes through it. ``sanitize_document`` *unlinks*: it deletes ``/Annots``
+    from each page and ``/AcroForm`` from the catalog. A ``PdfWriter`` then writes every object it
+    holds, referenced or not, so the widget dictionaries and their appearance streams would still
+    be **physically present** in the bytes that are about to be hashed -- carrying whatever the
+    generator of the file put in ``/V`` or ``/TU`` (a value, a tooltip, a name), invisible to every
+    reader and permanent in a write-once revision nobody can correct.
+
+    Writing the sanitised page tree out and reading it back keeps only the objects the pages still
+    reach. The second ``sanitize_document`` is over the clone, whose catalog and ``/Info`` are
+    pypdf's rather than ours; there is nothing left to flatten by then, so it only re-establishes
+    "no form, no actions, no inherited metadata, ``/Producer: esign``".
+
+    Deterministic, which the revision hash requires: the same input and the same drawing produce
+    the same bytes.
+    """
+    sanitize_document(writer, flatten_annotations=flatten_annotations)
+    reborn = writer_from_bytes(to_bytes(writer))
+    sanitize_document(reborn, flatten_annotations=False)
+    return to_bytes(reborn)

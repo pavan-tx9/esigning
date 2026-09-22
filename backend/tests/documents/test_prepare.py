@@ -11,7 +11,11 @@ from pypdf import PdfReader
 from esign.contracts import DocumentService, PrefillFieldDef, Rect, ValidationFailed
 from esign.documents.fonts import PLAIN_FONT
 from tests.documents.helpers import (
+    NamedWidget,
+    inflated_streams,
     make_pdf,
+    page_content,
+    pdf_with_named_widgets,
     pdf_with_widget_annotation,
     placed_text,
 )
@@ -73,6 +77,28 @@ def test_output_has_no_form_no_annotations_and_no_scripts(documents: DocumentSer
     for page in reader.pages:
         assert "/Annots" not in page
         assert "/AA" not in page
+
+
+def test_the_prepared_revision_keeps_no_widget_object_anywhere_in_its_bytes(documents: DocumentService) -> None:
+    """The same rule ``flatten_supplied`` follows, for the template path.
+
+    Burning the appearance in and deleting ``/Annots`` and ``/AcroForm`` *unlinks* the widget; it
+    does not remove it. A template that carries a tooltip, or a value a reader never sees, would
+    otherwise leave that text physically inside every prepared revision -- and inside the seal,
+    where there is no correcting it. One definition of "produce the bytes of a sanitised document"
+    (``pdfutil.sanitized_bytes``) is what makes this true on both paths at once.
+    """
+    pdf = pdf_with_named_widgets(
+        [NamedWidget(name="host_field", rect=(72.0, 600.0, 292.0, 640.0), value="SHOWNVALUE", tooltip="TOOLTIPSECRET")]
+    )
+    assert b"TOOLTIPSECRET" in inflated_streams(pdf)
+
+    out = documents.prepare(pdf, [], {})
+    # The appearance is drawn into the page -- that part of the widget is ink the signer sees ...
+    assert b"(SHOWNVALUE) Tj" in page_content(out)
+    # ... and the object that carried it is gone from the file, tooltip and all.
+    assert b"/Widget" not in out
+    assert b"TOOLTIPSECRET" not in inflated_streams(out)
 
 
 def test_a_widget_appearance_is_flattened_into_the_page(documents: DocumentService) -> None:

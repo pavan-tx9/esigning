@@ -466,9 +466,9 @@ class Verifier:
         the trail said -- otherwise "we flattened what you sent us" is an assertion about bytes
         nobody can produce any more. So:
 
-        * the upload named by ``upload_sha256`` is fetched (``BlobService.get`` re-hashes it) and
-          its ``blobs.kind`` must still be ``supplied_pdf``: a swapped upload is a failure here,
-          not a silence;
+        * the upload named by ``upload_sha256`` is fetched, which re-hashes it
+          (``BlobService.get``): a swapped upload is a failure here, not a silence. Its
+          ``blobs.kind`` is reported beside it and not asserted -- see below for why;
         * ``presented_sha256`` in the event's own data must be the hash on the event row, the hash
           of the stored ``supplied`` revision *and* the envelope's ``presented_sha256``: a swapped
           revision cannot agree with all three.
@@ -515,11 +515,16 @@ class Verifier:
         blob_kind = db.execute(
             text("SELECT kind FROM blobs WHERE sha256 = :sha"), {"sha": upload_sha}
         ).scalar_one_or_none()
-        run.expect(
-            "supplied_upload_intact",
-            str(blob_kind) == "supplied_pdf",
-            f"the upload {upload_sha.hex()} is stored as {blob_kind!r}, not as a supplied_pdf",
-        )
+        # Reported, not asserted. ``blobs`` is content-addressed and global, and ``put`` adopts an
+        # existing row rather than writing a second one, so ``kind`` records whoever stored those
+        # bytes *first* -- and blob rows are append-only, so it can never be corrected. The same
+        # PDF published as a template and then supplied as a host document (what an integrator
+        # does while wiring both paths up) would leave every later verification of a perfectly
+        # sound envelope reporting a failure, permanently, in ``verification.performed``. The
+        # evidence is the re-hash one line above: ``BlobService.get`` raises ``blob_corrupt`` if
+        # the stored bytes are not the ones ``upload_sha256`` names, which is what actually catches
+        # a swapped upload.
+        run.passed("supplied_upload_intact", f"stored as {blob_kind}")
         return 1
 
     def _check_envelope_row_against_trail(

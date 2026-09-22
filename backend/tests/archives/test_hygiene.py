@@ -28,7 +28,7 @@ def test_an_active_or_signed_scan_is_refused(host: Ehr) -> None:
         (pdf_with_xfa(), "scan_xfa"),
         (pdf_with_embedded_file(), "scan_embedded_file"),
         (pdf_with_launch_action(), "scan_forbidden_action"),
-        (pdf_with_signature_field(), "scan_already_signed"),
+        (pdf_with_signature_field(), "scan_signature_field"),
     ):
         response = file_archive(host, scan)
         assert response.status_code == 422, response.text

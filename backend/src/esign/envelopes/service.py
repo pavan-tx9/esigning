@@ -239,7 +239,16 @@ class EnvelopeServiceImpl:
 
         info = self._documents.inspect_supplied_pdf(spec.document)
         fields = self._resolve_supplied_fields(spec, roles, info)
-        self._documents.validate_definitions(info, list(fields), [], list(roles))
+        try:
+            self._documents.validate_definitions(info, list(fields), [], list(roles))
+        except ValidationFailed:
+            # ``validate_definitions`` answers ``template_definitions_invalid`` and quotes the ids
+            # it refused. Neither belongs here: the host sent no template, and its own strings must
+            # not come back (SPEC section 9). Recoded the same way ``inspect_supplied_pdf`` recodes
+            # the hygiene codes, so every refusal about this file says so.
+            raise ValidationFailed(
+                "the supplied document's field definitions were refused", code="supplied_definitions_invalid"
+            ) from None
         flattened = self._documents.flatten_supplied(spec.document)
 
         retain_until = self._settings.retain_until(document_type, now)
@@ -2050,7 +2059,31 @@ class EnvelopeServiceImpl:
         if signer is None or signer.envelope_id != loaded.envelope.id:
             raise NotFound("no such signer", code="not_found")
         self._refuse_if_past_expiry(loaded)
+        self._require_host_document_roles_unchanged(db, loaded)
         return loaded, signer
+
+    def _require_host_document_roles_unchanged(self, db: Session, loaded: _Loaded) -> None:
+        """Addendum 2: a host document's roles are what the trail says, *before* the signature.
+
+        ``_requires_reauth`` re-derives the re-authentication gate rather than reading the mutable
+        ``signers`` row, and its premise is that the definition it re-derives from is immutable.
+        That is true of ``template_versions``; it is not true of ``envelopes.field_definitions``,
+        which lives on the ordinary, UPDATE-able ``envelopes`` table. Without this, flipping a
+        non-clinician role's ``requires_reauth`` to false, taking the signature, and flipping it
+        back would produce a signature with no attestation behind it that still seals and still
+        verifies -- exactly the attacker the digests and the append-only triggers exist for.
+
+        The seal already makes this comparison (``_require_definitions_match_trail``), but only
+        after the signature exists. Making it here, on every signer-facing mutation, refuses the
+        signature instead of refusing the seal afterwards. Host-side reads (``get``, the host
+        ``signing_view``) do not pay for it: they do not come through this method.
+        """
+        if loaded.envelope.source != "host_document":
+            return
+        supplied = _first_event(self._audit.list(db, "envelope", loaded.envelope.id), EventType.DOCUMENT_SUPPLIED)
+        if supplied is None:
+            raise IntegrityFailure("the envelope has no document.supplied event", code="missing_supplied_event")
+        self._require_definitions_match_trail(loaded, supplied)
 
     def _refuse_if_past_expiry(self, loaded: _Loaded) -> None:
         """An envelope past its date is over, whether or not the sweep has got to it yet.

@@ -934,6 +934,22 @@ aimed at it.
   The certificate of completion prints "Document supplied by the host" in place of the template
   line, with that reference and the upload's hash (`CertificateSummary.source`,
   `host_document_ref`).
+- **The roles are a column, so the trail holds their digest.** Section 12's rule that
+  `requires_reauth` is re-derived rather than read from the mutable `signers` row assumed the
+  definition it is re-derived from is immutable, which is true of a template version and false of
+  `envelopes.field_definitions`. `document.supplied` therefore records `signer_roles_sha256` over
+  the roles as created, and the comparison is made twice: on every signer-facing load, so a
+  rewritten role refuses the *signature* (`certificate_evidence_mismatch`), and again at seal time,
+  so it cannot be certified either. Verification reports the same comparison afterwards. A role key
+  or field id is held to the audit trail's own `[a-z][a-z0-9_]{0,63}`, so nothing this path accepts
+  can be refused by the allowlist after two events are already in the trail.
+- **Refusals name the file, not a template.** The hygiene codes are `supplied_`-prefixed, and so is
+  `supplied_definitions_invalid`; two refusals exist that the template path does not need, because
+  flattening here removes rather than draws: an AcroForm signature field, empty or not
+  (`supplied_signature_field` -- a host places a slot by naming a text widget), and a visible
+  non-widget annotation carrying ink (`supplied_annotation_not_removable`). Field ids are built
+  from the role key and the field type and never from a widget's name, which is host text from
+  inside a per-patient file and would otherwise reach the trail as a capture's `field_id`.
 - **Unchanged**: everything downstream of revision 1 -- presentation, viewed-every-page, consent,
   re-authentication and the span, signing, revisions, the certificate, the single seal, storage,
   verification, webhooks, the signing UI, and Addendum 1's adopted signatures. Approved document

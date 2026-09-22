@@ -441,7 +441,14 @@ class DocumentService(Protocol):
         ``flatten_supplied`` removes them before the bytes become revision 1. The error codes say
         ``supplied`` where the template ones say ``template`` (``supplied_too_large``,
         ``supplied_too_many_pages``, ``supplied_encrypted``, ...), so a host reading them knows
-        they are about the file it just sent, exactly as ``inspect_scan_pdf`` does for a scan."""
+        they are about the file it just sent, exactly as ``inspect_scan_pdf`` does for a scan.
+
+        Two rules differ from the template path rather than only the bounds, both because
+        ``flatten_supplied`` removes rather than draws: an AcroForm *signature field* is refused as
+        ``supplied_signature_field`` even when it is an empty placeholder (a host places a slot by
+        naming a text widget ``<role_key>_signature``), and a visible non-widget annotation
+        carrying an appearance is refused as ``supplied_annotation_not_removable`` rather than
+        being silently stripped of the ink a reader would have seen."""
 
     def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
         """Addendum 2: read the supplied PDF's AcroForm widgets and turn them into ``FieldDef``s.
@@ -455,17 +462,29 @@ class DocumentService(Protocol):
         (SPEC section 6).
 
         Every declared role must resolve to at least one *signature* field, or this raises
-        ValidationFailed (``fields_unresolved``) naming the roles that did not -- never the widget
-        names, which the host chose and which the message would echo. Initials are a mark and are
+        ValidationFailed (``fields_unresolved``). The exception's own message names the roles that
+        did not resolve and never the widget names; what reaches the host over the wire is the
+        stable code alone, because ``api.errors`` answers every code with a fixed sentence and
+        echoes nothing (SPEC section 9). Initials are a mark and are
         resolved as one, but they do not make a role signable here, which is stricter than
         ``validate_definitions``' "no signature or initials field" deliberately: that rule was
         written for a template somebody authored field by field, and in a generated report the
         difference between a signature and initials is a substring of a widget's name. A host that
         really wants an initials-only role has ``ExplicitFields`` to say so in as many words.
         Widgets no role claims are not an error: they are dropped here and removed from the bytes
-        by ``flatten_supplied``.
-        Field ids are unique and stable within the envelope; the result is what
-        ``validate_definitions`` is then run against, like a template's."""
+        by ``flatten_supplied``. A declared role key that is not a valid id is refused before any
+        widget is read, with ``supplied_definitions_invalid`` -- the code ``validate_definitions``
+        gives the same key on the explicit-rects path -- because a key no widget name could ever
+        match is a malformed key, not a document missing its signature block.
+
+        Field ids are unique and stable within the envelope, and are built from the role key and
+        the field type (``clinician_signature``, ``clinician_date_signed``, and
+        ``clinician_signature_2`` for a repeat) -- never from the widget's name. An id is stored on
+        the envelope, served to the signing UI and written into the append-only trail as
+        ``signer.signed.data.captures[].field_id``; a widget name in a per-patient report is host
+        text that may carry an MRN, a surname or a date, and SPEC section 4 says those can never
+        appear in audit ``data``. The result is what ``validate_definitions`` is then run against,
+        like a template's."""
 
     def flatten_supplied(self, pdf: bytes) -> bytes:
         """Addendum 2: the bytes that become revision 1 of a host-document envelope.

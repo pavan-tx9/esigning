@@ -43,13 +43,23 @@ certificate, with the upload's hash and the host's document reference).
     `<role_key>_date` (or more generally `<role_key>__<field_id>` with an optional type suffix) to a
     `FieldDef` using the widget's page and rectangle (converted to displayed-page coordinates,
     honouring `/Rotate`). Every declared role must resolve to at least one signature field or the
-    request fails with `fields_unresolved` listing the roles. Unmatched widgets are removed.
+    request fails with `fields_unresolved`; the code is the whole answer, since section 9's "error
+    messages never echo input" applies to the roles as much as to anything else. The resulting
+    field id is built from the role key and the field type and never from the widget's name, which
+    is host text inside a per-patient file and would otherwise reach the append-only trail as
+    `signer.signed.data.captures[].field_id`. Unmatched widgets are removed.
   - **Explicit rects.** `fields: {"mode": "explicit", "fields": [FieldDef...]}`, where `page` may
     be a positive integer or a negative one counted from the end (`-1` = last page), so a variable
     page count does not matter. Validated with `validate_definitions` against the actual page sizes.
 - The same hygiene as templates (`inspect_template_pdf`: no encryption, JavaScript, XFA, embedded
   files, existing signatures, launch actions), then flattening of any remaining form fields and
   annotations, then storage as revision 1 (`supplied`). The upload is also stored as `supplied_pdf`.
+  Two rules are stricter here than for a template, both following from "remove all widgets and
+  annotations" below: an AcroForm signature field is refused as `supplied_signature_field` even
+  when it is an empty placeholder, and a visible non-widget annotation carrying an appearance is
+  refused as `supplied_annotation_not_removable` rather than having its ink silently dropped out of
+  the bytes the signer is shown. Definition problems answer `supplied_definitions_invalid`, not the
+  template path's code.
 - `Idempotency-Key` applies (the request hash covers the document bytes).
 - `EnvelopeView` gains `source`, and the existing signer-facing payload needs no change (fields
   are served from the envelope's own definitions).
@@ -61,7 +71,10 @@ own field and `requires_reauth`, sequential or parallel.
 - `resolve_named_fields(pdf, signer_roles) -> list[FieldDef]` with the naming rules above and
   correct geometry on rotated and offset-origin pages.
 - `flatten_supplied(pdf) -> bytes`: remove all widgets and annotations, keep page content, embed
-  nothing new. Refuse (ValidationFailed) if the result would differ in page count.
+  nothing new. Refuse (ValidationFailed) if the result would differ in page count. *Remove* means
+  the objects are not in the produced bytes: unlinking `/Annots` and `/AcroForm` leaves the widget
+  dictionaries and their appearance streams physically present, with whatever the generator put in
+  `/V` or `/TU`, inside the write-once revision nobody can correct.
 - Performance: a 30-page report must prepare in well under two seconds and present without
   re-parsing on every request (Addendum 0's page_count concern applies: persist `page_count` on
   `document_revisions` in this addendum's migration and use it everywhere the page count is needed).

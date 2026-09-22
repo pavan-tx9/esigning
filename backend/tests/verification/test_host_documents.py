@@ -71,15 +71,73 @@ def test_a_swapped_upload_is_reported_and_revision_one_is_not_blamed(ehr: Ehr, w
 
 
 def test_the_upload_cannot_be_restamped_as_some_other_kind_of_blob(ehr: Ehr, owner_engine: Engine) -> None:
-    """``supplied_upload_intact`` also compares ``blobs.kind``. Nothing can reach that comparison
-    through the database, which is the stronger answer: ``blobs`` is append-only against the app
-    role *and* against the owner, so an upload cannot be restamped as a template at all."""
+    """``blobs`` is append-only against the app role *and* against the owner, so ``kind`` cannot be
+    rewritten at all -- which is the stronger answer than any check could give, and the reason
+    ``supplied_upload_intact`` reports the kind rather than asserting it (see the test below)."""
     envelope = ehr.create_host_document_envelope(_report())
     upload_sha = bytes.fromhex(str(_supplied(ehr, envelope["id"])["upload_sha256"]))
     with pytest.raises(DBAPIError) as refused, owner_engine.begin() as conn:
         conn.execute(text("UPDATE blobs SET kind = 'template_pdf' WHERE sha256 = :sha"), {"sha": upload_sha})
     assert "append-only" in str(refused.value)
     assert ehr.verification(envelope["id"])["ok"]
+
+
+def test_a_report_whose_bytes_are_already_stored_under_another_kind_still_verifies(ehr: Ehr) -> None:
+    """``blobs`` is content-addressed and global: ``kind`` records whoever stored the bytes first.
+
+    ``ContentAddressedBlobService.put`` adopts an existing row rather than writing a second one,
+    and blob rows are append-only, so the kind can never be corrected afterwards. Publishing a
+    sample PDF as a template and then supplying the same file as a host document is what an
+    integrator does while wiring both paths up; asserting ``kind == 'supplied_pdf'`` would have
+    made every later verification of that entirely genuine envelope report a failure, permanently,
+    into ``verification.performed``. The evidence is the re-hash of the stored bytes, which the
+    swapped-upload test above exercises; the kind is reported beside it as text.
+    """
+    pdf = _report()
+    definitions = json.dumps(
+        {
+            "key": "supplied_twin",
+            "name": "The same report, published as a template",
+            "document_type": "clinical_order",
+            "fields": [
+                {
+                    "id": "clinician_signature",
+                    "label": "Clinician signature",
+                    "type": "signature",
+                    "page": PAGES,
+                    "rect": {"x": 54, "y": 96, "w": 240, "h": 50},
+                    "signer_role": "clinician",
+                    "required": True,
+                }
+            ],
+            "prefill_fields": [],
+            "signer_roles": [
+                {
+                    "key": "clinician",
+                    "label": "Clinician",
+                    "allowed_capacities": ["clinician"],
+                    "requires_reauth": True,
+                    "order_index": 0,
+                    "required": True,
+                }
+            ],
+        }
+    )
+    created = ehr.client.post(
+        "/v1/templates",
+        headers=ehr.headers,
+        files={"pdf": ("twin.pdf", pdf, "application/pdf")},
+        data={"definitions": definitions},
+    )
+    assert created.status_code == 201, created.text
+
+    envelope = ehr.create_host_document_envelope(pdf)
+    report = ehr.verification(envelope["id"])
+
+    assert report["ok"], report["problems"]
+    (check,) = [c for c in report["checks"] if c["name"] == "supplied_upload_intact"]
+    assert check["status"] == "passed"
+    assert "template_pdf" in check["detail"]
 
 
 def test_a_missing_upload_blob_is_reported_rather_than_passed_over(ehr: Ehr, world: World) -> None:

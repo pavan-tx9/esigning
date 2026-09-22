@@ -92,7 +92,9 @@ def test_a_thirty_page_report_is_signed_by_a_clinician_who_re_authenticates(ehr:
     # The signing UI gets this envelope's own definitions in place of a template version's.
     assert payload["envelope"]["page_count"] == REPORT_PAGES
     assert payload["envelope"]["title"] == "Clinical order"
-    assert {f["id"] for f in payload["fields"]} == {"clinician_signature", "clinician_date"}
+    # Ids are built from the role key and the field type, never from the widget names the
+    # generator chose -- those reach the append-only trail as ``captures[].field_id``.
+    assert {f["id"] for f in payload["fields"]} == {"clinician_signature", "clinician_date_signed"}
     assert {f["page"] for f in payload["fields"]} == {REPORT_PAGES}
 
     document_response = signer.get("/document")
@@ -289,6 +291,38 @@ def test_verification_catches_a_field_definition_that_no_longer_matches_the_row(
 
 
 # --------------------------------------------------------------------------- the API's own rules
+
+
+def test_nothing_reparses_the_report_to_present_it(ehr: Ehr, monkeypatch: Any) -> None:
+    """The addendum's performance requirement, asserted against the real service.
+
+    ``page_count`` persisted on ``document_revisions`` is only worth having if the presentation
+    path reads it, and ``EnvelopeServiceImpl._page_count`` falls back to fetching the blob and
+    parsing it whenever the column is NULL -- a deliberate path for revisions written before the
+    0800 migration, and a silent one. A regression in that read would restore a 30-page parse on
+    every session payload, every document fetch and every viewed check, and every assertion on the
+    stored column would stay green. So the calls are counted.
+    """
+    from esign.documents.service import PdfDocumentService
+
+    envelope = ehr.create_host_document_envelope(_report())
+    signer = ehr.open_session(envelope, "clinician", method="password+mfa")
+
+    original = PdfDocumentService.page_count
+    calls: list[int] = []
+
+    def counted(self: PdfDocumentService, pdf: bytes) -> int:
+        calls.append(len(pdf))
+        return original(self, pdf)
+
+    monkeypatch.setattr(PdfDocumentService, "page_count", counted)
+
+    payload = signer.session()
+    assert payload["envelope"]["page_count"] == REPORT_PAGES
+    assert signer.get("/document").status_code == 200
+    assert signer.post("/viewed", {"pages_viewed": REPORT_PAGES}).status_code == 200
+
+    assert calls == []
 
 
 def test_a_document_type_outside_the_approved_list_is_refused(ehr: Ehr) -> None:

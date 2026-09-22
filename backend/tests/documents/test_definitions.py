@@ -208,3 +208,36 @@ def test_a_role_that_merely_allows_other_capacities_is_unaffected(documents: Doc
         order_index=0,
     )
     documents.validate_definitions(INFO, [signature("witness_signature", "witness")], [], [role_def])
+
+
+# --------------------------------------------------------------------------- the allowlist agrees
+
+
+def test_the_id_pattern_is_the_audit_trails_own_slug() -> None:
+    """One pattern, two enforcement points, and they must not drift apart.
+
+    A role key and a field id declared here are written into the append-only audit trail --
+    ``session.created``, ``session.rejected``, ``signer.signed``, ``signer.declined`` carry the
+    role key, ``signer.signed.data.captures[].field_id`` the field id -- where the allowlist
+    validates them against ``Slug``. An id this accepted and the allowlist refused would create an
+    envelope that can never be signed *and* never be recorded as having failed: two events already
+    in a trail with no delete path, two stored blobs, and a 422 saying only "the request is not
+    valid". Addendum 2 made that reachable from a request body rather than from a template somebody
+    published, which is why this is asserted rather than assumed.
+    """
+    from typing import get_args
+
+    from esign.audit.events import Slug
+    from esign.documents.definitions import ID_PATTERN
+
+    (constraints,) = [meta for meta in get_args(Slug)[1:] if getattr(meta, "pattern", None)]
+    assert ID_PATTERN.pattern == constraints.pattern
+
+
+@pytest.mark.parametrize("key", ["2nd_clinician", "_cosigner", "Clinician", "co-signer", ""])
+def test_a_key_the_audit_trail_would_refuse_is_refused_here(documents: DocumentService, key: str) -> None:
+    role_def = SignerRoleDef(
+        key=key, label="Second clinician", allowed_capacities=("self",), requires_reauth=False, order_index=0
+    )
+    with pytest.raises(ValidationFailed):
+        documents.validate_definitions(INFO, [signature("a_signature", key)], [], [role_def])

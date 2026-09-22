@@ -46,7 +46,7 @@ from esign.documents.fonts import (
     truncate_to_width,
 )
 from esign.documents.geometry import PageGeometry
-from esign.documents.pdfutil import draw_overlay, geometries, sanitize_document, to_bytes, writer_from_bytes
+from esign.documents.pdfutil import draw_overlay, geometries, sanitized_bytes, writer_from_bytes
 
 __all__ = ["apply_signer_marks", "prepare"]
 
@@ -297,8 +297,7 @@ def prepare(
         geometry = pages[page_index]
         _draw_prefill_page(writer, geometry, definitions, prefill)
 
-    sanitize_document(writer)
-    return to_bytes(writer)
+    return sanitized_bytes(writer)
 
 
 def _draw_prefill_page(
@@ -443,8 +442,7 @@ def apply_signer_marks(
     for page_index, page_fields in sorted(by_page.items()):
         _draw_marks_page(writer, pages[page_index], page_fields, matched, stamp)
 
-    sanitize_document(writer)
-    return to_bytes(writer)
+    return sanitized_bytes(writer)
 
 
 def _draw_marks_page(

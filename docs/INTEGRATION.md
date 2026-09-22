@@ -150,9 +150,13 @@ Two ways to say where the signatures go:
   `<role_key>__<field_id>` with an optional type suffix. A report generator that already places a
   signature block only has to name the widget. Positions come from the widget, `/Rotate` and a
   non-zero `MediaBox` origin included. **Every role must resolve to at least one `_signature`
-  field**; otherwise the request is refused with `fields_unresolved`, naming the roles that did
-  not resolve and nothing from inside the file. Widgets no role claims are dropped, and none of
-  them survives into revision 1.
+  field**; otherwise the request is refused with `fields_unresolved`. Widgets no role claims are
+  dropped, and none of them survives into revision 1.
+  **Draw the signature slot as an ordinary text widget** (`/FT /Tx`) named `<role_key>_signature`,
+  not as an AcroForm signature field (`/FT /Sig`). A `/Sig` field is refused with
+  `supplied_signature_field` even when it is an empty placeholder: this service applies its own
+  signature and seals the result, and a document that already carries signature machinery is not
+  something it will sign over.
 - **`{"mode": "explicit", "fields": [...]}`** — `FieldDef`s with their own rects, for a generator
   that does not emit an AcroForm. `page` may count from the end (`-1` is the last page), which is
   what makes a variable page count harmless; it is resolved to a positive page before anything is
@@ -171,9 +175,40 @@ Things worth knowing here:
   `annual-summary-alvarez-1962`.
 - **Nothing is stored until every refusal has had its chance.** A document refused for hygiene,
   for an unresolved role or for its type leaves no blob and no envelope row behind.
-- Field ids are derived from the widget names your generator chose (lowercased, `[a-z0-9_]`), so
-  they come back in the signer-facing payload; the labels a signer reads are built from the role
-  labels in this request, never from inside the file.
+- **Every role carries its own `order_index`, and it is required.** There is no default: two roles
+  that both left it out would share position 0 and be refused as an ambiguous sequential order the
+  host never chose. Role keys are `[a-z][a-z0-9_]*`, at most 64 characters — the same shape the
+  audit trail accepts, so a key this route takes is one that can be recorded.
+- **Nothing from inside the file becomes an identifier.** Field ids are built from the role key
+  you declared and the type of the field — `clinician_signature`, `clinician_date_signed`, and
+  `clinician_signature_2` for a second signature widget of the same role — never from the widget's
+  own name. Those ids come back in the signer-facing payload and are written into the audit trail,
+  which may not hold anything about a patient; a generator that uniquifies its widget names per
+  document (an MRN, a surname, a date of service) is doing the normal thing and costs you nothing
+  here. The labels a signer reads are built from the role labels in this request, for the same
+  reason.
+- **Bake every mark into the page content.** Annotations are removed from the upload without being
+  drawn, so ink that lives in one would silently not be in the bytes the signer reads. A visible
+  non-widget annotation with an appearance — a `/FreeText` "AMENDED" note, a `/Stamp`, a `/Square`
+  redaction box, an `/Ink` mark — is refused with `supplied_annotation_not_removable` rather than
+  quietly dropped. `/Link` and `/Popup`, and anything flagged Hidden or NoView, draw nothing and
+  are fine.
+
+Every refusal on this path is a stable `code` with a fixed sentence beside it; the message never
+quotes your roles, your ids or anything out of the file (SPEC section 9), so the `code` is what to
+branch on:
+
+| code | what to fix |
+|---|---|
+| `fields_unresolved` | a declared role has no `<role_key>_signature` widget in the document (a role key that is not `[a-z][a-z0-9_]*` answers `supplied_definitions_invalid` instead, in both field modes: a key no widget name could match is a malformed key, not a missing signature block) |
+| `supplied_definitions_invalid` | the resolved fields or the `signer_roles` you sent were refused: a key that is not `[a-z][a-z0-9_]*`, two roles sharing an `order_index`, a signature rect under 80×28pt, a role allowing the clinician capacity without `requires_reauth` |
+| `field_page_out_of_range` | an explicit field names a page the document does not have |
+| `supplied_signature_field` | a slot was drawn as `/FT /Sig`; use a text widget |
+| `supplied_annotation_not_removable` | a visible annotation carries ink; draw it into the page |
+| `supplied_already_signed` | the PDF already carries a signature |
+| `supplied_too_large`, `supplied_too_many_pages` | over `MAX_SUPPLIED_DOCUMENT_BYTES` / `_PAGES` |
+| `supplied_encrypted`, `supplied_javascript`, `supplied_xfa`, `supplied_embedded_file`, `supplied_forbidden_action` | the hygiene rules, same as for a template |
+| `document_type_not_approved` | the type is not in `APPROVED_DOCUMENT_TYPES` |
 
 ## 2. Open a signing session
 

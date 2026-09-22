@@ -150,7 +150,7 @@ def test_the_fake_resolver_answers_what_the_real_one_answers() -> None:
     assert shape(real) == shape(fake)
     # And the agreed answer is the right one: the unmatched widget is gone, and the label a signer
     # reads comes from the role the host declared, not from the name inside the file.
-    assert [f.id for f in real] == ["clinician_signature", "clinician_date", "cosigner_signature"]
+    assert [f.id for f in real] == ["clinician_signature", "clinician_date_signed", "cosigner_signature"]
     assert [f.label for f in real] == [
         "Attending physician signature",
         "Attending physician date signed",

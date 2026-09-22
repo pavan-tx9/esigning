@@ -111,9 +111,10 @@ def test_the_envelope_carries_its_own_fields_and_roles(bench: Bench, db: Session
     stored = bench.field_definitions(db, view.id)
     assert set(stored) == {"fields", "signer_roles"}
     assert [r["key"] for r in stored["signer_roles"]] == ["clinician", "cosigner"]
+    # Ids are the role key and the field type -- not the widget names inside the file.
     assert [f["id"] for f in stored["fields"]] == [
         "clinician_signature",
-        "clinician_date",
+        "clinician_date_signed",
         "cosigner_signature",
     ]
     # Pages are stored positive, on the document's real last page.
@@ -202,14 +203,15 @@ def test_widgets_no_role_claims_are_dropped(bench: Bench, db: Session, host: Hos
     )
     view = bench.create_from_document(db, host, document=document)
     stored = bench.field_definitions(db, view.id)
-    assert [f["id"] for f in stored["fields"]] == ["clinician_signature", "clinician_date"]
+    assert [f["id"] for f in stored["fields"]] == ["clinician_signature", "clinician_date_signed"]
 
 
 def test_the_general_double_underscore_spelling_resolves_too(bench: Bench, db: Session, host: Host) -> None:
     document = supplied_pdf(pages=REPORT_PAGES, widgets=("clinician__attending_signature",))
     view = bench.create_from_document(db, host, document=document)
     stored = bench.field_definitions(db, view.id)
-    assert [(f["id"], f["type"]) for f in stored["fields"]] == [("clinician__attending_signature", "signature")]
+    # The widget's name decided which role and which type; the id says only that.
+    assert [(f["id"], f["type"]) for f in stored["fields"]] == [("clinician_signature", "signature")]
 
 
 def test_a_flattening_that_changed_the_page_count_is_refused(bench: Bench, db: Session, host: Host) -> None:
@@ -228,6 +230,44 @@ def test_signer_roles_are_required_and_unique(bench: Bench, db: Session, host: H
     with pytest.raises(ValidationFailed) as duplicated:
         bench.create_from_document(db, host, roles=twice, signers=signers_for(CLINICIAN_ROLES, "patient-ref-001"))
     assert duplicated.value.code == "duplicate_role"
+
+
+def test_a_role_key_that_is_not_an_id_is_refused_and_nothing_is_stored(bench: Bench, db: Session, host: Host) -> None:
+    """Both field modes answer the same code for the same bad key.
+
+    A key like ``Clinician`` can never claim a widget -- names are matched lowercased -- so named
+    resolution would otherwise report ``fields_unresolved`` about a report whose signature block is
+    exactly where the host put it, and never mention the capital letter. The explicit path has
+    always answered ``supplied_definitions_invalid`` for it, which is what `docs/INTEGRATION.md`
+    §1b documents.
+    """
+    shouty = (
+        SignerRoleDef(
+            key="Clinician",
+            label="Attending clinician",
+            allowed_capacities=("clinician",),
+            requires_reauth=True,
+            order_index=0,
+        ),
+    )
+    signers = (
+        NewSigner(
+            role_key="Clinician", host_user_id="dr-0311", display_name="Dr Quincy Ravensworth", capacity="clinician"
+        ),
+    )
+    for fields in (None, _explicit(role="Clinician")):
+        with pytest.raises(ValidationFailed) as refused:
+            bench.create_from_document(
+                db,
+                host,
+                document=supplied_pdf(pages=REPORT_PAGES, widgets=("Clinician_signature",)),
+                roles=shouty,
+                signers=signers,
+                **({} if fields is None else {"fields": fields}),
+            )
+        assert refused.value.code == "supplied_definitions_invalid"
+    assert db.execute(text("SELECT count(*) FROM envelopes")).scalar_one() == 0
+    assert bench.blobs.puts == []
 
 
 def test_the_people_rules_are_the_ones_create_applies(bench: Bench, db: Session, host: Host) -> None:
@@ -318,7 +358,7 @@ def test_a_rect_off_the_page_is_refused(bench: Bench, db: Session, host: Host) -
     )
     with pytest.raises(ValidationFailed) as refused:
         bench.create_from_document(db, host, document=supplied_pdf(pages=REPORT_PAGES, widgets=()), fields=off_the_page)
-    assert refused.value.code == "template_definitions_invalid"
+    assert refused.value.code == "supplied_definitions_invalid"
     assert db.execute(text("SELECT count(*) FROM envelopes")).scalar_one() == 0
 
 
@@ -330,7 +370,7 @@ def test_an_explicit_field_naming_an_undeclared_role_is_refused(bench: Bench, db
             document=supplied_pdf(pages=REPORT_PAGES, widgets=()),
             fields=_explicit(role="pharmacist"),
         )
-    assert refused.value.code == "template_definitions_invalid"
+    assert refused.value.code == "supplied_definitions_invalid"
 
 
 # --------------------------------------------------------------------------- downstream is unchanged
@@ -342,7 +382,7 @@ def test_the_signing_view_is_served_the_envelopes_own_fields(bench: Bench, db: S
     signing = bench.service.signing_view(db, session)
 
     assert signing.page_count == REPORT_PAGES
-    assert [f.id for f in signing.fields] == ["clinician_signature", "clinician_date"]
+    assert [f.id for f in signing.fields] == ["clinician_signature", "clinician_date_signed"]
     assert signing.signer.role_label == "Clinician"
     assert signing.signer.requires_reauth is True
     # No template name to show: the document type, which carries nothing about anybody.
@@ -476,6 +516,74 @@ def test_the_seal_refuses_roles_that_are_no_longer_the_ones_the_trail_recorded(
     with pytest.raises(IntegrityFailure) as refused:
         bench.service.seal_pending(db, view.id)
     assert refused.value.code == "certificate_evidence_mismatch"
+
+
+#: A role that must re-authenticate without allowing the clinician capacity. The clinician
+#: capacity forces re-authentication on its own (``role.requires_reauth or capacity ==
+#: "clinician"``), so it is the only shape where the *role's* flag is load-bearing by itself.
+WITNESS_ROLES: tuple[SignerRoleDef, ...] = (
+    SignerRoleDef(
+        key="witness",
+        label="Witness",
+        allowed_capacities=("witness",),
+        requires_reauth=True,
+        order_index=0,
+    ),
+)
+
+
+def test_a_rewritten_role_is_refused_before_the_signature_not_after_it(bench: Bench, db: Session, host: Host) -> None:
+    """The re-authentication gate is re-derived at signing time from a column that may be UPDATEd.
+
+    ``_requires_reauth`` deliberately reads the definitions rather than the mutable ``signers``
+    row, on the premise that the definitions are immutable -- true of ``template_versions``, false
+    of ``envelopes.field_definitions``. The digest in ``document.supplied`` was consulted only at
+    seal time, so flipping this role's ``requires_reauth`` to false, taking the signature with no
+    attestation, and flipping it back produced an envelope that sealed and verified clean. Every
+    signer-facing mutation goes through ``_load_for_session``, so the comparison happens there: the
+    signature is refused, not the seal afterwards.
+    """
+    document = supplied_pdf(pages=REPORT_PAGES, widgets=("witness_signature",))
+    view = bench.create_from_document(
+        db,
+        host,
+        roles=WITNESS_ROLES,
+        signers=signers_for(WITNESS_ROLES, "patient-ref-001"),
+        document=document,
+    )
+    session = bench.session(db, bench.signer_id(view, "witness"))
+
+    definitions = bench.field_definitions(db, view.id)
+    assert definitions["signer_roles"][0]["requires_reauth"] is True
+    definitions["signer_roles"][0]["requires_reauth"] = False
+    db.execute(
+        text("UPDATE envelopes SET field_definitions = CAST(:defs AS jsonb) WHERE id = :id"),
+        {"defs": json.dumps(definitions), "id": view.id},
+    )
+
+    with pytest.raises(IntegrityFailure) as refused:
+        bench.service.present(db, session, CTX)
+    assert refused.value.code == "certificate_evidence_mismatch"
+
+
+def test_the_persisted_page_count_is_the_one_presentation_reads(bench: Bench, db: Session, host: Host) -> None:
+    """Addendum 2: a 30-page report presents "without re-parsing on every request".
+
+    ``_page_count`` reads ``document_revisions.page_count`` and falls back to fetching the blob and
+    parsing it when the column is NULL -- a deliberate path for revisions written before 0800, and
+    a silent one. Asserting on the stored column cannot see that fallback come back; counting the
+    calls into the documents module can.
+    """
+    view = bench.create_from_document(db, host, document=supplied_pdf(pages=REPORT_PAGES))
+    session = bench.session(db, bench.signer_id(view, "clinician"))
+
+    bench.documents.pages_counted = 0
+    bench.service.present(db, session, CTX)
+    bench.service.record_viewed(db, session, REPORT_PAGES, CTX)
+    bench.service.signing_view(db, session)
+
+    assert bench.documents.pages_counted == 0
+    assert bench.revision_pages(db, view.id) == [(1, "supplied", REPORT_PAGES)]
 
 
 def test_the_certificate_carries_both_ends_of_the_one_transformation(bench: Bench, db: Session, host: Host) -> None:

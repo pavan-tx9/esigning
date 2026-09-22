@@ -350,10 +350,13 @@ def _cover(canvas: Canvas, report: Report, y: float) -> float:
 def _widget(canvas: Canvas, name: str, tooltip: str, x: float, y: float, width: float, height: float) -> None:
     """One named AcroForm text widget: the whole of what the host tells the service about a field.
 
-    Not a signature field (``/FT /Sig``): a supplied document with one of those in it is refused,
-    and rightly -- the seal is the service's to apply. This is an ordinary text widget whose
-    *name* says which role and which kind of field, and which is flattened away before anybody
-    sees the document.
+    Not a signature field (``/FT /Sig``): a supplied document with one of those in it is refused
+    with ``supplied_signature_field``, and rightly -- the seal is the service's to apply. This is
+    an ordinary text widget whose *name* says which role and which kind of field, and which is
+    flattened away before anybody sees the document. The name is read once, to decide the role and
+    the type, and never becomes the field's id: ids come back as ``clinician_signature`` and
+    ``clinician_date_signed`` whatever this generator called the widget, because an id reaches the
+    append-only audit trail and a generated report's widget names are ours, not the service's.
 
     ``round``: reportlab takes either, its type stubs say ``int``, and every rectangle here lands
     on a whole point anyway.

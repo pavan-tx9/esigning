@@ -35,7 +35,14 @@ __all__ = [
     "validate_definitions",
 ]
 
-ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9_]+$")
+#: Role keys, field ids and prefill keys. This is deliberately the *same* pattern the audit
+#: trail's ``Slug`` enforces (``esign.audit.events.Slug``): an id declared here is written into
+#: ``signer.signed.data.captures[].field_id`` and a role key into four event payloads, so an id
+#: this accepted and the allowlist refused would be an envelope that can be created and never
+#: signed -- with no delete path for the two events already in the trail. Addendum 2 made that
+#: reachable at runtime, since a host document declares its roles per request rather than once at
+#: publish. ``tests/documents/test_definitions.py`` asserts the two patterns agree.
+ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 MAX_ID_CHARS: Final[int] = 64
 MAX_LABEL_CHARS: Final[int] = 120
 MAX_FIELDS: Final[int] = 500
@@ -109,7 +116,7 @@ def validate_definitions(
         role_keys.append(key)
         what = f"role {key!r}"
         if not ID_PATTERN.match(key) or len(key) > MAX_ID_CHARS:
-            problems.append(f"{what}: key must match [a-z0-9_]+ and be at most {MAX_ID_CHARS} characters")
+            problems.append(f"{what}: key must match [a-z][a-z0-9_]* and be at most {MAX_ID_CHARS} characters")
         if not role.label.strip():
             problems.append(f"{what}: label is required")
         if len(role.label) > MAX_LABEL_CHARS:
@@ -152,7 +159,7 @@ def validate_definitions(
         field_ids.append(fld.id)
         what = f"field {fld.id!r}"
         if not ID_PATTERN.match(fld.id) or len(fld.id) > MAX_ID_CHARS:
-            problems.append(f"{what}: id must match [a-z0-9_]+ and be at most {MAX_ID_CHARS} characters")
+            problems.append(f"{what}: id must match [a-z][a-z0-9_]* and be at most {MAX_ID_CHARS} characters")
         if fld.type not in _FIELD_TYPES:
             problems.append(f"{what}: unknown field type {fld.type!r}")
         if len(fld.label) > MAX_LABEL_CHARS:
@@ -183,7 +190,7 @@ def validate_definitions(
         prefill_keys.append(prefill.key)
         what = f"prefill {prefill.key!r}"
         if not ID_PATTERN.match(prefill.key) or len(prefill.key) > MAX_ID_CHARS:
-            problems.append(f"{what}: key must match [a-z0-9_]+ and be at most {MAX_ID_CHARS} characters")
+            problems.append(f"{what}: key must match [a-z][a-z0-9_]* and be at most {MAX_ID_CHARS} characters")
         if prefill.font_size <= 0 or prefill.font_size > 72:
             problems.append(f"{what}: font_size must be between 0 and 72")
         _check_rect(problems, what, prefill.page, prefill.rect, info)

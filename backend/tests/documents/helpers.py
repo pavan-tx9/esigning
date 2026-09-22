@@ -50,12 +50,17 @@ __all__ = [
     "generated_report",
     "geometry_of",
     "handwriting_png",
+    "inflated_streams",
     "make_pdf",
     "not_a_png",
+    "page_content",
     "pdf_with_acroform_javascript",
+    "pdf_with_applied_signature",
     "pdf_with_embedded_file",
+    "pdf_with_inked_annotation",
     "pdf_with_javascript",
     "pdf_with_launch_action",
+    "pdf_with_link_annotation",
     "pdf_with_named_widgets",
     "pdf_with_page_additional_actions",
     "pdf_with_signature_field",
@@ -212,6 +217,83 @@ def pdf_with_signature_field() -> bytes:
     return _rewrite(make_pdf(), mutate)
 
 
+def pdf_with_applied_signature() -> bytes:
+    """A signature field that has actually been signed: ``/V`` at a ``/Type /Sig`` dictionary.
+
+    The difference from :func:`pdf_with_signature_field`, which is an *empty* placeholder. Both are
+    refused, with different codes, because they are different mistakes: this one means somebody
+    signed the file already, and that one means the generator drew the signature slot as an AcroForm
+    signature field instead of a text widget.
+    """
+
+    def mutate(writer: PdfWriter) -> None:
+        signature = DictionaryObject()
+        signature[NameObject("/Type")] = NameObject("/Sig")
+        signature[NameObject("/Filter")] = NameObject("/Adobe.PPKLite")
+        signature[NameObject("/ByteRange")] = ArrayObject([NumberObject(v) for v in (0, 840, 960, 240)])
+        field = DictionaryObject()
+        field[NameObject("/Type")] = NameObject("/Annot")
+        field[NameObject("/Subtype")] = NameObject("/Widget")
+        field[NameObject("/FT")] = NameObject("/Sig")
+        field[NameObject("/T")] = TextStringObject("applied_signature")
+        field[NameObject("/V")] = signature
+        field[NameObject("/Rect")] = ArrayObject([FloatObject(v) for v in (72, 72, 272, 122)])
+        form = DictionaryObject()
+        form[NameObject("/Fields")] = ArrayObject([field])
+        form[NameObject("/SigFlags")] = NumberObject(3)
+        writer.root_object[NameObject("/AcroForm")] = form
+        writer.pages[0][NameObject("/Annots")] = ArrayObject([field])
+
+    return _rewrite(make_pdf(), mutate)
+
+
+def pdf_with_inked_annotation(subtype: str = "/FreeText", *, flags: int | None = 4) -> bytes:
+    """A non-widget annotation with a real appearance stream: ink a reader draws.
+
+    ``flatten_supplied`` removes annotations without rendering them, so a mark like this would be
+    dropped out of the bytes that become revision 1. ``inspect_supplied_pdf`` refuses it instead.
+    ``flags=None`` omits ``/F``; ``flags=2`` is Hidden, which no reader draws.
+    """
+
+    def mutate(writer: PdfWriter) -> None:
+        rect = (72.0, 600.0, 372.0, 640.0)
+        appearance = DecodedStreamObject()
+        appearance.set_data(b"BT /Helv 12 Tf 4 12 Td (AMENDED 2026-01-01) Tj ET")
+        appearance[NameObject("/Type")] = NameObject("/XObject")
+        appearance[NameObject("/Subtype")] = NameObject("/Form")
+        appearance[NameObject("/BBox")] = ArrayObject(
+            [FloatObject(v) for v in (0, 0, rect[2] - rect[0], rect[3] - rect[1])]
+        )
+        appearance[NameObject("/Resources")] = DictionaryObject()
+        annot = DictionaryObject()
+        annot[NameObject("/Type")] = NameObject("/Annot")
+        annot[NameObject("/Subtype")] = NameObject(subtype)
+        annot[NameObject("/Rect")] = ArrayObject([FloatObject(v) for v in rect])
+        annot[NameObject("/Contents")] = TextStringObject("AMENDED 2026-01-01")
+        if flags is not None:
+            annot[NameObject("/F")] = NumberObject(flags)
+        appearances = DictionaryObject()
+        appearances[NameObject("/N")] = appearance
+        annot[NameObject("/AP")] = appearances
+        writer.pages[0][NameObject("/Annots")] = ArrayObject([annot])
+
+    return _rewrite(make_pdf(), mutate)
+
+
+def pdf_with_link_annotation() -> bytes:
+    """A ``/Link`` with an appearance: carries no ink of its own, so removing it loses nothing."""
+
+    def mutate(writer: PdfWriter) -> None:
+        annot = DictionaryObject()
+        annot[NameObject("/Type")] = NameObject("/Annot")
+        annot[NameObject("/Subtype")] = NameObject("/Link")
+        annot[NameObject("/Rect")] = ArrayObject([FloatObject(v) for v in (72, 600, 272, 620)])
+        annot[NameObject("/F")] = NumberObject(4)
+        writer.pages[0][NameObject("/Annots")] = ArrayObject([annot])
+
+    return _rewrite(make_pdf(), mutate)
+
+
 def pdf_with_widget_annotation(*, rect: tuple[float, float, float, float] = (72, 600, 272, 640)) -> bytes:
     """A text form field with a real appearance stream, for the flattening tests.
 
@@ -275,6 +357,11 @@ class NamedWidget:
     ft: str = "/Tx"
     flags: int = 0  # /Ff
     javascript: bool = False  # an /AA keystroke action, which intake must refuse
+    #: A pre-filled ``/V``, with a matching ``/AP /N`` appearance stream -- what a generator that
+    #: fills its own form produces, and the shape that puts an MRN or a name inside a widget.
+    value: str | None = None
+    #: ``/TU``, the tooltip a reader shows on hover.
+    tooltip: str | None = None
 
 
 def _widget_dict(writer: PdfWriter, widget: NamedWidget) -> tuple[Any, Any]:
@@ -290,6 +377,22 @@ def _widget_dict(writer: PdfWriter, widget: NamedWidget) -> tuple[Any, Any]:
     annot[NameObject("/Subtype")] = NameObject("/Widget")
     annot[NameObject("/Rect")] = ArrayObject([FloatObject(value) for value in widget.rect])
     annot[NameObject("/F")] = NumberObject(4)  # Print
+
+    if widget.value is not None:
+        appearance = DecodedStreamObject()
+        appearance.set_data(f"BT /Helv 10 Tf 2 4 Td ({widget.value}) Tj ET".encode())
+        appearance[NameObject("/Type")] = NameObject("/XObject")
+        appearance[NameObject("/Subtype")] = NameObject("/Form")
+        appearance[NameObject("/BBox")] = ArrayObject(
+            [FloatObject(v) for v in (0, 0, widget.rect[2] - widget.rect[0], widget.rect[3] - widget.rect[1])]
+        )
+        appearance[NameObject("/Resources")] = DictionaryObject()
+        appearances = DictionaryObject()
+        appearances[NameObject("/N")] = appearance
+        annot[NameObject("/AP")] = appearances
+        annot[NameObject("/V")] = TextStringObject(widget.value)
+    if widget.tooltip is not None:
+        annot[NameObject("/TU")] = TextStringObject(widget.tooltip)
 
     if widget.javascript:
         action = DictionaryObject()
@@ -401,6 +504,36 @@ def generated_report(
     canvas.save()
     data = buffer.getvalue()
     return _attach_widgets(data, widgets) if widgets else data
+
+
+def page_content(pdf: bytes, page: int = 0) -> bytes:
+    """The decoded content stream of one page: the ink a reader actually draws, and nothing else.
+
+    Narrower than :func:`inflated_streams` on purpose. "The mark is in the file somewhere" can be
+    true of an object no reader reaches; "the mark is in the page's own content stream" is the
+    claim worth asserting.
+    """
+    contents = PdfReader(io.BytesIO(pdf)).pages[page].get_contents()
+    assert contents is not None, f"page {page + 1} has no content stream"
+    return bytes(contents.get_data())
+
+
+def inflated_streams(pdf: bytes) -> bytes:
+    """Every stream in the file, decompressed where it can be, plus the raw bytes.
+
+    Unlinking an object is not removing it. This is what "the text is not in the file" has to be
+    measured against, because ``/AcroForm`` and ``/Annots`` can both be gone while the widget
+    dictionary and its appearance stream are still written out -- and pypdf packs dictionaries into
+    compressed object streams, so the raw bytes alone would not see them either.
+    """
+    found = bytearray(pdf)
+    for chunk in pdf.split(b"stream")[1:]:
+        body = chunk.split(b"endstream")[0]
+        try:
+            found += zlib.decompress(body.strip(b"\r\n"))
+        except zlib.error:
+            continue
+    return bytes(found)
 
 
 def widget_names(pdf: bytes) -> list[str]:

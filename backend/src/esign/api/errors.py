@@ -46,6 +46,39 @@ _BY_CODE: Final[dict[str, str]] = {
     "idempotency_key_reused": "That idempotency key was already used with a different request.",
     "idempotency_key_required": "This request needs an Idempotency-Key header.",
     "out_of_scope": "This service does not support that kind of signing.",
+    # Addendum 2, the host-supplied document path. These reach an integrator wiring up an EHR, not
+    # a patient, and every one of them is about the file that was just sent -- so the sentence says
+    # which class of problem it is. None of them names a role, a widget or anything else out of the
+    # request: the `code` is the stable, specific part, exactly as SPEC section 9 has it.
+    "fields_unresolved": "The document has no signature block for one of the signer roles you declared.",
+    "supplied_definitions_invalid": "The field or signer-role definitions for that document were refused.",
+    "supplied_too_large": "That document is larger than this service accepts.",
+    "supplied_too_many_pages": "That document has more pages than this service accepts.",
+    "supplied_no_pages": "That document has no pages.",
+    "supplied_encrypted": "That document is encrypted; supply it unencrypted.",
+    "supplied_already_signed": "That document already carries a signature.",
+    "supplied_signature_field": (
+        "That document contains an AcroForm signature field. Place the signature block as an "
+        "ordinary text widget named <role_key>_signature instead."
+    ),
+    "supplied_annotation_not_removable": (
+        "That document contains a visible annotation. Draw the mark into the page content before "
+        "supplying it, because annotations are removed."
+    ),
+    "supplied_javascript": "That document contains JavaScript or an action trigger.",
+    "supplied_xfa": "That document contains an XFA form.",
+    "supplied_forbidden_action": "That document contains an action this service does not accept.",
+    "supplied_embedded_file": "That document contains an embedded file.",
+    "supplied_embedded_stream": "That document contains an embedded file.",
+    "supplied_forbidden_annotation": "That document contains a multimedia or attachment annotation.",
+    "supplied_unreadable_object": "That document could not be read.",
+    "supplied_content_unreadable": "That document has a page whose content could not be read.",
+    "supplied_too_complex": "That document is too large to inspect.",
+    "supplied_flatten_changed_pages": "That document could not be prepared without changing its page count.",
+    "field_page_out_of_range": "A field names a page the document does not have.",
+    "document_type_not_approved": "That document type cannot be signed here.",
+    "signer_roles_required": "A supplied document needs at least one signer role.",
+    "duplicate_role": "Two signer roles share a key.",
 }
 
 _BY_STATUS: Final[dict[int, str]] = {

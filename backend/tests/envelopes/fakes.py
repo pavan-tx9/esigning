@@ -69,7 +69,7 @@ from esign.contracts import (
     ValidationFailed,
     is_opaque_id,
 )
-from esign.documents.definitions import MAX_LABEL_CHARS
+from esign.documents.definitions import ID_PATTERN, MAX_LABEL_CHARS
 from esign.ids import advisory_lock_key, new_id
 
 # --------------------------------------------------------------------------- blobs
@@ -416,6 +416,11 @@ class FakeDocumentService:
         #: refuse to do.
         self.flatten_drops_a_page = False
         self.flattened = 0
+        #: Addendum 2: how many times a PDF was re-parsed to learn its page count. The addendum
+        #: asks that a 30-page report "present without re-parsing on every request", and the
+        #: service's fallback to this method when ``document_revisions.page_count`` is NULL is
+        #: silent, so a regression there would be invisible without a count.
+        self.pages_counted = 0
 
     def inspect_template_pdf(self, pdf: bytes) -> TemplatePdfInfo:
         return TemplatePdfInfo(
@@ -452,6 +457,14 @@ class FakeDocumentService:
 
     def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
         """Map the document's widget names onto the declared roles, dropping the rest."""
+        # A key no widget name could ever match is a malformed key, not a document missing its
+        # signature block, and the real resolver says so before it reads a widget.
+        malformed = sorted({role.key for role in signer_roles if not ID_PATTERN.match(role.key)})
+        if malformed:
+            raise ValidationFailed(
+                f"signer role key(s) must match [a-z][a-z0-9_]*: {', '.join(malformed)}",
+                code="supplied_definitions_invalid",
+            )
         header = _supplied_header(pdf)
         if header is None:
             raise ValidationFailed("the supplied document could not be read", code="supplied_unreadable")
@@ -460,13 +473,23 @@ class FakeDocumentService:
         by_key = {role.key: role for role in signer_roles}
 
         fields: list[FieldDef] = []
+        taken: set[str] = set()
         for index, name in enumerate(widgets):
             role_key, field_type = _claimed_by(name, by_key)
             if role_key is None:
                 continue  # an unmatched widget is dropped here and flattened away below
+            # The id is the role key and the field type, exactly as `esign.documents.supplied`
+            # builds it, and never the widget's name: an id is written into the append-only trail
+            # as ``signer.signed.data.captures[].field_id``, and a widget name in a per-patient
+            # report is host text that may carry an MRN or a surname. A fake that used the name
+            # would teach these tests the opposite of what the service does.
+            field_id = f"{role_key}_{field_type}"
+            if field_id in taken:
+                field_id = next(f"{field_id}_{n}" for n in range(2, 1000) if f"{field_id}_{n}" not in taken)
+            taken.add(field_id)
             fields.append(
                 FieldDef(
-                    id=name,
+                    id=field_id,
                     type=field_type,  # type: ignore[arg-type]  # from _WIDGET_TYPES
                     # The signature block is at the end of a generated report; the widget's own
                     # page is what the real resolver reads, and here that is the last one.
@@ -518,12 +541,17 @@ class FakeDocumentService:
 
         Not the real validator (that has its own tests): page within the document, rect inside the
         page as the document reports it, every field pointing at a declared role, every role
-        carrying a signature. Those four are what ``create_from_document`` promises it runs before
-        anything is written, so the fake has to be able to refuse them.
+        carrying a signature, and a role key the audit trail could record. Those five are what
+        ``create_from_document`` promises it runs before anything is written, so the fake has to be
+        able to refuse them.
         """
         _ = prefill_fields
         declared = {role.key for role in signer_roles}
-        problems: list[str] = []
+        problems: list[str] = [
+            f"role {role.key!r}: key must match [a-z][a-z0-9_]*"
+            for role in signer_roles
+            if not ID_PATTERN.match(role.key)
+        ]
         for definition in fields:
             what = f"field {definition.id!r}"
             if definition.page < 1 or definition.page > info.page_count:
@@ -583,6 +611,7 @@ class FakeDocumentService:
         raise NotImplementedError("Addendum 1 A (paper archives): FakeDocumentService.build_archive_cover")
 
     def page_count(self, pdf: bytes) -> int:
+        self.pages_counted += 1
         header = _supplied_header(pdf)
         base = self.pages if header is None else int(header.get("pages", "0"))
         return base + (1 if b"% certificate" in pdf else 0)
