@@ -77,6 +77,10 @@ LOGGABLE_KEYS: Final[frozenset[str]] = frozenset(
         "document_type",
         "event_type",
         "envelope_status",
+        # Addendum 2: `template` or `host_document`, the `envelopes.source` enum itself. Named for
+        # its column rather than a bare `source`, which is the kind of key a later caller fills
+        # with free text without noticing the allowlist was meant to stop exactly that.
+        "envelope_source",
         "signer_status",
         "signer_role",
         "role_key",

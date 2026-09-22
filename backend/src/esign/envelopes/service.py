@@ -347,9 +347,10 @@ class EnvelopeServiceImpl:
             signer_count=len(planned),
             presented_sha256=presented.sha256,
             page_count=page_count,
-            # ``revision_kind`` rather than a ``source`` key: the structured logger's allowlist is
-            # closed (``esign.logging.LOGGABLE_KEYS``) and ``supplied`` is exactly what says this
-            # envelope's revision 1 came from the host.
+            # Where the document came from, in the column's own words, beside the revision kind
+            # that follows from it. Both are closed enums from the schema, so neither can become a
+            # place for anything about the patient to arrive (``esign.logging.LOGGABLE_KEYS``).
+            envelope_source="host_document",
             revision_kind="supplied",
         )
         # ``spec.document``, the flattened bytes and the display names never leave this frame.
@@ -519,6 +520,9 @@ class EnvelopeServiceImpl:
             signing_order=spec.signing_order,
             signer_count=len(planned),
             presented_sha256=presented.sha256,
+            # Said on both paths, so "which envelopes came from a template?" is one grep and not
+            # the absence of a key (Addendum 2).
+            envelope_source="template",
         )
         # `prepared`, `spec.prefill` and the display names never leave this frame: nothing above
         # stores or logs them outside the PDF and the signers table.
