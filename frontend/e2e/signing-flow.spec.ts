@@ -358,6 +358,7 @@ test("a clinician in a signing queue is not handed off again while the earlier c
   await expect(ui.getByTestId("step-confirm")).toBeVisible();
   const covered = ui.getByTestId("reauth-verified");
   await expect(covered).toHaveAttribute("data-reauth-scope", "span");
+  await expect(covered).toContainText(/You confirmed your identity at \d{1,2}:\d{2}/);
   await expect(covered).toContainText(/covers this signature until \d{1,2}:\d{2}/);
   await expect(ui.getByRole("button", { name: "Confirm it's me" })).toHaveCount(0);
   await expect(page.locator("#reauth")).toBeHidden();

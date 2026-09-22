@@ -95,6 +95,8 @@ export const sessionSchema = z.object({
     requires_reauth: z.boolean(),
     reauth_valid_until: timestamp.nullable(),
     reauth_scope: reauthScopeSchema.nullable(),
+    /** When that attestation was made: the moment the signer confirmed their identity. */
+    reauth_at: timestamp.nullable(),
   }),
   other_signers: z.array(z.object({ role_label: z.string(), status: signerStatusSchema })),
   fields: z.array(fieldSchema),
@@ -252,7 +254,8 @@ export function postSign(request: SignRequest, idempotencyKey: string) {
  * afterwards and its `adopted_signature: null` is what the UI believes.
  */
 export function postRevokeAdoptedSignature() {
-  return api("/signing/adopted-signature/revoke", ackSchema, { method: "POST", body: {} });
+  // No body: the route takes none, and the session token says whose signature it is.
+  return api("/signing/adopted-signature/revoke", ackSchema, { method: "POST" });
 }
 
 // --------------------------------------------------------------------------- idempotency

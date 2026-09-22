@@ -60,6 +60,11 @@ CheckStatus = Literal["passed", "failed", "skipped"]
 #: written in one transaction but from two ``Clock`` reads. Matches the envelope service's own
 #: tolerance, so the seal and this report cannot disagree about what counts as drift.
 _ROW_EVENT_TOLERANCE: Final = timedelta(seconds=60)
+#: ``signer.signed.reauth_age_seconds`` is whole seconds, measured from a ``Clock`` read taken
+#: immediately before the event is appended (nothing but the append itself sits between the two),
+#: so ``occurred_at - age`` names the attestation's ``auth_time`` to within a second or two. A row
+#: whose ``auth_time`` has been moved by more than this is a finding.
+_REAUTH_AGE_TOLERANCE: Final = timedelta(seconds=5)
 
 
 @dataclass(frozen=True)
@@ -657,7 +662,7 @@ class Verifier:
             if _text(row.method) != _text(event.data.get("reauth_method")):
                 problems.append(f"{signer_id}: the attestation's method is not the one signer.signed recorded")
             recorded_auth_time = event.occurred_at - timedelta(seconds=int(age))
-            if abs(row.auth_time - recorded_auth_time) > _ROW_EVENT_TOLERANCE:
+            if abs(row.auth_time - recorded_auth_time) > _REAUTH_AGE_TOLERANCE:
                 problems.append(f"{signer_id}: the attestation's auth_time is not the age signer.signed recorded")
             pair = whose.get(signer_id)
             if pair is not None and row.host_id is not None and (str(row.host_id), str(row.host_user_id)) != pair:

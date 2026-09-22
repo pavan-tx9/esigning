@@ -37,6 +37,14 @@ __all__ = ["PdfDocumentService"]
 log = get_logger(__name__)
 
 
+def _scan_code(code: str) -> str:
+    """``template_too_many_pages`` -> ``scan_too_many_pages``, ``pdf_encrypted`` -> ``scan_encrypted``."""
+    for prefix in ("template_", "pdf_"):
+        if code.startswith(prefix):
+            return f"scan_{code[len(prefix) :]}"
+    return code
+
+
 class PdfDocumentService:
     """pypdf + reportlab + Pillow implementation of ``esign.contracts.DocumentService``."""
 
@@ -59,6 +67,26 @@ class PdfDocumentService:
             sha256=info.sha256,
             size_bytes=len(pdf),
         )
+        return info
+
+    def inspect_scan_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        """The template hygiene rules under the scan bounds (Addendum 1 A).
+
+        Rasterised pages are larger than rendered text and a paper consent packet has more of
+        them, so the bounds differ; nothing else does. The codes are the template ones with their
+        prefix changed, so a host reading them knows they are about the file it just sent.
+        """
+        bounds = self._settings.model_copy(
+            update={
+                "max_template_bytes": self._settings.max_scan_bytes,
+                "max_template_pages": self._settings.max_scan_pages,
+            }
+        )
+        try:
+            info = inspection.inspect_template(pdf, bounds)
+        except ValidationFailed as exc:
+            raise ValidationFailed("the scan was refused", code=_scan_code(exc.code)) from None
+        log.info("documents.scan_inspected", page_count=info.page_count, sha256=info.sha256, size_bytes=len(pdf))
         return info
 
     def validate_definitions(

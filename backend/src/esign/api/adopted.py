@@ -75,12 +75,10 @@ def save_adopted_signature(
     kind: AdoptedSignatureKind = "drawn" if source.kind == "drawn" else "typed"
     image_sha256: bytes | None = None
     if kind == "drawn":
-        if source.image_png is None:  # pragma: no cover - the sign path refused it already
-            raise ValidationFailed("there is no drawn signature to save", code="no_signature_to_save")
-        # ``sign`` stored the *sanitised* PNG as a ``signature_image`` blob a moment ago, and the
-        # blob store is content-addressed, so sanitising the same bytes again names that blob
-        # exactly. The row points at the bytes that were stamped, never at the client's original.
-        image_sha256 = hashlib.sha256(rt.documents.sanitize_signature_png(source.image_png)).digest()
+        # The image the row points at is the one the trail says was applied: ``signer.signed``'s
+        # ``CaptureRef`` for this field carries the digest of the sanitised PNG ``sign`` stored a
+        # moment ago, so the saved signature is tied to the hash chain, never to the client's bytes.
+        image_sha256 = _applied_image_sha256(rt, db, session, source.field_id)
 
     replaced = rt.identity.get_adopted_signature(db, host_id=session.host_id, host_user_id=session.host_user_id)
     adopted = rt.identity.adopt_signature(
@@ -108,6 +106,28 @@ def save_adopted_signature(
     if replaced is not None:
         _record_revocation(rt, db, replaced, reason="replaced", actor=signer_actor(session, capacity), ctx=ctx)
     return adopted
+
+
+def _applied_image_sha256(rt: Runtime, db: Session, session: SessionInfo, field_id: str) -> bytes:
+    """The digest of the drawn signature ``sign`` just stamped into ``field_id``, from the trail.
+
+    The ``signer.signed`` event this session appended in this transaction records one
+    ``CaptureRef`` per capture, and a drawn one carries ``image_sha256``: the content address of
+    the sanitised PNG stored as a ``signature_image`` blob. Reading it back from the chain, rather
+    than re-deriving it from the request, means the row can only ever name ink the trail vouches
+    for -- and ``adopt_signature`` checks that blob exists and is a signature image.
+    """
+    signed = [
+        event
+        for event in rt.audit.list(db, "envelope", session.envelope_id)
+        if event.event_type == EventType.SIGNER_SIGNED and event.ctx.session_id == session.id
+    ]
+    if not signed:  # pragma: no cover - ``sign`` appended it a moment ago
+        raise ValidationFailed("there is no signature to save", code="no_signature_to_save")
+    for ref in signed[-1].data.get("captures") or []:
+        if isinstance(ref, dict) and ref.get("field_id") == field_id and ref.get("image_sha256"):
+            return bytes.fromhex(str(ref["image_sha256"]))
+    raise ValidationFailed("there is no drawn signature to save", code="no_signature_to_save")
 
 
 def revoke_and_record(

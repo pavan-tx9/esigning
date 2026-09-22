@@ -367,6 +367,8 @@ def signing_session_json(
             # an earlier document of the same signing queue, ``null`` when there is none.
             "reauth_valid_until": timestamp(view.reauth_valid_until),
             "reauth_scope": view.reauth_scope,
+            # ...and when it was made, so the UI can say "you confirmed your identity at HH:MM".
+            "reauth_at": timestamp(view.reauth_at),
         },
         "other_signers": [{"role_label": label, "status": status} for label, status in view.other_signers],
         "fields": [

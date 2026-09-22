@@ -343,6 +343,9 @@ class FakeDocumentService:
             sha256=hashlib.sha256(pdf).digest(),
         )
 
+    def inspect_scan_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        return self.inspect_template_pdf(pdf)
+
     def validate_definitions(
         self,
         info: TemplatePdfInfo,
@@ -621,10 +624,12 @@ class FakeIdentityService:
     # -- re-authentication --------------------------------------------------
     def attest_reauth(self, db: Session, *, host: Host, session_id: UUID, auth: AuthContext) -> SessionInfo:
         _ = host
+        info = next(record.info for record in self._sessions.values() if record.info.id == session_id)
+        # Whose attestation this is, as ``0700`` records it: from the session, never the request.
         db.execute(
             text(
-                "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at) "
-                "VALUES (:id, :session, :method, :auth_time, :at)"
+                "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at, host_id, host_user_id) "
+                "VALUES (:id, :session, :method, :auth_time, :at, :host_id, :host_user_id)"
             ),
             {
                 "id": new_id(),
@@ -632,28 +637,49 @@ class FakeIdentityService:
                 "method": auth.method,
                 "auth_time": auth.auth_time,
                 "at": self._clock.now(),
+                "host_id": info.host_id,
+                "host_user_id": info.host_user_id,
             },
         )
-        return next(record.info for record in self._sessions.values() if record.info.id == session_id)
+        return info
 
     def fresh_reauth(self, db: Session, session_id: UUID) -> ReauthEvidence | None:
+        """This session's own attestation first; with the span on, the same user's most recent one
+        on another of their sessions (``scope="span"``), within both windows -- the same
+        resolution order as the real service, so the envelope tests can exercise a queue."""
+        now = self._clock.now()
+        own = self._fake_attestation(db, session_id, now=now, span=False)
+        if own is not None or self._settings.reauth_span_seconds <= 0:
+            return own
+        return self._fake_attestation(db, session_id, now=now, span=True)
+
+    def _fake_attestation(self, db: Session, session_id: UUID, *, now: datetime, span: bool) -> ReauthEvidence | None:
+        asking = next(record.info for record in self._sessions.values() if record.info.id == session_id)
+        if span:
+            sql = (
+                "SELECT id, method, auth_time FROM reauth_attestations "
+                "WHERE host_id = :host_id AND host_user_id = :host_user_id AND session_id <> :id "
+                "ORDER BY auth_time DESC LIMIT 1"
+            )
+        else:
+            sql = "SELECT id, method, auth_time FROM reauth_attestations WHERE session_id = :id ORDER BY auth_time DESC LIMIT 1"
         row = db.execute(
-            text(
-                "SELECT id, method, auth_time, attested_at FROM reauth_attestations "
-                "WHERE session_id = :id ORDER BY attested_at DESC LIMIT 1"
-            ),
-            {"id": session_id},
+            text(sql), {"id": session_id, "host_id": asking.host_id, "host_user_id": asking.host_user_id}
         ).one_or_none()
         if row is None:
             return None
-        age = (self._clock.now() - row.attested_at.astimezone(UTC)).total_seconds()
-        if age > self._settings.reauth_max_age_seconds:
+        auth_time = row.auth_time.astimezone(UTC)
+        age = (now - auth_time).total_seconds()
+        window = self._settings.reauth_max_age_seconds
+        if span:
+            window = min(window, self._settings.reauth_span_seconds)
+        if age < 0 or age > window:
             return None
         return ReauthEvidence(
             attestation_id=row.id if isinstance(row.id, UUID) else UUID(str(row.id)),
             method=cast(AuthMethod, str(row.method)),
-            auth_time=row.auth_time.astimezone(UTC),
-            scope="session",
+            auth_time=auth_time,
+            scope="span" if span else "session",
         )
 
     # -- adopted signatures (Addendum 1 B) ----------------------------------

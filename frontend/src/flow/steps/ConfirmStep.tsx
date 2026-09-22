@@ -90,6 +90,7 @@ export function ConfirmStep({
   const coveredUntil = signer.reauth_valid_until
     ? clockTime(signer.reauth_valid_until, session.consent.locale)
     : null;
+  const confirmedAt = signer.reauth_at ? clockTime(signer.reauth_at, session.consent.locale) : null;
 
   const request = useMemo<SignRequest>(
     () => buildSignRequest(session.fields, draft, { kiosk: session.session.kiosk }),
@@ -246,12 +247,12 @@ export function ConfirmStep({
                 data-reauth-scope={signer.reauth_scope ?? undefined}
               >
                 <span aria-hidden="true">✓ </span>
-                {signer.reauth_scope === "span"
-                  ? "You confirmed your identity for an earlier document a short while ago. "
-                  : "You've already confirmed it's you. "}
-                {coveredUntil !== null
-                  ? `That confirmation covers this signature until ${coveredUntil}, and the record will say so.`
-                  : "That confirmation covers this signature, and the record will say so."}
+                {confirmedAt !== null
+                  ? `You confirmed your identity at ${confirmedAt}`
+                  : "You've already confirmed your identity"}
+                {signer.reauth_scope === "span" ? " for an earlier document" : ""}
+                {"; this signature will be recorded under that confirmation."}
+                {coveredUntil !== null ? ` It covers this signature until ${coveredUntil}.` : ""}
                 {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
               </p>
               <Button

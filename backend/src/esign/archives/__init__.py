@@ -15,6 +15,6 @@ delegates here.
 
 from __future__ import annotations
 
-from esign.archives.service import ArchiveService, build_archive_service, scan_settings
+from esign.archives.service import ArchiveService, build_archive_service
 
-__all__ = ["ArchiveService", "build_archive_service", "scan_settings"]
+__all__ = ["ArchiveService", "build_archive_service"]

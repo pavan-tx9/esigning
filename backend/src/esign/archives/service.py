@@ -48,7 +48,7 @@ from esign.contracts import (
 from esign.ids import new_id
 from esign.logging import get_logger
 
-__all__ = ["ArchiveService", "build_archive_service", "scan_settings"]
+__all__ = ["ArchiveService", "build_archive_service"]
 
 log = get_logger(__name__)
 
@@ -61,24 +61,6 @@ _MAX_PAPER_SIGNERS: Final[int] = 20
 
 _CAPACITIES: Final[frozenset[str]] = frozenset(get_args(Capacity))
 _DISPOSITIONS: Final[frozenset[str]] = frozenset(get_args(OriginalDisposition))
-
-
-def scan_settings(settings: Settings) -> Settings:
-    """``settings`` with the template bounds replaced by the scan bounds (Addendum 1 A).
-
-    A scan goes through exactly the template hygiene rules -- no encryption, no JavaScript, no XFA,
-    no embedded files, no existing signature -- but under ``MAX_SCAN_BYTES`` / ``MAX_SCAN_PAGES``:
-    rasterised pages are larger than rendered text and a paper consent packet has more of them.
-    ``DocumentService.inspect_template_pdf`` reads those two bounds from its settings and the
-    contract gives it no other way to be told, so the archive route is served by a document service
-    built from this copy. Nothing else about it differs.
-    """
-    return settings.model_copy(
-        update={
-            "max_template_bytes": settings.max_scan_bytes,
-            "max_template_pages": settings.max_scan_pages,
-        }
-    )
 
 
 class ArchiveService:
@@ -98,7 +80,6 @@ class ArchiveService:
         self._clock = clock
         self._audit = audit_log
         self._blobs = blob_service
-        #: Built from :func:`scan_settings`: the hygiene rules of a template, the bounds of a scan.
         self._documents = document_service
 
     def create(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> UUID:
@@ -109,7 +90,7 @@ class ArchiveService:
         """
         now = self._clock.now()
         document_type = self._approved(spec.document_type)
-        patient_ref = _require_opaque(spec.patient_ref)
+        patient_ref = _require_opaque(spec.patient_ref, "patient_ref_invalid")
         attestation = _check_attestation(spec.attestation)
         paper_signed_on = _check_signing_date(spec.paper_signed_on, now)
         info = self._inspect(scan)
@@ -205,16 +186,12 @@ class ArchiveService:
         return value
 
     def _inspect(self, scan: bytes) -> TemplatePdfInfo:
-        """The template hygiene rules under the scan bounds.
+        """The template hygiene rules under the scan bounds (``DocumentService.inspect_scan_pdf``).
 
         Image-only pages are expected and fine; anything active, encrypted or already signed is
-        not. The codes are the template ones with their prefix changed, so a host reading them
-        knows they are about the scan it just sent and not about a template it does not have.
+        not, and the document service answers with ``scan_`` codes.
         """
-        try:
-            return self._documents.inspect_template_pdf(scan)
-        except ValidationFailed as exc:
-            raise ValidationFailed("the scan was refused", code=_scan_code(exc.code)) from None
+        return self._documents.inspect_scan_pdf(scan)
 
     def _lock_superseded(self, db: Session, host: Host, envelope_id: UUID | None) -> repo.SupersededRow | None:
         """The same rule ``EnvelopeService.create`` applies: only a sealed envelope of this host,
@@ -260,21 +237,13 @@ class ArchiveService:
 # --------------------------------------------------------------------------- validation helpers
 
 
-def _scan_code(code: str) -> str:
-    """``template_too_many_pages`` -> ``scan_too_many_pages``, ``pdf_encrypted`` -> ``scan_encrypted``."""
-    for prefix in ("template_", "pdf_"):
-        if code.startswith(prefix):
-            return f"scan_{code[len(prefix) :]}"
-    return code
-
-
-def _require_opaque(value: str) -> str:
-    """Host-chosen identifiers reach the audit trail, so they must not be facts about a person."""
+def _require_opaque(value: str, code: str = "host_user_id_invalid") -> str:
+    """Host-chosen identifiers reach the audit trail, so they must not be facts about a person.
+    The codes are the ones ``EnvelopeService.create`` uses: ``patient_ref_invalid`` for the
+    patient reference, ``host_user_id_invalid`` for a person's id."""
     text_value = (value or "").strip()
     if not is_opaque_id(text_value):
-        raise ValidationFailed(
-            "an identifier must be opaque: no spaces, not a name or a date", code="host_user_id_invalid"
-        )
+        raise ValidationFailed("an identifier must be opaque: no spaces, not a name or a date", code=code)
     return text_value
 
 
@@ -335,11 +304,7 @@ def build_archive_service(
     blob_service: BlobService,
     document_service: DocumentService,
 ) -> ArchiveService:
-    """The module's one factory (SPEC section 2).
-
-    ``document_service`` must be one built from :func:`scan_settings`, so the hygiene check applies
-    the scan bounds rather than the template ones. ``esign.runtime`` is the only caller.
-    """
+    """The module's one factory (SPEC section 2). ``esign.runtime`` is the only caller."""
     return ArchiveService(
         settings,
         clock,

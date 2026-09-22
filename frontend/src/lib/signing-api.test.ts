@@ -53,6 +53,7 @@ describe("the session schema is SPEC 9, exactly", () => {
         requires_reauth: false,
         reauth_valid_until: null,
         reauth_scope: null,
+        reauth_at: null,
       },
       other_signers: [{ role_label: "Witness", status: "pending" }],
       fields: [
@@ -91,6 +92,7 @@ describe("the session schema is SPEC 9, exactly", () => {
     Object.assign(drawn.signer, {
       reauth_valid_until: "2026-09-22T10:02:00Z",
       reauth_scope: "span",
+      reauth_at: "2026-09-22T10:00:00Z",
     });
     const parsed = sessionSchema.parse(drawn);
     expect(parsed.adopted_signature?.kind).toBe("drawn");
@@ -108,6 +110,7 @@ describe("the session schema is SPEC 9, exactly", () => {
     Object.assign(typed.signer, {
       reauth_valid_until: "2026-09-22T10:02:00Z",
       reauth_scope: "session",
+      reauth_at: "2026-09-22T10:00:00Z",
     });
     expect(sessionSchema.safeParse(typed).success).toBe(true);
 

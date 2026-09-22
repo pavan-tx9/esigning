@@ -84,7 +84,7 @@ def test_identifiers_that_are_facts_about_a_person_are_refused(host: Ehr) -> Non
 
     dated = file_archive(host, patient_ref="1971-04-02")
     assert dated.status_code == 422
-    assert error_code(dated) == "host_user_id_invalid"
+    assert error_code(dated) == "patient_ref_invalid"  # the code ``POST /v1/envelopes`` uses for it
 
 
 def test_an_attestation_without_a_paper_signer_is_refused(host: Ehr) -> None:

@@ -17,10 +17,10 @@ from uuid import UUID
 import pytest
 from pypdf import PdfReader
 
-from esign.archives import scan_settings
 from esign.config import Settings
 from esign.contracts import ArchiveCoverSummary, Attestation, DocumentService, PaperSigner, ValidationFailed
 from esign.documents import build_document_service
+from tests.archives.conftest import scan_pdf
 
 ENVELOPE_ID = UUID("6f1c7bd6-1f5a-4a6c-9f4f-9f0d9f7b1a55")
 ATTESTED_AT = datetime(2026, 3, 17, 14, 30, tzinfo=UTC)
@@ -115,15 +115,18 @@ def test_a_long_name_does_not_break_the_page(documents: DocumentService) -> None
     assert "destroyed under the practice's retention policy" in _text(pdf)
 
 
-def test_scan_settings_changes_only_the_two_bounds(settings_no_db: Settings) -> None:
-    """The archives module's document service differs from every other one in exactly two values,
-    which is what lets a 100-page scan through the check a 50-page template would fail."""
-    scanning = scan_settings(settings_no_db)
-    assert scanning.max_template_bytes == settings_no_db.max_scan_bytes
-    assert scanning.max_template_pages == settings_no_db.max_scan_pages
-    before = settings_no_db.model_dump()
-    changed = {key for key, value in scanning.model_dump().items() if before.get(key) != value}
-    assert changed <= {"max_template_bytes", "max_template_pages"}
+def test_inspect_scan_pdf_applies_the_scan_bounds_and_scan_codes(settings_no_db: Settings) -> None:
+    """A 100-page scan passes the check a 50-page template would fail, and the refusal codes say
+    ``scan`` so a host knows which file they are about."""
+    documents = build_document_service(settings_no_db.model_copy(update={"max_scan_pages": 3, "max_template_pages": 1}))
+    two_pages = scan_pdf(pages=2)
+    assert documents.inspect_scan_pdf(two_pages).page_count == 2
+    with pytest.raises(ValidationFailed) as as_template:
+        documents.inspect_template_pdf(two_pages)
+    assert as_template.value.code == "template_too_many_pages"
+    with pytest.raises(ValidationFailed) as too_many:
+        documents.inspect_scan_pdf(scan_pdf(pages=4))
+    assert too_many.value.code == "scan_too_many_pages"
 
 
 def test_something_that_is_not_a_pdf_is_refused_before_it_is_ever_filed(documents: DocumentService) -> None:

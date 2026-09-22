@@ -508,9 +508,10 @@ describe("a re-authentication carried over from an earlier document", () => {
 
     const covered = screen.getByTestId("reauth-verified");
     expect(covered).toHaveAttribute("data-reauth-scope", "span");
+    expect(covered).toHaveTextContent(/You confirmed your identity at \d{1,2}:\d{2}/);
     expect(covered).toHaveTextContent("for an earlier document");
+    expect(covered).toHaveTextContent("recorded under that confirmation");
     expect(covered).toHaveTextContent(/covers this signature until \d{1,2}:\d{2}/);
-    expect(covered).toHaveTextContent("the record will say so");
     expect(screen.queryByRole("button", { name: "Confirm it's me" })).toBeNull();
     expect(screen.queryByTestId("reauth-waiting")).toBeNull();
     expect(screen.getByRole("button", { name: "Confirm again" })).toBeInTheDocument();

@@ -361,6 +361,14 @@ class DocumentService(Protocol):
         """Reject (ValidationFailed) PDFs that are encrypted, already signed, contain JavaScript,
         XFA, embedded files or launch actions, or exceed configured size/page limits."""
 
+    def inspect_scan_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        """Addendum 1 A: exactly the rules of ``inspect_template_pdf`` -- no encryption, scripts,
+        XFA, embedded files or existing signatures -- under ``MAX_SCAN_BYTES`` / ``MAX_SCAN_PAGES``
+        instead of the template bounds. Image-only pages are expected and fine. The error codes
+        say ``scan`` where the template ones say ``template`` (``scan_too_large``,
+        ``scan_too_many_pages``, ``scan_encrypted``, ...), so a host reading them knows they are
+        about the file it just sent."""
+
     def validate_definitions(
         self,
         info: TemplatePdfInfo,
@@ -922,6 +930,10 @@ class SigningView:
     fields: tuple[SigningFieldView, ...]  # this signer's fields only
     #: Addendum 1 C: which attestation ``reauth_valid_until`` rests on; ``None`` when there is none.
     reauth_scope: ReauthScope | None = None
+    #: Addendum 1 C: that attestation's ``auth_time`` -- when the signer confirmed their identity --
+    #: so the UI can say "you confirmed your identity at HH:MM" rather than infer it. ``None``
+    #: exactly when ``reauth_valid_until`` is.
+    reauth_at: datetime | None = None
 
 
 WebhookEvent = Literal[
@@ -936,6 +948,20 @@ class EnvelopeNotifier(Protocol):
         and hashes only."""
 
 
+class ArchiveCreator(Protocol):
+    """Addendum 1 A: the ``esign.archives`` module, as ``EnvelopeService.create_archive`` sees it.
+
+    ``esign.runtime`` builds the archives module and injects it into the envelope service like
+    every other collaborator; the envelope service delegates ``create_archive`` here and owns
+    everything from ``completed_pending_seal`` onwards (the seal, the certificate, the webhook,
+    voiding, verification), which it already does for both kinds.
+    """
+
+    def create(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> UUID:
+        """File the scan and return the new envelope's id, in the caller's transaction. Enforces
+        and records exactly what ``EnvelopeService.create_archive`` documents."""
+
+
 class EnvelopeService(Protocol):
     """Owns every envelope and signer state transition. Each method locks the envelope row,
     checks the transition is legal, applies it, and appends the audit event in the same
@@ -947,7 +973,8 @@ class EnvelopeService(Protocol):
         """Addendum 1 A: file a scan of a paper-signed document as a ``paper_archive`` envelope.
 
         Enforces: ``document_type`` approved (ValidationFailed ``document_type_not_approved``),
-        ``patient_ref`` and ``attestation.staff_user_id`` opaque (``host_user_id_invalid``),
+        ``patient_ref`` opaque (``patient_ref_invalid``, as ``create`` says it) and
+        ``attestation.staff_user_id`` opaque (``host_user_id_invalid``),
         ``paper_signed_on`` not after today (``paper_signed_on_in_future``), at least one paper
         signer, and the scan passing the template hygiene rules under ``MAX_SCAN_BYTES`` /
         ``MAX_SCAN_PAGES`` (``inspect_template_pdf``: no encryption, scripts, XFA, embedded files

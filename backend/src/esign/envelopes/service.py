@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, Final, Literal, Protocol, cast, get_args
+from typing import Any, Final, Literal, cast, get_args
 from uuid import UUID
 
 from sqlalchemy import text
@@ -39,6 +39,7 @@ from esign.contracts import (
     Actor,
     ActorRole,
     ArchiveCoverSummary,
+    ArchiveCreator,
     AuditEvent,
     AuditLog,
     BlobService,
@@ -130,18 +131,6 @@ class _Loaded:
     signers: tuple[repo.SignerRow, ...]
     roles: dict[str, SignerRoleDef]
     template: repo.TemplateVersionRow | None
-
-
-class ArchiveCreator(Protocol):
-    """Addendum 1 A: what ``create_archive`` delegates to (``esign.archives``).
-
-    Declared here rather than imported, so the envelopes module keeps depending on
-    ``contracts.py`` and the foundation alone (SPEC section 2). ``esign.runtime`` builds the
-    archives module and injects it, exactly as it injects the other collaborators.
-    """
-
-    def create(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> UUID:
-        """File the scan and return the new envelope's id, in the caller's transaction."""
 
 
 class EnvelopeServiceImpl:
@@ -367,8 +356,10 @@ class EnvelopeServiceImpl:
             on_behalf_of_label=signer.on_behalf_of,
             reauth_valid_until=self._reauth_valid_until(fresh),
             # Addendum 1 C: the UI skips the hand-off while this is in the future, so it has to be
-            # told whether the attestation behind it belongs to this session or was borrowed.
+            # told whether the attestation behind it belongs to this session or was borrowed, and
+            # when it was made, so it can say so in the signer's own words.
             reauth_scope=None if fresh is None else fresh.scope,
+            reauth_at=None if fresh is None else fresh.auth_time,
             other_signers=tuple(
                 (loaded.roles[s.role_key].label if s.role_key in loaded.roles else s.role_key, s.status)
                 for s in sorted(loaded.signers, key=lambda s: (s.order_index, s.role_key))
@@ -613,6 +604,11 @@ class EnvelopeServiceImpl:
         repo.update_envelope(db, loaded.envelope.id, current_revision_sha256=revision.sha256)
         repo.update_signer(db, signer.id, status="signed", signed_at=now)
 
+        # The attestation's age is measured *here*, a moment before the event is appended, not
+        # from the ``now`` the stamp carries: stamping and storing the revision sit between the two,
+        # and the certificate derives ``reauth_at`` as ``occurred_at - reauth_age_seconds``, which
+        # verification then compares with the attestation row under a tight tolerance.
+        reauth_age = None if reauth is None else _age_seconds(self._clock.now(), reauth.auth_time)
         self._append(
             db,
             loaded.envelope.id,
@@ -633,7 +629,7 @@ class EnvelopeServiceImpl:
                 # evidence -- the document says which one it borrowed and how stale it was.
                 "reauth_attestation_id": None if reauth is None else reauth.attestation_id,
                 "reauth_scope": None if reauth is None else reauth.scope,
-                "reauth_age_seconds": None if reauth is None else _age_seconds(now, reauth.auth_time),
+                "reauth_age_seconds": reauth_age,
                 # Addendum 1 B: which saved signature was applied, when one was. The certificate
                 # prints "signed with a saved signature adopted on <date>" from it.
                 "adopted_signature_id": _adopted_signature_id(accepted),

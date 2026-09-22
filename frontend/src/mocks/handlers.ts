@@ -1,6 +1,7 @@
 import { delay, HttpResponse, http } from "msw";
 import {
   documentFor,
+  ENVELOPE_ID,
   LOCALE_PATTERN,
   MockHttpError,
   type MockRecord,
@@ -12,6 +13,7 @@ import {
   recordRevokeSaved,
   recordSign,
   recordViewed,
+  SIGNER_ID,
   sessionBody,
 } from "@/mocks/db";
 
@@ -50,10 +52,11 @@ function signerRoute(latency: number, handle: Handle) {
   };
 }
 
+/** Every signer POST answers ids and statuses only (SPEC section 9), the real shape exactly. */
 const ack = (record: MockRecord) =>
   HttpResponse.json({
-    envelope_status: record.envelopeStatus,
-    signer_status: record.signerStatus,
+    envelope: { id: ENVELOPE_ID, status: record.envelopeStatus },
+    signer: { id: SIGNER_ID, status: record.signerStatus },
   });
 
 export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
@@ -121,10 +124,10 @@ export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
 
     http.post(
       "/v1/signing/adopted-signature/revoke",
-      signerRoute(latency, (record) => {
-        recordRevokeSaved(record);
-        return ack(record);
-      }),
+      signerRoute(latency, (record) =>
+        // 200 either way; the body says whether there was one (`api/signer_routes.py`).
+        HttpResponse.json({ revoked: recordRevokeSaved(record) }),
+      ),
     ),
 
     http.post(
