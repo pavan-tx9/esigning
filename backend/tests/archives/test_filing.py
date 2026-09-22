@@ -114,7 +114,8 @@ def test_the_scan_is_stored_write_once_as_revision_one(host: Ehr, world: World) 
     with world.sessions() as db:
         revisions = db.execute(
             text(
-                "SELECT revision_no, kind, sha256 FROM document_revisions WHERE envelope_id = :id ORDER BY revision_no"
+                "SELECT revision_no, kind, sha256, page_count FROM document_revisions "
+                "WHERE envelope_id = :id ORDER BY revision_no"
             ),
             {"id": view["id"]},
         ).all()
@@ -129,6 +130,10 @@ def test_the_scan_is_stored_write_once_as_revision_one(host: Ehr, world: World) 
     ]
     assert bytes(revisions[0].sha256).hex() == view["presented_sha256"]
     assert blob_kind == "scan_pdf"
+    # Addendum 2 persists the page count as each revision is written, so nothing re-parses a PDF
+    # to count it later. The scan is two pages; the cover sheet and the certificate are the rest.
+    assert revisions[0].page_count == 2
+    assert all(r.page_count is not None for r in revisions)
 
 
 def test_the_sealed_document_is_cover_then_scan_then_certificate(host: Ehr) -> None:

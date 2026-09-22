@@ -116,7 +116,14 @@ class ArchiveService:
             expires_at=self._settings.default_expiry(now),
             created_at=now,
         )
-        repo.insert_scan_revision(db, revision_id=new_id(), envelope_id=envelope_id, sha256=blob.sha256, created_at=now)
+        repo.insert_scan_revision(
+            db,
+            revision_id=new_id(),
+            envelope_id=envelope_id,
+            sha256=blob.sha256,
+            page_count=info.page_count,
+            created_at=now,
+        )
 
         self._append(
             db,

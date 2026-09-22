@@ -131,15 +131,22 @@ def insert_archive_envelope(
 
 
 def insert_scan_revision(
-    db: Session, *, revision_id: UUID, envelope_id: UUID, sha256: bytes, created_at: datetime
+    db: Session, *, revision_id: UUID, envelope_id: UUID, sha256: bytes, page_count: int, created_at: datetime
 ) -> None:
-    """Revision 1 of a paper archive: the scan as it was received, kind ``scan``."""
+    """Revision 1 of a paper archive: the scan as it was received, kind ``scan``.
+
+    Addendum 2 persists ``page_count`` on every revision as it is written, so that nothing later
+    re-parses the PDF to count its pages. The archive service has already counted this one while
+    inspecting the scan, so the number costs nothing here; readers fall back to counting when the
+    column is NULL, and this is the last writer that was leaving it so.
+    """
     db.execute(
         text(
-            "INSERT INTO document_revisions (id, envelope_id, revision_no, kind, sha256, signer_id, created_at) "
-            "VALUES (:id, :env, 1, 'scan', :sha, NULL, :at)"
+            "INSERT INTO document_revisions "
+            "(id, envelope_id, revision_no, kind, sha256, signer_id, created_at, page_count) "
+            "VALUES (:id, :env, 1, 'scan', :sha, NULL, :at, :pages)"
         ),
-        {"id": revision_id, "env": envelope_id, "sha": sha256, "at": created_at},
+        {"id": revision_id, "env": envelope_id, "sha": sha256, "at": created_at, "pages": page_count},
     )
 
 
