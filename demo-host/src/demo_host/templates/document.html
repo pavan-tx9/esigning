@@ -5,9 +5,20 @@
   <section class="card">
     <h1>{{ document.title }}</h1>
     <p class="lead">{{ patient.name }} · filed {{ document.filed_at.strftime('%Y-%m-%d %H:%M UTC') }}</p>
+    {% if document.kind == 'paper_archive' %}
+      <p class="fine">
+        The seal proves this scan has not changed since it was filed, and who attested to it. It does
+        not prove the ink signature is genuine: that rests on the paper original and the member of
+        staff who filed it. The cover page inside the PDF says the same.
+      </p>
+    {% endif %}
     <dl class="facts">
       <div><dt>Sealed document</dt><dd><code class="hash">{{ document.sealed_sha256 }}</code></dd></div>
-      <div><dt>Template</dt><dd>{{ document.template_key }}</dd></div>
+      {% if document.kind == 'paper_archive' %}
+        <div><dt>Kind</dt><dd data-testid="document-kind">Scan of a document signed on paper on {{ document.paper_signed_on }}</dd></div>
+      {% else %}
+        <div><dt>Template</dt><dd>{{ document.template_key }}</dd></div>
+      {% endif %}
       <div><dt>Size</dt><dd>{{ '{:,}'.format(document.pdf|length) }} bytes</dd></div>
     </dl>
     <div class="actions">

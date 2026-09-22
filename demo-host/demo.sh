@@ -12,6 +12,11 @@
 #   DEMO_HOST_PORT   (8100)   the stand-in EHR
 #   DEMO_SKIP_BUILD  (unset)  do not rebuild the signing UI even if it looks stale
 #   DEMO_QUIET       (unset)  no banner; used by the end-to-end runner
+#
+# The demo runs the service with a five-minute re-authentication span (REAUTH_SPAN_SECONDS=300 and
+# REAUTH_MAX_AGE_SECONDS=300, both exported below unless already set) so the clinician's signing
+# queue can be shown. The service's default is 0 -- one re-authentication per document -- and
+# demo-host/README.md says why it should stay that way unless compliance has agreed otherwise.
 
 set -euo pipefail
 
@@ -91,7 +96,12 @@ if [ -z "${DEMO_SKIP_BUILD:-}" ]; then
 fi
 
 # ------------------------------------------------------------------ 4. the API
-step "starting the API on ${API_PORT}"
+# Addendum 1 C: the signing queue. Off by default in the service; on for the demo, for both the
+# API (which answers reauth_valid_until) and the worker (which seals what the API accepted).
+export REAUTH_SPAN_SECONDS="${REAUTH_SPAN_SECONDS:-300}"
+export REAUTH_MAX_AGE_SECONDS="${REAUTH_MAX_AGE_SECONDS:-300}"
+
+step "starting the API on ${API_PORT} (re-authentication span ${REAUTH_SPAN_SECONDS}s)"
 # `esign serve` rather than uvicorn directly: it drops uvicorn's log config, so its own loggers
 # propagate to the allowlisted structured handler instead of writing straight to stdout.
 (
@@ -136,7 +146,7 @@ fi
 # ------------------------------------------------------------------ 6. the sample templates
 published="$(curl -s -H "Authorization: Bearer $DEMO_ESIGN_API_KEY" "$API_URL/v1/templates")"
 missing=0
-for key in hipaa_acknowledgement patient_consent procedure_consent; do
+for key in hipaa_acknowledgement patient_consent procedure_consent clinical_order; do
   grep -q "\"$key\"" <<<"$published" || missing=1
 done
 if [ "$missing" = "1" ]; then
@@ -186,9 +196,13 @@ if [ -z "${DEMO_QUIET:-}" ]; then
     ${BOLD}grace${RESET}   a parent, signing a consent to treatment on behalf of her child.
     ${BOLD}ben${RESET}     the witness on the procedure consent. His turn comes after Maria's.
     ${BOLD}priya${RESET}   the clinician on it. Signing in a professional capacity, so she is asked
-              for her password again before the signature is taken.
-    ${BOLD}tomas${RESET}   the other clinician. Can open a chart and re-verify anything in it.
-    ${BOLD}alice${RESET}   the front desk. Starts the clinic tablet from "Clinic tablet".
+              for her password again before the signature is taken. Also has a queue of
+              order sign-offs: "Signing queue" confirms her identity once for all of them.
+    ${BOLD}tomas${RESET}   the other clinician, with a queue of his own. Save a signature on the
+              first order and the second offers it back.
+    ${BOLD}alice${RESET}   the front desk. Starts the clinic tablet from "Clinic tablet", files a
+              scan of an ink-signed document from "File a paper document", and can remove
+              anybody's saved signature from "People".
 
   ${DIM}Worth watching: the Webhooks page, which shows each delivery and whether its signature
   checked out, and any document in a chart, which has a button that re-verifies the seal, every

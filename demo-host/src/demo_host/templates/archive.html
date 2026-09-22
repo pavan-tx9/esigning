@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}File a paper document · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>File a paper document</h1>
+    <p class="lead">
+      A document that was signed in ink. Upload the scan and say what it is; the signing service
+      stores it write-once, seals it with a timestamp, and it lands in the chart with the same
+      verification as anything signed electronically.
+    </p>
+    <p class="fine">
+      What the seal proves: that the scan has not changed since you filed it, and that you attested
+      to it. What it does not prove: that the ink signature is genuine. That rests on the paper
+      original and on you. The cover page inside the sealed PDF says exactly this.
+    </p>
+    <p class="fine">
+      No scanner handy? <a href="/static/sample-scan.pdf" download>Download the sample scan</a>, a
+      two-page image-only PDF, and file that.
+    </p>
+    {% if problem_code %}
+      <p class="notice error" role="alert" data-testid="archive-problem">
+        That did not work: <code>{{ problem_code }}</code>.
+        {% if problem_code == 'incomplete' %}Every field is needed, including the attestation.{% endif %}
+        {% if problem_code == 'not_a_pdf' %}The scan has to be a PDF of at most 20 MiB.{% endif %}
+        {% if problem_code.startswith('scan_') %}The signing service refused the scan.{% endif %}
+      </p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <form method="post" action="/archive" enctype="multipart/form-data" class="signin archive-form">
+      <label for="archive-patient">Patient</label>
+      <select id="archive-patient" name="patient_id" required>
+        {% for patient in patients %}
+          <option value="{{ patient.id }}">{{ patient.name }} · record {{ patient.mrn }}</option>
+        {% endfor %}
+      </select>
+
+      <label for="archive-type">Document type</label>
+      <select id="archive-type" name="document_type" required>
+        {% for key, label in archive_document_types.items() %}
+          <option value="{{ key }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+
+      <label for="archive-title">Title in the chart</label>
+      <input id="archive-title" name="title" type="text" maxlength="120" placeholder="e.g. Consent to treatment (signed on paper)" />
+
+      <label for="archive-date">Date it was signed on paper</label>
+      <input id="archive-date" name="paper_signed_on" type="date" max="{{ today }}" required />
+
+      <label for="archive-scan">The scan (PDF)</label>
+      <input id="archive-scan" name="scan" type="file" accept="application/pdf" required />
+
+      <fieldset>
+        <legend>Who signed the paper</legend>
+        <p class="fine">Named on the cover page and the certificate, never in the audit trail.</p>
+        {% for n in [1, 2] %}
+          <div class="paper-signer">
+            <label for="signer-name-{{ n }}">Name{% if n == 2 %} (optional){% endif %}</label>
+            <input id="signer-name-{{ n }}" name="signer_name" type="text" maxlength="200" {% if n == 1 %}required{% endif %} />
+            <label for="signer-capacity-{{ n }}">Capacity</label>
+            <select id="signer-capacity-{{ n }}" name="signer_capacity">
+              {% for capacity in paper_capacities %}
+                <option value="{{ capacity }}" {% if (n == 1 and capacity == 'self') or (n == 2 and capacity == 'witness') %}selected{% endif %}>{{ capacity }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        {% endfor %}
+      </fieldset>
+
+      <label for="archive-disposition">The paper original</label>
+      <select id="archive-disposition" name="original_disposition" required>
+        {% for key, label in dispositions.items() %}
+          <option value="{{ key }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+
+      <fieldset>
+        <legend>Attestation</legend>
+        <label class="radio">
+          <input type="checkbox" name="true_copy" value="yes" required />
+          I, {{ user.display_name }}, attest that this scan is a complete and accurate copy of the paper document.
+        </label>
+        <p class="fine">
+          Recorded in the audit trail against your user id, and printed on the cover page and the
+          certificate with your name.
+        </p>
+      </fieldset>
+
+      <button type="submit" data-testid="archive-file">File it</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

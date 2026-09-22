@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate the three sample templates and their definitions, reproducibly.
+"""Generate the four sample templates and their definitions, reproducibly.
 
 Run from the repository root::
 
@@ -11,11 +11,12 @@ the JSON is written sorted with a trailing newline. ``tests/documents/test_sampl
 regenerates everything into a temporary directory and fails if a single byte differs, so a
 template can never drift from the script that claims to produce it.
 
-The three templates are the ones SPEC section 6 requires:
+The first three templates are the ones SPEC section 6 requires; the fourth is Addendum 1's:
 
 ``patient_consent``         one signer, who may sign for themselves or as a guardian
 ``hipaa_acknowledgement``   one signer, one page
 ``procedure_consent``       patient, witness and clinician, in that order, over three pages
+``clinical_order``          one signer, a clinician, one page: what a signing queue is made of
 
 The bodies are plain-language placeholders, not legal advice. A deployment replaces them with text
 its counsel has approved; the geometry and the role structure are the part worth copying.
@@ -133,7 +134,7 @@ def render(sample: Sample) -> bytes:
     return buffer.getvalue()
 
 
-# --------------------------------------------------------------------------- the three samples
+# --------------------------------------------------------------------------- the four samples
 
 
 def _patient_consent() -> Sample:
@@ -380,7 +381,69 @@ def _procedure_consent() -> Sample:
     )
 
 
-SAMPLES: Final[tuple[Sample, ...]] = (_patient_consent(), _hipaa_acknowledgement(), _procedure_consent())
+def _clinical_order() -> Sample:
+    """A clinician's sign-off on an order for a patient: one signer, one page, re-authentication
+    required. The document a clinician signs many of in a row, which is what Addendum 1 C's
+    signing queue exists for -- and the one that shows a saved signature (Addendum 1 B) earning
+    its keep."""
+    roles = [
+        SignerRoleDef(
+            key="clinician",
+            label="Clinician",
+            allowed_capacities=("clinician",),
+            requires_reauth=True,
+            order_index=0,
+        )
+    ]
+    fields = [
+        FieldDef(
+            id="clinician_signature",
+            type="signature",
+            page=1,
+            rect=Rect(x=72, y=200, w=240, h=46),
+            signer_role="clinician",
+            label="Clinician signature",
+        ),
+        FieldDef(
+            id="clinician_date",
+            type="date_signed",
+            page=1,
+            rect=Rect(x=352, y=200, w=170, h=18),
+            signer_role="clinician",
+            label="Date signed",
+        ),
+    ]
+    prefill = [
+        PrefillFieldDef(key="patient_name", page=1, rect=Rect(x=72, y=560, w=240, h=14), font_size=10),
+        PrefillFieldDef(key="order_reference", page=1, rect=Rect(x=352, y=560, w=170, h=14), font_size=10),
+        PrefillFieldDef(
+            key="order_summary", page=1, rect=Rect(x=72, y=380, w=468, h=150), font_size=10, multiline=True
+        ),
+    ]
+    body = [
+        "This confirms the order described below for the patient named above. By signing, the "
+        "clinician states that they gave or reviewed the order, that it is complete and accurate "
+        "as written, and that it may be acted on.",
+        "A signature here is a clinical act. The records system asks the clinician to confirm their "
+        "identity again immediately before it is taken, and records how and when that was done.",
+    ]
+    return Sample(
+        key="clinical_order",
+        name="Clinical order sign-off",
+        document_type="clinical_order",
+        signer_roles=roles,
+        fields=fields,
+        prefill_fields=prefill,
+        pages=[("Order confirmation", body)],
+    )
+
+
+SAMPLES: Final[tuple[Sample, ...]] = (
+    _patient_consent(),
+    _hipaa_acknowledgement(),
+    _procedure_consent(),
+    _clinical_order(),
+)
 
 
 # --------------------------------------------------------------------------- writing

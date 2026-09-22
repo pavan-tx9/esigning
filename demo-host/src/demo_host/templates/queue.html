@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Signing queue · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>Signing queue</h1>
+    <p class="lead">
+      Orders waiting on your sign-off. Confirm your identity once, then sign each one in turn.
+    </p>
+    <p class="fine">
+      Every one of these is a clinical signature, so the signing service needs a fresh confirmation
+      of who you are before each is taken. This clinic has told the service to let one confirmation
+      cover a queue for five minutes (<code>REAUTH_SPAN_SECONDS=300</code>). Each document is still
+      reviewed, consented to and signed on its own, and the record of each signature says which
+      confirmation it rests on and how old that confirmation was.
+    </p>
+    {% if problem_code %}
+      <p class="notice error" role="alert" data-testid="queue-problem">
+        That did not work: <code>{{ problem_code }}</code>.
+        {% if problem_code == 'wrong_password' %}That password did not match.{% endif %}
+      </p>
+    {% endif %}
+    {% if unreachable %}
+      <p class="notice warn" role="alert">
+        The signing service did not answer (<code>{{ unreachable }}</code>), so the statuses below may
+        be out of date.
+      </p>
+    {% endif %}
+  </section>
+
+  <section class="card" data-testid="queue-reauth">
+    <h2>Confirm it's you</h2>
+    {% if reauth %}
+      <p class="notice ok" data-testid="queue-confirmed">
+        Confirmed at {{ reauth.at.strftime('%H:%M:%S UTC') }}. The service will accept it for your
+        other documents until {{ reauth.valid_until[11:19] }} UTC; after that it asks again.
+      </p>
+      <p class="fine">
+        The confirmation was recorded against the first document's signing session. Your later
+        documents borrow it, and their records say so (<code>reauth_scope: span</code>).
+      </p>
+    {% else %}
+      <p class="fine">
+        Your password, checked by this records system; the confirmation is then attested to the
+        signing service server to server, against the first document's signing session.
+      </p>
+    {% endif %}
+    <form method="post" action="/queue/reauth" class="signin">
+      <label for="queue-password">Password</label>
+      <input id="queue-password" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit" data-testid="queue-confirm">{{ 'Confirm again' if reauth else 'Confirm once for the queue' }}</button>
+    </form>
+  </section>
+
+  {% for row in rows %}
+    <section class="card task" data-testid="queue-task" data-status="{{ row.my_status }}">
+      <h2>{{ row.task.title }}</h2>
+      <dl class="facts">
+        <div><dt>Patient</dt><dd>{{ row.patient.name }}</dd></div>
+        <div><dt>Order</dt><dd>{{ row.task.prefill.order_reference }}</dd></div>
+        <div><dt>Your status</dt><dd><span class="pill pill-{{ row.my_status }}">{{ row.my_status }}</span></dd></div>
+        <div><dt>Document</dt><dd>{{ row.task.envelope_status|replace('_', ' ') }}</dd></div>
+      </dl>
+      <p class="fine">{{ row.task.prefill.order_summary }}</p>
+      <div class="actions">
+        {% if row.my_status == 'signed' %}
+          <p class="done" data-testid="queue-done">Signed.</p>
+          {% if row.document %}
+            <a class="button" href="/chart/document/{{ row.document.id }}">See it in the chart</a>
+          {% endif %}
+        {% elif row.ready %}
+          <form method="post" action="/tasks/{{ row.task.id }}/open">
+            <input type="hidden" name="return_to" value="/queue" />
+            <button type="submit" data-testid="queue-sign">Read and sign</button>
+          </form>
+        {% else %}
+          <p class="done">This document is no longer open for signature.</p>
+        {% endif %}
+      </div>
+    </section>
+  {% else %}
+    <section class="card"><p data-testid="queue-empty">Nothing is waiting for your sign-off.</p></section>
+  {% endfor %}
+</div>
+{% endblock %}

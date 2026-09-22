@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import json
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
 
-from fastapi import Cookie, FastAPI, Form, Request, Response
+from fastapi import Cookie, FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -35,7 +35,9 @@ from demo_host.esign_api import EsignApiError, EsignClient
 from demo_host.signatures import SIGNATURE_HEADER, verify_signature
 from demo_host.store import (
     IDENTITY_CHECK_LABELS,
+    ArchiveFiling,
     ChartDocument,
+    QueueReauth,
     Store,
     Task,
     TaskSigner,
@@ -52,9 +54,41 @@ SESSION_COOKIE = "demo_session"
 #: What a clinic tablet says it did to check the person in front of it.
 IDENTITY_CHECKS = tuple(IDENTITY_CHECK_LABELS)
 
+#: A signing session lasts 30 minutes on the service; one younger than this is reused rather than
+#: replaced, because replacing it revokes it and a re-authentication attested on it with it.
+SESSION_REUSE = timedelta(minutes=25)
+
+#: Where a page may send somebody back to after signing. A closed list, so a return address can
+#: never be a link somebody else chose.
+RETURN_URLS = {"/worklist": "Back to the worklist", "/queue": "Back to the signing queue"}
+
+#: The paper documents staff can file (Addendum 1 A). The document type is what the service's
+#: retention and approval rules key on; the title is this EHR's own label for the chart.
+ARCHIVE_DOCUMENT_TYPES = {
+    "patient_consent": "Consent to treatment",
+    "hipaa_acknowledgement": "Acknowledgement of privacy practices",
+    "procedure_consent": "Consent to a procedure",
+    "clinical_order": "Clinical order sign-off",
+}
+DISPOSITIONS = {
+    "retained": "The paper original is kept on file",
+    "returned_to_signer": "The paper original was returned to the signer",
+    "destroyed_per_policy": "The paper original was destroyed under the retention policy",
+}
+PAPER_CAPACITIES = ("self", "guardian", "proxy", "witness", "interpreter", "clinician")
+MAX_SCAN_BYTES = 20 * 1024 * 1024
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _is_date(value: str) -> bool:
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def create_app(
@@ -68,6 +102,9 @@ def create_app(
     app.mount("/static", StaticFiles(directory=_HERE / "static"), name="static")
     pages = Jinja2Templates(directory=str(_HERE / "templates"))
     pages.env.globals["identity_check_labels"] = IDENTITY_CHECK_LABELS
+    pages.env.globals["archive_document_types"] = ARCHIVE_DOCUMENT_TYPES
+    pages.env.globals["dispositions"] = DISPOSITIONS
+    pages.env.globals["paper_capacities"] = PAPER_CAPACITIES
 
     # ------------------------------------------------------------------ helpers
 
@@ -253,31 +290,48 @@ def create_app(
         )
 
     @app.post("/tasks/{task_id}/open")
-    def open_task(task_id: str, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
+    def open_task(
+        task_id: str,
+        return_to: Annotated[str, Form()] = "/worklist",
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
         """Create the envelope if it does not exist, start a signing session for this person, and
         send them to the page that embeds the signing UI. The token stays here."""
         user = current_user(demo_session)
         if user is None:
             return to_login()
+        back = return_to if return_to in RETURN_URLS else "/worklist"
         task = state.tasks.get(task_id)
         if task is None or task.signer_for(user.id) is None:
-            return RedirectResponse("/worklist?problem_code=not_your_task", status_code=303)
+            return RedirectResponse(f"{back}?problem_code=not_your_task", status_code=303)
         try:
             ensure_envelope(task)
             started = start_session(task, user, demo_session)
         except EsignApiError as exc:
-            return RedirectResponse(f"/worklist?problem_code={exc.code}", status_code=303)
+            return RedirectResponse(f"{back}?problem_code={exc.code}", status_code=303)
         if started is None:
-            return RedirectResponse("/worklist?problem_code=no_signer", status_code=303)
-        return RedirectResponse(f"/sign/{task.id}", status_code=303)
+            return RedirectResponse(f"{back}?problem_code=no_signer", status_code=303)
+        return RedirectResponse(
+            f"/sign/{task.id}" + (f"?return_to={back}" if back != "/worklist" else ""), status_code=303
+        )
 
     def start_session(task: Task, user: User, session_key: str | None) -> TaskSigner | None:
+        """Start a signing session for this person on this task, or reuse the one already running.
+
+        The service revokes a signer's previous session whenever a new one is created, and a
+        re-authentication attested on a revoked session covers nothing. A queue confirms identity
+        on the first document's session *before* that document is opened, so opening it has to
+        keep that session rather than mint another.
+        """
         signer = signer_for(task, user)
         if signer is None or task.envelope_id is None:
             return None
         signer_id = task.signer_ids.get(signer.role_key)
         if signer_id is None:
             return None
+        started = task.session_started.get(signer.role_key)
+        if signer.role_key in task.sessions and started is not None and _now() - started < SESSION_REUSE:
+            return signer
         kiosk = task.kiosk
         created = esign.create_session(
             envelope_id=task.envelope_id,
@@ -287,21 +341,119 @@ def create_app(
             kiosk=kiosk,
         )
         task.sessions[signer.role_key] = (str(created["session_id"]), str(created["token"]))
+        task.session_started[signer.role_key] = _now()
         return signer
+
+    # ------------------------------------------------------------------ the signing queue (Addendum 1 C)
+
+    def queue_rows(user: User) -> tuple[list[dict[str, Any]], str | None]:
+        rows: list[dict[str, Any]] = []
+        unreachable: str | None = None
+        for task in state.queue_for(user):
+            unreachable = refresh(task) or unreachable
+            signer = task.signer_for(user.id)
+            assert signer is not None
+            my_status = task.signer_status.get(signer.role_key, "pending")
+            rows.append(
+                {
+                    "task": task,
+                    "patient": state.patients[task.patient_id],
+                    "my_status": my_status,
+                    "ready": my_status not in {"signed", "declined"}
+                    and not task.is_finished
+                    and waiting_for(task, signer) is None,
+                    "document": state.document_for_envelope(task.envelope_id or ""),
+                }
+            )
+        return rows, unreachable
+
+    @app.get("/queue", response_class=HTMLResponse)
+    def queue(
+        request: Request,
+        problem_code: str | None = None,
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        """A clinician's signing queue: the documents waiting on them, one confirmation of their
+        identity, then each document in turn. The service is configured with a re-authentication
+        span for the demo, so the confirmation made on the first document covers the rest for a
+        few minutes; every signature still records which confirmation it rests on."""
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if user.role != "clinician":
+            return problem(request, user, "Clinicians only", "The signing queue is for clinicians' sign-offs.", 403)
+        rows, unreachable = queue_rows(user)
+        return render(
+            request,
+            "queue.html",
+            {
+                "user": user,
+                "rows": rows,
+                "problem_code": problem_code,
+                "unreachable": unreachable,
+                "reauth": state.queue_reauth.get(user.id),
+                "now": _now(),
+            },
+        )
+
+    @app.post("/queue/reauth")
+    def queue_reauth(
+        password: Annotated[str, Form()],
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        """Confirm the clinician's identity once for the queue.
+
+        The service has no "re-authenticate this user" call, on purpose: an attestation belongs to
+        a session, and a session belongs to one signer of one document. So the first document in
+        the queue gets its envelope and session here, the attestation is made on that session, and
+        with the span on the service lets the clinician's other sessions borrow it. The password
+        is checked by this EHR, and the attestation goes server to server, exactly as on the
+        signing page.
+        """
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if user.role != "clinician":
+            return RedirectResponse("/worklist?problem_code=clinicians_only", status_code=303)
+        if not secrets.compare_digest(password, settings.password):
+            return RedirectResponse("/queue?problem_code=wrong_password", status_code=303)
+        rows, _ = queue_rows(user)
+        first = next((row["task"] for row in rows if row["ready"]), None)
+        if first is None:
+            return RedirectResponse("/queue?problem_code=nothing_to_sign", status_code=303)
+        try:
+            ensure_envelope(first)
+            started = start_session(first, user, demo_session)
+            if started is None:
+                return RedirectResponse("/queue?problem_code=no_signer", status_code=303)
+            session_id = first.sessions[started.role_key][0]
+            result = esign.reauth(session_id=session_id, method="password", auth_time=_now())
+        except EsignApiError as exc:
+            return RedirectResponse(f"/queue?problem_code={exc.code}", status_code=303)
+        state.queue_reauth[user.id] = QueueReauth(
+            at=_now(), valid_until=str(result.get("reauth_valid_until", "")), session_id=session_id
+        )
+        return RedirectResponse("/queue", status_code=303)
 
     # ------------------------------------------------------------------ the embedded signing page
 
     @app.get("/sign/{task_id}", response_class=HTMLResponse)
-    def sign_page(request: Request, task_id: str, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
+    def sign_page(
+        request: Request,
+        task_id: str,
+        return_to: str = "/worklist",
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
         user = current_user(demo_session)
         if user is None:
             return to_login()
+        back = return_to if return_to in RETURN_URLS else "/worklist"
         task = state.tasks.get(task_id)
         if task is None:
             return problem(request, user, "No such document", "That document is not on this worklist.", 404)
         signer = signer_for(task, user)
         if signer is None or signer.role_key not in task.sessions:
-            return RedirectResponse("/worklist?problem_code=session_missing", status_code=303)
+            return RedirectResponse(f"{back}?problem_code=session_missing", status_code=303)
         return render(
             request,
             "sign.html",
@@ -312,9 +464,11 @@ def create_app(
                 "patient": state.patients[task.patient_id],
                 "kiosk": task.kiosk is not None,
                 "kiosk_check": None if task.kiosk is None else IDENTITY_CHECK_LABELS.get(task.kiosk[1], task.kiosk[1]),
-                "needs_reauth": signer.role_key == "clinician",
+                "needs_reauth": signer.capacity == "clinician",
                 "esign_origin": settings.ui_url,
                 "frame_src": settings.signing_ui_src,
+                "return_url": back,
+                "return_label": RETURN_URLS[back],
             },
         )
 
@@ -461,10 +615,184 @@ def create_app(
             task.sessions.pop("patient", None)
         return RedirectResponse("/kiosk", status_code=303)
 
+    # ------------------------------------------------------------------ paper documents (Addendum 1 A)
+
+    @app.get("/archive", response_class=HTMLResponse)
+    def archive_form(
+        request: Request,
+        problem_code: str | None = None,
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if not user.is_staff:
+            return problem(request, user, "Staff only", "Paper documents are filed by the front desk.", 403)
+        return render(
+            request,
+            "archive.html",
+            {
+                "user": user,
+                "patients": list(state.patients.values()),
+                "problem_code": problem_code,
+                "today": _now().date().isoformat(),
+            },
+        )
+
+    @app.post("/archive")
+    async def archive_file(
+        patient_id: Annotated[str, Form()],
+        title: Annotated[str, Form(max_length=120)],
+        document_type: Annotated[str, Form()],
+        paper_signed_on: Annotated[str, Form()],
+        original_disposition: Annotated[str, Form()],
+        signer_name: Annotated[list[str], Form()],
+        signer_capacity: Annotated[list[str], Form()],
+        scan: Annotated[UploadFile, File()],
+        true_copy: Annotated[str | None, Form()] = None,
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        """File a scan of a document signed on paper (Addendum 1 A).
+
+        The member of staff is the attesting party: their opaque user id goes to the service and
+        into the audit trail, their display name onto the cover page and the certificate. The
+        people who signed the paper are named on the cover page and the certificate only. What
+        the seal will prove is that this scan has not changed since this moment, and who said it
+        was a true copy -- not that the ink is genuine.
+        """
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if not user.is_staff:
+            return RedirectResponse("/worklist?problem_code=staff_only", status_code=303)
+        patient = state.patients.get(patient_id)
+        signers = [
+            {"display_name": name.strip(), "capacity": capacity}
+            for name, capacity in zip(signer_name, signer_capacity, strict=False)
+            if name.strip()
+        ]
+        if (
+            patient is None
+            or document_type not in ARCHIVE_DOCUMENT_TYPES
+            or original_disposition not in DISPOSITIONS
+            or true_copy != "yes"
+            or not signers
+            or any(s["capacity"] not in PAPER_CAPACITIES for s in signers)
+            or not _is_date(paper_signed_on)
+        ):
+            return RedirectResponse("/archive?problem_code=incomplete", status_code=303)
+        data = await scan.read(MAX_SCAN_BYTES + 1)
+        if not data.startswith(b"%PDF") or len(data) > MAX_SCAN_BYTES:
+            return RedirectResponse("/archive?problem_code=not_a_pdf", status_code=303)
+        filing_id = str(uuid4())
+        try:
+            view = esign.file_archive(
+                scan=data,
+                filename="scan.pdf",
+                patient_ref=patient.mrn,
+                document_type=document_type,
+                host_document_ref=f"paper-{filing_id}",
+                paper_signed_on=paper_signed_on,
+                attestation={
+                    "staff_user_id": user.id,
+                    "staff_display_name": user.display_name,
+                    "statement": "true_copy",
+                    "original_disposition": original_disposition,
+                    "paper_signers": signers,
+                },
+                idempotency_key=filing_id,
+            )
+        except EsignApiError as exc:
+            return RedirectResponse(f"/archive?problem_code={exc.code}", status_code=303)
+        state.record_archive(
+            ArchiveFiling(
+                envelope_id=str(view["id"]),
+                patient_id=patient.id,
+                title=title.strip() or ARCHIVE_DOCUMENT_TYPES[document_type],
+                document_type=document_type,
+                paper_signed_on=paper_signed_on,
+                filed_by=user.id,
+                filed_at=_now(),
+                envelope_status=str(view["status"]),
+            )
+        )
+        return RedirectResponse(f"/chart/{patient.id}?filed=1", status_code=303)
+
+    def refresh_archive(filing: ArchiveFiling) -> None:
+        """Ask the service where the filing has got to, and file the sealed copy if the webhook
+        has not already: the inline seal usually finishes inside the filing request itself."""
+        try:
+            view = esign.envelope(filing.envelope_id)
+        except EsignApiError:
+            return
+        filing.envelope_status = str(view["status"])
+        if filing.envelope_status == "sealed":
+            _file_archive_in_chart(filing, str(view.get("sealed_sha256") or ""))
+
+    def _file_archive_in_chart(filing: ArchiveFiling, sealed_sha256: str) -> None:
+        if state.document_for_envelope(filing.envelope_id) is not None:
+            return
+        try:
+            pdf = esign.sealed_document(filing.envelope_id)
+        except EsignApiError:
+            return
+        state.file_document(
+            ChartDocument(
+                id=str(uuid4()),
+                patient_id=filing.patient_id,
+                title=filing.title,
+                envelope_id=filing.envelope_id,
+                template_key=None,
+                sealed_sha256=sealed_sha256,
+                filed_at=_now(),
+                pdf=pdf,
+                kind="paper_archive",
+                paper_signed_on=filing.paper_signed_on,
+            )
+        )
+
+    # ------------------------------------------------------------------ people (Addendum 1 B)
+
+    @app.get("/people", response_class=HTMLResponse)
+    def people(
+        request: Request,
+        result: str | None = None,
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        """Everybody who signs here, with the one thing a host may do to a saved signature:
+        remove it. There is no host call to create or read one -- staff cannot make a doctor's
+        signature -- so this page cannot say whether a person has one saved."""
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if not user.is_staff:
+            return problem(request, user, "Staff only", "Saved signatures are removed by the front desk.", 403)
+        return render(request, "people.html", {"user": user, "people": list(state.users.values()), "result": result})
+
+    @app.post("/people/{user_id}/revoke-signature")
+    def revoke_signature(user_id: str, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
+        """``POST /v1/users/{host_user_id}/adopted-signature/revoke``, server to server. The
+        service answers 200 either way and says whether there was one to remove."""
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if not user.is_staff or user_id not in state.users:
+            return RedirectResponse("/people?result=refused", status_code=303)
+        try:
+            revoked = esign.revoke_adopted_signature(user_id)
+        except EsignApiError as exc:
+            return RedirectResponse(f"/people?result={exc.code}", status_code=303)
+        return RedirectResponse(f"/people?result={'revoked' if revoked else 'nothing_saved'}", status_code=303)
+
     # ------------------------------------------------------------------ the chart
 
     @app.get("/chart/{patient_id}", response_class=HTMLResponse)
-    def chart(request: Request, patient_id: str, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
+    def chart(
+        request: Request,
+        patient_id: str,
+        filed: str | None = None,
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
         user = current_user(demo_session)
         if user is None:
             return to_login()
@@ -473,11 +801,15 @@ def create_app(
             return problem(request, user, "No such chart", "That chart does not exist here.", 404)
         if not may_see_chart(user, patient_id):
             return problem(request, user, "Not your chart", "You can only open your own chart.", 403)
-        pending = []
+        pending: list[dict[str, str]] = []
         for task in state.tasks_for_patient(patient_id):
             refresh(task)
             if task.envelope_id is not None and state.document_for_envelope(task.envelope_id) is None:
-                pending.append(task)
+                pending.append({"title": task.title, "status": task.envelope_status})
+        for filing in state.archives_for(patient_id):
+            refresh_archive(filing)
+            if state.document_for_envelope(filing.envelope_id) is None:
+                pending.append({"title": f"{filing.title} (paper)", "status": filing.envelope_status})
         return render(
             request,
             "chart.html",
@@ -486,6 +818,7 @@ def create_app(
                 "patient": patient,
                 "documents": state.documents_for(patient_id),
                 "pending": pending,
+                "just_filed": filed is not None,
             },
         )
 
@@ -593,7 +926,8 @@ def create_app(
         envelope_id = str(payload.get("envelope_id", ""))
         delivery_id = str(payload.get("id", uuid4()))
         task = state.task_by_envelope(envelope_id)
-        note = "no task here for that envelope" if task is None else ""
+        filing = state.archives.get(envelope_id)
+        note = "no task here for that envelope" if task is None and filing is None else ""
         first_time = state.record_webhook(
             WebhookRecord(
                 received_at=_now(),
@@ -610,6 +944,11 @@ def create_app(
                 task.signer_status[str(signer["role_key"])] = str(signer["status"])
             if event == "envelope.sealed":
                 _file_in_chart(task, payload)
+        if filing is not None and first_time:
+            # A paper archive fires envelope.sealed and envelope.voided only (SPEC section 9).
+            filing.envelope_status = str(payload.get("status", filing.envelope_status))
+            if event == "envelope.sealed":
+                _file_archive_in_chart(filing, str(payload.get("sealed_sha256", "")))
         return JSONResponse({"received": True})
 
     def _file_in_chart(task: Task, payload: dict[str, Any]) -> None:

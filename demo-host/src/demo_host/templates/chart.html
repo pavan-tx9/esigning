@@ -12,14 +12,26 @@
     </p>
   </section>
 
+  {% if just_filed %}
+    <section class="card">
+      <p class="notice ok" role="status" data-testid="archive-filed">
+        The scan has been filed with the signing service. It appears below once it is sealed and the
+        sealed copy has come back -- usually within a few seconds. Reload to check.
+      </p>
+    </section>
+  {% endif %}
+
   <section class="card">
     <h2>Signed documents</h2>
     {% if documents %}
       <ul class="plain documents">
         {% for document in documents %}
-          <li data-testid="chart-document">
+          <li data-testid="chart-document" data-kind="{{ document.kind }}">
             <a href="/chart/document/{{ document.id }}">{{ document.title }}</a>
-            <span class="fine">filed {{ document.filed_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+            <span class="fine">
+              {% if document.kind == 'paper_archive' %}scan of a paper document signed on {{ document.paper_signed_on }} ·{% endif %}
+              filed {{ document.filed_at.strftime('%Y-%m-%d %H:%M UTC') }}
+            </span>
           </li>
         {% endfor %}
       </ul>
@@ -32,8 +44,8 @@
     <section class="card">
       <h2>Out for signature</h2>
       <ul class="plain">
-        {% for task in pending %}
-          <li>{{ task.title }} — {{ task.envelope_status|replace('_', ' ') }}</li>
+        {% for item in pending %}
+          <li>{{ item.title }} — {{ item.status|replace('_', ' ') }}</li>
         {% endfor %}
       </ul>
     </section>

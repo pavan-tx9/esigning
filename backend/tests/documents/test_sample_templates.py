@@ -1,4 +1,4 @@
-"""The three shipped sample templates, and the script that claims to produce them.
+"""The four shipped sample templates, and the script that claims to produce them.
 
 Two things are being checked. That the templates are usable: they pass intake, their definitions
 validate against their own PDFs, and a full prepare/sign/certificate/finalize round trip works on
@@ -25,7 +25,7 @@ from tests.documents.conftest import certificate_summary
 from tests.documents.helpers import handwriting_png
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[3] / "templates"
-KEYS = ("patient_consent", "hipaa_acknowledgement", "procedure_consent")
+KEYS = ("patient_consent", "hipaa_acknowledgement", "procedure_consent", "clinical_order")
 
 
 def load_generator() -> ModuleType:
@@ -41,7 +41,7 @@ def definitions_for(key: str) -> TemplateDefinitions:
     return definitions_from_json(json.loads((TEMPLATE_DIR / f"{key}.json").read_text()))
 
 
-def test_all_three_templates_ship() -> None:
+def test_all_four_templates_ship() -> None:
     for key in KEYS:
         assert (TEMPLATE_DIR / f"{key}.pdf").is_file(), key
         assert (TEMPLATE_DIR / f"{key}.json").is_file(), key

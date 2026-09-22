@@ -138,3 +138,9 @@ footer { max-width: 56rem; margin: 0 auto; padding: 0 1rem 2rem; color: var(--in
 @media (max-width: 40rem) {
   .bar nav { margin-left: 0; width: 100%; gap: 0.75rem; }
 }
+
+.signin select { padding: 0.45rem 0.6rem; border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
+.archive-form { max-width: 34rem; }
+.archive-form fieldset { padding: 0.6rem 0.8rem; }
+.paper-signer { display: grid; grid-template-columns: 1fr auto; gap: 0.25rem 0.75rem; margin: 0.25rem 0 0.5rem; }
+.paper-signer label { grid-column: span 1; }

@@ -33,6 +33,9 @@ uv run python -m demo_host
 | `DEMO_HOST_PORT` | `8100` | Port |
 | `DEMO_PASSWORD` | `demo1234` | The one password everybody here has |
 
+`demo.sh` also exports `REAUTH_SPAN_SECONDS=300` and `REAUTH_MAX_AGE_SECONDS=300` to the service
+it starts (unless they are already set), for the signing queue below.
+
 ## What it covers
 
 - **People.** Two patients, a guardian, a witness, two clinicians and a member of the front desk.
@@ -49,6 +52,32 @@ uv run python -m demo_host
 - **Webhooks,** verified with HMAC and a five-minute timestamp tolerance before anything is
   believed, and deduplicated by delivery id because delivery is at-least-once.
 - **A chart,** where the sealed PDF is filed and can be downloaded and re-verified on demand.
+- **Filing a paper document** (`/archive`, staff). Upload a scan of an ink-signed document, say who
+  signed it and what happened to the original, and attest that the scan is a true copy. It goes to
+  `POST /v1/archives` with the member of staff's opaque id as the attesting party, comes back sealed
+  by webhook, and appears in the chart as a paper archive with the same "Verify it now" button. A
+  sample scan is at `/static/sample-scan.pdf`.
+- **A signing queue** (`/queue`, clinicians). Every order sign-off needs the clinician to confirm
+  their identity immediately before signing. The queue confirms once -- the password is checked
+  here, then attested server to server against the *first* document's signing session -- and the
+  clinician signs each document in turn without being asked again, because the service is running
+  with a re-authentication span.
+- **People** (`/people`, staff). The one thing a host may do about a saved signature: remove it
+  (`POST /v1/users/{id}/adopted-signature/revoke`). There is no host call to create or read one, so
+  staff cannot make a doctor's signature and this page cannot say whether anybody has one.
+
+### Why the re-authentication span is off by default
+
+The developer guide asks for per-document proof that a clinician re-authenticated for *that*
+document, and the service's default (`REAUTH_SPAN_SECONDS=0`) gives exactly that: one attestation
+covers one session, which is one document. A span trades that proof for convenience. It is
+contained -- at most 900 seconds, never further back than `REAUTH_MAX_AGE_SECONDS`, each document
+still reviewed, consented to and signed on its own, and every `signer.signed` event and certificate
+saying which attestation was used, whether it was borrowed (`reauth_scope: span`) and how old it
+was -- but it is still weaker, and whether the trade is acceptable is a compliance decision, not
+an engineering one. The demo turns it on so the queue can be seen working; a deployment should
+leave it at zero until compliance has agreed in writing, and set both settings together when it
+does (the queue's window is the smaller of the two).
 
 ## What it deliberately does not do
 

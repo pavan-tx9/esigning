@@ -103,8 +103,10 @@ make demo         # everything, in the foreground; Ctrl-C stops it
 `make demo` starts Postgres on 54329, applies the migrations, generates a development PKI into
 `.dev-pki/`, seeds the ESIGN disclosure, builds the signing UI, starts the API on :8000, registers
 a demo EHR (keeping its credentials in `.demo/env`, because `esign hosts create` prints the API key
-exactly once), imports the three sample templates, starts the worker, and starts a stand-in EHR on
-:8100. It then prints where to click. Everything it does is safe to repeat.
+exactly once), imports the four sample templates, starts the worker, and starts a stand-in EHR on
+:8100. It then prints where to click. Everything it does is safe to repeat. The demo runs the
+service with a five-minute re-authentication span (`REAUTH_SPAN_SECONDS=300`, off by default;
+`demo-host/README.md` says why) so the clinician's signing queue can be shown.
 
 Open <http://localhost:8100> and sign in as any of `maria`, `grace`, `ben`, `priya`, `tomas` or
 `alice` with the password `demo1234`. Worth doing in this order:
@@ -118,6 +120,13 @@ Open <http://localhost:8100> and sign in as any of `maria`, `grace`, `ben`, `pri
    identity; the signature is still the patient's.
 5. The **Webhooks** page shows each delivery and whether its HMAC checked out. Any document in a
    chart has a button that re-verifies the seal, every stored hash and the whole audit chain.
+6. **alice** — "File a paper document" uploads a scan of an ink-signed document with her
+   attestation; it is sealed and lands in the chart with the same verification button.
+7. **priya** — "Signing queue": three order sign-offs, one confirmation of her identity, then each
+   signed in turn without being asked again. Every signature's record says which confirmation it
+   rests on and whether it was borrowed.
+8. **tomas** — the same queue; tick "Save this signature for next time" on the first order and the
+   second offers it back. "People" (as alice) removes anybody's saved signature.
 
 Logs from everything `make demo` started are in `.demo/logs/`.
 
@@ -433,7 +442,60 @@ def verify_signature(secret: bytes, body: bytes, header: str, *, now, tolerance_
     return hmac.compare_digest(expected, parts.get("v1", ""))
 ```
 
-### 7. Reading the record back
+### 7. Filing a document that was signed on paper
+
+A host can file a scan of a document signed in ink, so it gets the same write-once storage, seal,
+timestamp, audit trail and verification (`docs/SPEC-ADDENDUM-1.md`, section A). Multipart: the
+`scan` (a PDF; converting a photograph is the host's job) beside a `body` that says what it is and
+who attests to it.
+
+```sh
+curl -s -X POST $API/v1/archives -H "$AUTH" -H 'Idempotency-Key: paper-5531' \
+  -F 'scan=@consent-scan.pdf;type=application/pdf' \
+  -F 'body={"patient_ref": "pat-90412", "document_type": "patient_consent",
+            "host_document_ref": "paper-5531", "paper_signed_on": "2026-09-01",
+            "attestation": {"staff_user_id": "staff-3310", "staff_display_name": "Alice Wu",
+                            "statement": "true_copy", "original_disposition": "retained",
+                            "paper_signers": [{"display_name": "Maria Alvarez", "capacity": "self"}]}}'
+```
+
+It answers an `EnvelopeView` with `"kind": "paper_archive"`, no template and no signers, in
+`completed_pending_seal`; the seal is attempted inline and retried by the worker, `envelope.sealed`
+fires, and `/document`, `/audit`, `/verification` and `/void` work as for any envelope. The sealed
+PDF opens with a cover page stating what it is, the paper signing date, who attested and when, the
+disposition of the original, the scan's SHA-256, and what the seal does and does not prove: that
+the scan is unchanged since filing and who filed it, not that the ink is genuine. The scan passes
+the template hygiene rules under `MAX_SCAN_BYTES` / `MAX_SCAN_PAGES`; `staff_user_id` and
+`patient_ref` must be opaque, and the paper signers' names reach the cover page and the certificate
+only, never the audit trail.
+
+### 8. Saved signatures and the signing queue
+
+A signer can save the signature they adopt so their next session offers it again
+(`save_adopted_signature: true` on `POST /v1/signing/sign`; `adopted_signature` in the session
+payload; `{"kind": "adopted", "adopted_signature_id": ...}` as a capture). Only the signer can
+create one, from inside their own session, and never from a kiosk. A host may remove one:
+
+```sh
+curl -s -X POST "$API/v1/users/user-0311/adopted-signature/revoke" -H "$AUTH" -d '{}'
+```
+
+```json
+{"revoked": true}
+```
+
+200 either way; another host's user and a user with nothing saved both answer `false`.
+
+With `REAUTH_SPAN_SECONDS` above zero (default `0`, at most `900`), a re-authentication attested on
+one of a user's sessions also covers their other sessions on the same host for that long after its
+`auth_time`, so a clinician confirms once and signs a queue. The host still calls
+`POST /v1/sessions/{id}/reauth` once, on the first document; `GET /v1/signing/session` then reports
+`reauth_valid_until`, `reauth_scope` (`session` or `span`) and `reauth_at` for the others, and
+every `signer.signed` event and the certificate record which attestation was used, whether it was
+borrowed, and how old it was. The attestation must still be within `REAUTH_MAX_AGE_SECONDS`, so
+the queue's window is the smaller of the two settings.
+
+### 9. Reading the record back
 
 ```sh
 curl -s "$API/v1/envelopes/$ENVELOPE_ID"               -H "$AUTH"   # EnvelopeView
@@ -527,7 +589,7 @@ in KMS and only its *identifier* is configuration.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `APPROVED_DOCUMENT_TYPES` | the three samples | compliance owns this list. A template of any other type cannot produce an envelope |
+| `APPROVED_DOCUMENT_TYPES` | the four samples | compliance owns this list. A template of any other type cannot produce an envelope, and a scan of any other type cannot be filed |
 | `RETENTION_YEARS_BY_DOCUMENT_TYPE` | `{}` | JSON. Anything absent gets the default |
 | `DEFAULT_RETENTION_YEARS` | `10` | a floor, not a schedule; 365-day years |
 | `ENVELOPE_DEFAULT_TTL_DAYS` | `14` | when the host does not send `expires_at` |
@@ -606,7 +668,7 @@ frontend/             Bun, Vite, React 19, TypeScript strict, TanStack Query, Ta
   src/flow/           the six-state signing flow and its steps.
   e2e/                Playwright, against the mocks and against the real stack.
 demo-host/            a stand-in EHR. Not product code; it speaks HTTP like a customer would.
-templates/            three sample templates, with a script that regenerates the PDFs byte for byte.
+templates/            four sample templates, with a script that regenerates the PDFs byte for byte.
 docs/                 SPEC.md, this documentation, and the developer guide the rules come from.
 ```
 

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}People · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>People</h1>
+    <p class="lead">Everybody who signs here, and the one thing this records system may do about a saved signature.</p>
+    <p class="fine">
+      A person can save the signature they adopt so their next session offers it again. Only they
+      can create one, from inside their own signing session; there is no call for a host to upload
+      a signature for somebody, so staff cannot make a doctor's signature. Either side can remove
+      one. The service does not say whether a person has one saved, so this page cannot either.
+    </p>
+    {% if result %}
+      <p class="notice {{ 'ok' if result in ['revoked', 'nothing_saved'] else 'error' }}" role="status" data-testid="people-result" data-result="{{ result }}">
+        {% if result == 'revoked' %}Their saved signature has been removed. Their next signing session will not offer it.
+        {% elif result == 'nothing_saved' %}They had no saved signature; nothing changed.
+        {% else %}That did not work: <code>{{ result }}</code>.{% endif %}
+      </p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <table>
+      <thead><tr><th>Name</th><th>Role</th><th>Saved signature</th></tr></thead>
+      <tbody>
+        {% for person in people %}
+          <tr data-testid="person" data-username="{{ person.username }}">
+            <td>{{ person.display_name }}</td>
+            <td>{{ person.role }}{% if person.job_title %} · {{ person.job_title }}{% endif %}</td>
+            <td>
+              <form method="post" action="/people/{{ person.id }}/revoke-signature">
+                <button type="submit" class="secondary" data-testid="revoke-signature">Remove saved signature</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>
+{% endblock %}

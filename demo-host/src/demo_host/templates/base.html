@@ -18,7 +18,8 @@
         <nav aria-label="Main">
           <a href="/worklist">Worklist</a>
           {% if user.patient_id %}<a href="/chart/{{ user.patient_id }}">Chart</a>{% endif %}
-          {% if user.role == 'staff' %}<a href="/kiosk">Clinic tablet</a>{% endif %}
+          {% if user.role == 'clinician' %}<a href="/queue">Signing queue</a>{% endif %}
+          {% if user.role == 'staff' %}<a href="/kiosk">Clinic tablet</a><a href="/archive">File a paper document</a><a href="/people">People</a>{% endif %}
           <a href="/webhooks">Webhooks</a>
           <form method="post" action="/logout"><button type="submit" class="link">Sign out</button></form>
         </nav>

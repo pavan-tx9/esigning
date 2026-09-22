@@ -22,9 +22,11 @@ from typing import Literal
 from uuid import uuid4
 
 __all__ = [
+    "ArchiveFiling",
     "ChartDocument",
     "Login",
     "Patient",
+    "QueueReauth",
     "Store",
     "Task",
     "TaskSigner",
@@ -102,25 +104,62 @@ class Task:
     signer_status: dict[str, str] = field(default_factory=dict)
     #: The live signing session per role_key: (session_id, token).
     sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: When each of those sessions was started, so one that is still good can be reused: creating
+    #: a new session revokes the previous one, and a re-authentication attested on a revoked
+    #: session covers nothing (SPEC section 8), which would break the signing queue.
+    session_started: dict[str, datetime] = field(default_factory=dict)
     #: Set while a member of staff is running this task on the clinic tablet.
     kiosk: tuple[str, str] | None = None  # (staff_user_id, identity_check)
 
     def signer_for(self, user_id: str) -> TaskSigner | None:
         return next((s for s in self.signers if s.user_id == user_id), None)
 
+    @property
+    def is_finished(self) -> bool:
+        return self.envelope_status in {"sealed", "declined", "voided", "expired", "completed_pending_seal"}
+
 
 @dataclass(frozen=True)
 class ChartDocument:
-    """A sealed PDF filed in a patient's chart."""
+    """A sealed PDF filed in a patient's chart: signed electronically, or a scan of a paper
+    original that staff filed and the service sealed (Addendum 1 A)."""
 
     id: str
     patient_id: str
     title: str
     envelope_id: str
-    template_key: str
+    template_key: str | None
     sealed_sha256: str
     filed_at: datetime
     pdf: bytes
+    kind: str = "electronic"
+    #: The date on the paper, for a paper archive.
+    paper_signed_on: str | None = None
+
+
+@dataclass
+class ArchiveFiling:
+    """A scan of a paper-signed document that staff filed with the service, until the sealed
+    copy comes back by webhook and lands in the chart."""
+
+    envelope_id: str
+    patient_id: str
+    title: str
+    document_type: str
+    paper_signed_on: str
+    filed_by: str  # user id of the attesting member of staff
+    filed_at: datetime
+    envelope_status: str
+
+
+@dataclass
+class QueueReauth:
+    """The one re-authentication a clinician made for their signing queue, as the service answered
+    it. The service is the authority on whether it still covers anything; this is for the page."""
+
+    at: datetime
+    valid_until: str
+    session_id: str
 
 
 @dataclass(frozen=True)
@@ -154,6 +193,8 @@ class Store:
         self.tasks = {t.id: t for t in tasks}
         self.logins: dict[str, Login] = {}
         self.documents: dict[str, ChartDocument] = {}
+        self.archives: dict[str, ArchiveFiling] = {}
+        self.queue_reauth: dict[str, QueueReauth] = {}
         self.webhooks: list[WebhookRecord] = []
         self._seen_deliveries: set[str] = set()
 
@@ -187,6 +228,20 @@ class Store:
     def task_by_envelope(self, envelope_id: str) -> Task | None:
         return next((t for t in self.tasks.values() if t.envelope_id == envelope_id), None)
 
+    def queue_for(self, user: User) -> list[Task]:
+        """The documents waiting on this clinician's signature, in seed order."""
+        return [
+            t for t in self.tasks.values() if any(s.user_id == user.id and s.capacity == "clinician" for s in t.signers)
+        ]
+
+    # ------------------------------------------------------------------ paper archives
+    def record_archive(self, filing: ArchiveFiling) -> None:
+        with self._lock:
+            self.archives[filing.envelope_id] = filing
+
+    def archives_for(self, patient_id: str) -> list[ArchiveFiling]:
+        return [a for a in self.archives.values() if a.patient_id == patient_id]
+
     # ------------------------------------------------------------------ chart
     def file_document(self, document: ChartDocument) -> None:
         with self._lock:
@@ -217,7 +272,7 @@ class Store:
 
 def build_store() -> Store:
     """Two patients, a guardian, a witness, two clinicians and a member of the front desk, with
-    one worklist item per sample template."""
+    one worklist item per sample template and a queue of orders waiting on each clinician."""
     maria = Patient(id=str(uuid4()), mrn="mrn-100234", name="Maria Alvarez", date_of_birth="1971-04-02")
     sam = Patient(id=str(uuid4()), mrn="mrn-100907", name="Sam Okafor", date_of_birth="2017-11-19")
 
@@ -326,5 +381,41 @@ def build_store() -> Store:
             },
             note="The one to run on the clinic tablet: the front desk starts it, the patient signs it there, and the tablet comes back.",
         ),
+        *_orders(
+            "u-priya",
+            (
+                (maria, "ORD-4471", "Physiotherapy, right knee: eight weeks, twice weekly, review at the end."),
+                (sam, "ORD-4472", "Ankle X-ray, left, two views, before the physiotherapy review."),
+                (maria, "ORD-4473", "Pre-operative bloods: full blood count, clotting screen, group and save."),
+            ),
+        ),
+        *_orders(
+            "u-tomas",
+            (
+                (sam, "ORD-4480", "Paediatric physiotherapy referral, left ankle, six weeks."),
+                (maria, "ORD-4481", "Repeat prescription review: analgesia for the right knee, four weeks."),
+            ),
+        ),
     )
     return Store(users=users, patients=(maria, sam), tasks=tasks)
+
+
+def _orders(clinician_id: str, orders: tuple[tuple[Patient, str, str], ...]) -> tuple[Task, ...]:
+    """A clinician's queue: one ``clinical_order`` sign-off per order, each its own envelope with
+    the clinician as its only signer. Re-authentication is required for every one; with the span
+    on (Addendum 1 C) one confirmation covers the run."""
+    return tuple(
+        Task(
+            id=str(uuid4()),
+            title=f"Order sign-off {reference}",
+            template_key="clinical_order",
+            patient_id=patient.id,
+            signing_order="parallel",
+            signers=(
+                TaskSigner(role_key="clinician", role_label="Clinician", user_id=clinician_id, capacity="clinician"),
+            ),
+            prefill={"patient_name": patient.name, "order_reference": reference, "order_summary": summary},
+            note="A clinician's sign-off. One of the signing queue: confirm your identity once, then sign each in turn.",
+        )
+        for patient, reference, summary in orders
+    )

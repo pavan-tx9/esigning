@@ -10,6 +10,7 @@ because the code is the part worth branching on and the part that is safe to sho
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -101,6 +102,41 @@ class EsignClient:
 
     def envelope(self, envelope_id: str | UUID) -> dict[str, Any]:
         return self._json("GET", f"/v1/envelopes/{envelope_id}")
+
+    # ------------------------------------------------------------------ paper archives (Addendum 1 A)
+    def file_archive(
+        self,
+        *,
+        scan: bytes,
+        filename: str,
+        patient_ref: str,
+        document_type: str,
+        host_document_ref: str,
+        paper_signed_on: str,
+        attestation: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """``POST /v1/archives``: multipart, the scan beside a JSON ``body`` that is ``NewArchive``."""
+        body = {
+            "patient_ref": patient_ref,
+            "document_type": document_type,
+            "host_document_ref": host_document_ref,
+            "paper_signed_on": paper_signed_on,
+            "attestation": attestation,
+        }
+        return self._json(
+            "POST",
+            "/v1/archives",
+            headers={"Idempotency-Key": idempotency_key},
+            files={"scan": (filename, scan, "application/pdf")},
+            data={"body": json.dumps(body)},
+        )
+
+    # ------------------------------------------------------------------ saved signatures (Addendum 1 B)
+    def revoke_adopted_signature(self, host_user_id: str) -> bool:
+        """``POST /v1/users/{id}/adopted-signature/revoke``. True when there was one to revoke."""
+        answer = self._json("POST", f"/v1/users/{host_user_id}/adopted-signature/revoke", json={"reason": "host"})
+        return bool(answer.get("revoked"))
 
     def void_envelope(self, envelope_id: str | UUID, reason_code: str) -> dict[str, Any]:
         return self._json("POST", f"/v1/envelopes/{envelope_id}/void", json={"reason_code": reason_code})

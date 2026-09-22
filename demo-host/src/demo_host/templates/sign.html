@@ -8,6 +8,8 @@
      data-token-url="/sign/{{ task.id }}/token"
      data-reauth-url="/sign/{{ task.id }}/reauth"
      data-status-url="/sign/{{ task.id }}/status"
+     data-return-url="{{ return_url }}"
+     data-return-label="{{ return_label }}"
      data-kiosk="{{ 'true' if kiosk else 'false' }}">
 
   <section class="card">

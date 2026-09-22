@@ -112,6 +112,7 @@ class Settings(BaseSettings):
         "patient_consent",
         "hipaa_acknowledgement",
         "procedure_consent",
+        "clinical_order",
     )
     #: Years to retain the sealed document, per document type. Anything absent gets the default.
     retention_years_by_document_type: dict[str, int] = Field(default_factory=dict)

@@ -22,6 +22,12 @@
   const log = document.getElementById("log");
   const origin = new URL(root.dataset.frameSrc, window.location.href).origin;
   const kiosk = root.dataset.kiosk === "true";
+  // Where "back" goes: the worklist, or the signing queue this document was opened from.
+  const back = {
+    href: root.dataset.returnUrl || "/worklist",
+    label: root.dataset.returnLabel || "Back to the worklist",
+    testid: "back-link",
+  };
 
   let initialised = false;
   let sessionId = null;
@@ -91,9 +97,7 @@
     });
     if (!response.ok) {
       initialised = false;
-      outcome("We could not start the signing session", "Go back to the worklist and open it again.", [
-        { href: "/worklist", label: "Back to the worklist" },
-      ]);
+      outcome("We could not start the signing session", "Go back and open it again.", [back]);
       return;
     }
     const body = await response.json();
@@ -151,7 +155,7 @@
           outcome(
             kiosk ? "Signed, sealed and filed" : "Your signature is recorded",
             "The sealed document arrived by webhook and has been filed in the chart.",
-            [{ href: status.document_url, label: "See it in the chart", testid: "filed-link" }],
+            [{ href: status.document_url, label: "See it in the chart", testid: "filed-link" }, back],
           );
           return;
         }
@@ -159,16 +163,14 @@
           outcome(
             "Signed",
             "The other signers still have to sign. The sealed copy is filed when everyone has.",
-            [{ href: "/worklist", label: "Back to the worklist" }],
+            [back],
           );
           return;
         }
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    outcome("Signed", "The sealed copy has not arrived yet. It will be filed when it does.", [
-      { href: "/worklist", label: "Back to the worklist" },
-    ]);
+    outcome("Signed", "The sealed copy has not arrived yet. It will be filed when it does.", [back]);
   }
 
   // --------------------------------------------------------------------- messages
@@ -221,14 +223,12 @@
         kiosk
           ? "Please hand the tablet back to the front desk. The clinic will bring a paper copy."
           : "The clinic has been told, and will bring you a paper copy.",
-        kiosk ? [] : [{ href: "/worklist", label: "Back to the worklist" }],
+        kiosk ? [] : [back],
       );
       return;
     }
     if (data.type === "esign:expired" && !signed) {
-      outcome("The signing session ended", "Nothing was signed. You can open it again from the worklist.", [
-        { href: "/worklist", label: "Back to the worklist" },
-      ]);
+      outcome("The signing session ended", "Nothing was signed. You can open it again.", [back]);
     }
   });
 })();

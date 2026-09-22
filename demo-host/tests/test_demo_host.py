@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ from demo_host.store import Store, build_store
 
 SECRET = bytes.fromhex("a1" * 32)
 ENVELOPE_ID = "11111111-2222-4333-8444-555555555555"
+ARCHIVE_ID = "22222222-3333-4444-8555-666666666666"
 SEALED_SHA = "9f" * 32
 
 
@@ -49,17 +51,32 @@ class FakeService:
         self.signer_status = "pending"
         self.envelope_status = "created"
         self.reauth_status = 200
+        self.sessions_created = 0
+        self.archives: list[tuple[bytes, dict[str, Any]]] = []
+        self.revoked: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
-        body: dict[str, Any] = json.loads(request.content) if request.content else {}
         path = request.url.path
+        content_type = request.headers.get("content-type", "")
+        if content_type.startswith("multipart/form-data"):
+            # POST /v1/archives: the scan beside a JSON ``body`` part. Only the shape is checked;
+            # the real thing is exercised by the Playwright specs against the real service.
+            body = _multipart_body(request)
+            self.calls.append((request.method, path, body))
+            self.archives.append((body["scan"], json.loads(body["body"])))
+            return httpx.Response(201, json=self._archive_view())
+        body = json.loads(request.content) if request.content else {}
         self.calls.append((request.method, path, body))
 
         if request.method == "POST" and path == "/v1/envelopes":
             return httpx.Response(201, json=self._envelope(body))
         if request.method == "GET" and path == f"/v1/envelopes/{ENVELOPE_ID}":
             return httpx.Response(200, json=self._envelope(None))
+        if path.endswith("/adopted-signature/revoke"):
+            self.revoked.append(path.split("/")[3])
+            return httpx.Response(200, json={"revoked": path.split("/")[3] == "u-priya"})
         if path.endswith("/sessions"):
+            self.sessions_created += 1
             return httpx.Response(
                 201,
                 json={
@@ -78,8 +95,10 @@ class FakeService:
                     "reauth_valid_until": "2026-09-21T20:02:00Z",
                 },
             )
-        if path == f"/v1/envelopes/{ENVELOPE_ID}/document":
+        if path in (f"/v1/envelopes/{ENVELOPE_ID}/document", f"/v1/envelopes/{ARCHIVE_ID}/document"):
             return httpx.Response(200, content=b"%PDF-1.7 sealed", headers={"content-type": "application/pdf"})
+        if request.method == "GET" and path == f"/v1/envelopes/{ARCHIVE_ID}":
+            return httpx.Response(200, json=self._archive_view())
         if path == f"/v1/envelopes/{ENVELOPE_ID}/verification":
             return httpx.Response(
                 200,
@@ -97,6 +116,21 @@ class FakeService:
                 },
             )
         return httpx.Response(404, json={"error": {"code": "not_found", "message": ""}})  # pragma: no cover
+
+    def _archive_view(self) -> dict[str, Any]:
+        return {
+            **self._envelope(None),
+            "id": ARCHIVE_ID,
+            "kind": "paper_archive",
+            "status": "completed_pending_seal",
+            "template_key": None,
+            "template_version": None,
+            "signing_order": None,
+            "signers": [],
+            "sealed_sha256": None,
+            "paper_signed_on": "2026-09-01",
+            "attested_at": "2026-09-21T19:00:00Z",
+        }
 
     def _envelope(self, created: dict[str, Any] | None) -> dict[str, Any]:
         roles = (
@@ -130,6 +164,18 @@ class FakeService:
             "supersedes_envelope_id": None,
             "superseded_by_envelope_id": None,
         }
+
+
+def _multipart_body(request: httpx.Request) -> dict[str, Any]:
+    """The parts of a multipart request, by name; file parts as bytes."""
+    boundary = request.headers["content-type"].split("boundary=")[1].encode()
+    parts: dict[str, Any] = {}
+    for chunk in request.content.split(b"--" + boundary)[1:-1]:
+        head, _, payload = chunk.lstrip(b"\r\n").partition(b"\r\n\r\n")
+        name = head.split(b'name="')[1].split(b'"')[0].decode()
+        value = payload[:-2] if payload.endswith(b"\r\n") else payload
+        parts[name] = value if b"filename=" in head else value.decode()
+    return parts
 
 
 @pytest.fixture
@@ -443,3 +489,163 @@ def test_no_identifying_detail_can_reach_a_url(client: TestClient, store: Store)
             assert detail not in url
         assert "est_" not in url
         assert "esk_" not in url
+
+
+# --------------------------------------------------------------------------- Addendum 1: paper documents
+
+
+def test_staff_file_a_paper_document_with_an_attestation(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    sign_in(client, "alice")
+    maria = next(p for p in store.patients.values() if p.name == "Maria Alvarez")
+    scan = (Path(__file__).resolve().parents[1] / "src/demo_host/static/sample-scan.pdf").read_bytes()
+
+    response = client.post(
+        "/archive",
+        data={
+            "patient_id": maria.id,
+            "title": "Consent to treatment (signed on paper)",
+            "document_type": "patient_consent",
+            "paper_signed_on": "2026-09-01",
+            "original_disposition": "retained",
+            "signer_name": ["Maria Alvarez", ""],
+            "signer_capacity": ["self", "witness"],
+            "true_copy": "yes",
+        },
+        files={"scan": ("scan.pdf", scan, "application/pdf")},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/chart/{maria.id}?filed=1"
+    sent_scan, body = service.archives[0]
+    assert sent_scan == scan
+    assert body["patient_ref"] == maria.mrn
+    assert body["document_type"] == "patient_consent"
+    assert body["paper_signed_on"] == "2026-09-01"
+    # The attesting party is the member of staff who is signed in, by opaque id and by name; the
+    # people who signed the paper are named, and an empty second row is not a signer.
+    assert body["attestation"]["staff_user_id"] == "u-alice"
+    assert body["attestation"]["staff_display_name"] == "Alice Wu"
+    assert body["attestation"]["statement"] == "true_copy"
+    assert body["attestation"]["paper_signers"] == [{"display_name": "Maria Alvarez", "capacity": "self"}]
+    filing = store.archives[ARCHIVE_ID]
+    assert filing.patient_id == maria.id and filing.filed_by == "u-alice"
+
+    # The chart says it is on its way, and the sealed webhook files it as a paper archive.
+    chart = client.get(f"/chart/{maria.id}?filed=1")
+    assert "archive-filed" in chart.text
+    deliver(
+        client,
+        {**sealed_payload("d-archive"), "envelope_id": ARCHIVE_ID, "template_key": None, "kind": "paper_archive"},
+    )
+    document = store.document_for_envelope(ARCHIVE_ID)
+    assert document is not None and document.kind == "paper_archive"
+    assert document.paper_signed_on == "2026-09-01" and document.template_key is None
+    page = client.get(f"/chart/document/{document.id}")
+    assert "signed on paper on 2026-09-01" in page.text
+    assert "not prove the ink signature is genuine" in page.text
+
+
+def test_filing_without_the_attestation_or_a_pdf_goes_nowhere(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    sign_in(client, "alice")
+    maria = next(p for p in store.patients.values() if p.name == "Maria Alvarez")
+    fields = {
+        "patient_id": maria.id,
+        "title": "x",
+        "document_type": "patient_consent",
+        "paper_signed_on": "2026-09-01",
+        "original_disposition": "retained",
+        "signer_name": ["Maria Alvarez"],
+        "signer_capacity": ["self"],
+    }
+    unattested = client.post(
+        "/archive",
+        data=fields,
+        files={"scan": ("scan.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        follow_redirects=False,
+    )
+    assert unattested.headers["location"] == "/archive?problem_code=incomplete"
+    not_a_pdf = client.post(
+        "/archive",
+        data={**fields, "true_copy": "yes"},
+        files={"scan": ("scan.png", b"\x89PNG", "image/png")},
+        follow_redirects=False,
+    )
+    assert not_a_pdf.headers["location"] == "/archive?problem_code=not_a_pdf"
+    assert service.archives == []
+    sign_in(client, "maria")
+    assert client.get("/archive").status_code == 403
+
+
+# --------------------------------------------------------------------------- Addendum 1: the signing queue
+
+
+def test_the_queue_confirms_once_on_the_first_documents_session_and_keeps_it(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    sign_in(client, "priya")
+    page = client.get("/queue")
+    assert page.status_code == 200
+    # Everything she signs as a clinician: the three orders, and the procedure consent that is
+    # still waiting on the patient and the witness, which is listed but not ready.
+    assert page.text.count('data-testid="queue-task"') == 4
+    assert page.text.count('data-testid="queue-sign"') == 3
+    assert 'data-testid="queue-confirmed"' not in page.text
+
+    confirmed = client.post("/queue/reauth", data={"password": "demo1234"}, follow_redirects=False)
+    assert confirmed.headers["location"] == "/queue"
+    first = next(t for t in store.queue_for(store.users["u-priya"]) if t.template_key == "clinical_order")
+    assert first.envelope_id == ENVELOPE_ID and "clinician" in first.sessions
+    reauth = next(body for method, path, body in service.calls if path.endswith("/reauth"))
+    assert reauth["method"] == "password"
+    assert service.sessions_created == 1
+    assert "queue-confirmed" in client.get("/queue").text
+
+    # Opening that document keeps the session the attestation was made on rather than minting a
+    # new one, which would revoke it and the attestation with it.
+    opened = client.post(f"/tasks/{first.id}/open", data={"return_to": "/queue"}, follow_redirects=False)
+    assert opened.headers["location"] == f"/sign/{first.id}?return_to=/queue"
+    assert service.sessions_created == 1
+    sign_page = client.get(f"/sign/{first.id}?return_to=/queue")
+    assert 'data-return-url="/queue"' in sign_page.text
+
+    # A return address is one of two known pages, never something the request chose.
+    elsewhere = client.post(
+        f"/tasks/{first.id}/open", data={"return_to": "https://evil.example"}, follow_redirects=False
+    )
+    assert elsewhere.headers["location"] == f"/sign/{first.id}"
+
+
+def test_the_queue_is_for_clinicians_and_needs_the_password(client: TestClient, service: FakeService) -> None:
+    sign_in(client, "priya")
+    wrong = client.post("/queue/reauth", data={"password": "nope"}, follow_redirects=False)
+    assert wrong.headers["location"] == "/queue?problem_code=wrong_password"
+    assert not [c for c in service.calls if c[1].endswith("/reauth")]
+    sign_in(client, "maria")
+    assert client.get("/queue").status_code == 403
+
+
+# --------------------------------------------------------------------------- Addendum 1: saved signatures
+
+
+def test_staff_can_remove_a_saved_signature_and_are_told_whether_there_was_one(
+    client: TestClient, service: FakeService
+) -> None:
+    sign_in(client, "alice")
+    assert 'data-username="priya"' in client.get("/people").text
+    had_one = client.post("/people/u-priya/revoke-signature", follow_redirects=False)
+    assert had_one.headers["location"] == "/people?result=revoked"
+    had_none = client.post("/people/u-maria/revoke-signature", follow_redirects=False)
+    assert had_none.headers["location"] == "/people?result=nothing_saved"
+    assert service.revoked == ["u-priya", "u-maria"]
+    assert 'data-result="revoked"' in client.get("/people?result=revoked").text
+    sign_in(client, "priya")
+    assert client.get("/people").status_code == 403
+    assert (
+        client.post("/people/u-maria/revoke-signature", follow_redirects=False).headers["location"]
+        == "/people?result=refused"
+    )

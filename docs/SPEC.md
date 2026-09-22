@@ -285,6 +285,8 @@ the paper original and the attesting staff member, and the cover page and the ce
 - Ship three sample templates in `templates/` with definitions: a patient consent form (patient,
   optional guardian capacity), a HIPAA acknowledgement (patient), and a procedure consent needing
   patient, witness and clinician in sequence. Generate the PDFs with a script so they are reproducible.
+  Addendum 1 adds a fourth, `clinical_order`: one clinician signer, one page, re-authentication
+  required -- the document a signing queue (section 14 C) is made of.
 
 ## 7. Storage
 
