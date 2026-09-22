@@ -21,18 +21,19 @@ allowed to reach a log and the value is exactly the thing we suspect of being PH
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Any, Final, Literal, get_args
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 from pydantic.functional_validators import AfterValidator
 
-from esign.audit.canonical import canonical_value
+from esign.audit.canonical import archive_attested_detail_digest, canonical_value
 from esign.contracts import (
     OPAQUE_ID_PATTERN,
     AdoptedRevokeReason,
     AdoptedSignatureKind,
+    Attestation,
     AttestationStatement,
     BlobKind,
     Capacity,
@@ -50,6 +51,7 @@ __all__ = [
     "EVENT_DATA_MODELS",
     "OPAQUE_ID_PATTERN",
     "EventData",
+    "attested_detail_digest",
     "declared_data_keys",
     "is_opaque_id",
     "validate_event_data",
@@ -371,12 +373,36 @@ class ArchiveCreatedData(EventData):
 
 class ArchiveAttestedData(EventData):
     """Addendum 1 A: who attested the scan and what they said. The staff member by opaque id;
-    the paper signers by count only, because their names are PHI."""
+    the paper signers by count only, because their names are PHI.
+
+    ``attested_detail_sha256`` is what puts the rest of the attestation beyond reach of an UPDATE:
+    one joint digest (:func:`esign.audit.canonical.archive_attested_detail_digest`) over the
+    attesting staff member's display name, the ordered paper signers and the paper signing date --
+    the three things the cover page and the certificate print, which live in mutable columns and
+    which, for an archive, are the whole attribution. The names stay out of the trail; their
+    digest does not."""
 
     staff_user_id: OpaqueId
     statement: AttestationStatement
     original_disposition: OriginalDisposition
     paper_signer_count: Ordinal
+    attested_detail_sha256: Sha256
+
+
+def attested_detail_digest(attestation: Attestation, paper_signed_on: date) -> bytes:
+    """The value of :attr:`ArchiveAttestedData.attested_detail_sha256`, from the attestation.
+
+    Declared here, beside the field, so the one place that writes it (the archive service), the
+    cross-check the seal runs before printing those names, and the verification report that runs
+    the same comparison afterwards all hash identical bytes. The encoding itself is
+    :func:`esign.audit.canonical.archive_attested_detail_digest`; this only unpacks the contract
+    type into it.
+    """
+    return archive_attested_detail_digest(
+        staff_display_name=attestation.staff_display_name,
+        paper_signers=[(signer.display_name, signer.capacity) for signer in attestation.paper_signers],
+        paper_signed_on=paper_signed_on.isoformat(),
+    )
 
 
 class SignatureAdoptedData(EventData):

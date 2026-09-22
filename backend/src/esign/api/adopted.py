@@ -80,8 +80,11 @@ def save_adopted_signature(
     signature revokes it (``replaced``), and both facts are recorded.
     """
     if session.kiosk is not None:
-        # The identity module refuses this too. Refusing here as well means the signature is never
-        # applied and then rolled back for a reason the signer could have been told up front.
+        # The backstop, not the guard: this runs *after* ``EnvelopeService.sign``, so by the time
+        # it fires the revision is stamped and ``signer.signed`` is appended, and the refusal
+        # rolls all of it back. ``post_sign`` therefore refuses a kiosk request before applying
+        # anything, and ``identity/adopted.py::_session_for_adoption`` refuses it again below this.
+        # Three refusals for one rule, because the one that must never be missing is the innermost.
         raise Forbidden("a shared tablet does not keep a signature", code="adoption_not_allowed")
 
     kind: AdoptedSignatureKind = "drawn" if source.kind == "drawn" else "typed"

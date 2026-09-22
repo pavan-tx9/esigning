@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
+from uuid import UUID
 
+import pytest
 from sqlalchemy import Engine, text
 
+from esign.contracts import IntegrityFailure
 from esign.storage import content_key
-from tests.archives.conftest import attestation, filed, scan_pdf
+from tests.archives.conftest import PAPER_SIGNER_NAME, STAFF_NAME, attestation, filed, scan_pdf
+from tests.archives.test_void_and_supersede import pending as pending  # the seal-outage world
 from tests.e2e.conftest import Ehr, World
 
 
@@ -23,6 +28,24 @@ def _problems(host: Ehr, envelope_id: str) -> list[str]:
     assert report["ok"] is False, report
     problems: list[str] = report["problems"]
     return problems
+
+
+def _rewrite_attestation(world: World, envelope_id: str, **overrides: Any) -> None:
+    with world.sessions() as db:
+        db.execute(
+            text("UPDATE envelopes SET attestation = CAST(:value AS jsonb) WHERE id = :id"),
+            {"value": json.dumps(attestation(**overrides)), "id": envelope_id},
+        )
+        db.commit()
+
+
+def _rewrite_paper_signed_on(world: World, envelope_id: str, value: str) -> None:
+    with world.sessions() as db:
+        db.execute(
+            text("UPDATE envelopes SET paper_signed_on = CAST(:value AS date) WHERE id = :id"),
+            {"value": value, "id": envelope_id},
+        )
+        db.commit()
 
 
 def test_a_sealed_archive_verifies_completely(host: Ehr) -> None:
@@ -98,6 +121,79 @@ def test_a_rewritten_attestation_is_caught(host: Ehr, world: World) -> None:
     problems = _problems(host, view["id"])
     assert any("staff_user_id" in problem for problem in problems), problems
     assert any("original_disposition" in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"staff_display_name": "Somebody Else Entirely"}, id="attesting_staff_name"),
+        pytest.param(
+            {"paper_signers": [{"display_name": "Somebody Else Entirely", "capacity": "self"}]},
+            id="paper_signer_name",
+        ),
+        pytest.param(
+            {"paper_signers": [{"display_name": PAPER_SIGNER_NAME, "capacity": "guardian"}]},
+            id="paper_signer_capacity",
+        ),
+    ],
+)
+def test_a_rewritten_name_or_capacity_is_caught_although_it_is_never_in_the_trail(
+    host: Ehr, world: World, overrides: dict[str, Any]
+) -> None:
+    """The names are the whole attribution of an archive, and none of them is in the trail as text.
+
+    There is no signer row, no session and no stamped revision behind them: where the paper
+    original was destroyed under policy, the attestation is all that remains of it. The four
+    comparisons that *do* have a text counterpart -- the opaque staff id, the statement, the
+    disposition, the signer count -- all still pass here; only the joint digest over the names and
+    the paper date contradicts the row.
+    """
+    view = filed(host)
+    _rewrite_attestation(world, view["id"], **overrides)
+
+    problems = _problems(host, view["id"])
+    assert any("attested detail" in problem for problem in problems), problems
+    assert not any("staff_user_id" in problem for problem in problems), problems
+    assert not any("paper_signer_count" in problem for problem in problems), problems
+
+
+def test_a_rewritten_paper_signing_date_is_caught(host: Ehr, world: World) -> None:
+    """``archive.created`` deliberately keeps no ``paper_signed_on`` -- it is a date about a
+    patient -- but the cover page prints the column, so the trail has to be able to contradict it.
+    The joint digest does, without putting a brute-forceable bare date in the chain."""
+    view = filed(host)
+    _rewrite_paper_signed_on(world, view["id"], "2019-01-02")
+
+    problems = _problems(host, view["id"])
+    assert any("attested detail" in problem for problem in problems), problems
+
+
+def test_the_seal_refuses_a_rewritten_attestation_rather_than_printing_it(pending: tuple[World, Ehr]) -> None:
+    """``completed_pending_seal`` is an expected, hours-long state whenever KMS, the TSA or storage
+    is backing off, and the cover page and certificate are rendered from these mutable columns at
+    *seal* time. A rewrite inside that window must stop the seal, not be baked into bytes that can
+    never be re-sealed.
+    """
+    world, host = pending
+    view = filed(host)
+    assert view["status"] == "completed_pending_seal"
+
+    _rewrite_attestation(world, view["id"], staff_display_name="Somebody Else Entirely")
+    _rewrite_paper_signed_on(world, view["id"], "2019-01-02")
+
+    with world.rt.transaction() as db, pytest.raises(IntegrityFailure) as seen:
+        world.rt.envelopes.seal_pending(db, UUID(view["id"]))
+    assert seen.value.code == "certificate_evidence_mismatch"
+    assert host.envelope(view["id"])["status"] == "completed_pending_seal"
+
+
+def test_an_untouched_archive_agrees_with_its_own_digest(host: Ehr, world: World) -> None:
+    """The digest is over the row as filed, not over a copy of itself: rewriting the attestation
+    with exactly the same values leaves the report clean."""
+    view = filed(host)
+    _rewrite_attestation(world, view["id"], staff_display_name=STAFF_NAME)
+
+    assert host.verification(view["id"])["ok"] is True
 
 
 def test_a_tampered_archive_audit_row_is_caught(host: Ehr, owner_engine: Engine) -> None:

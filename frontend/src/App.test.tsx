@@ -743,6 +743,44 @@ describe("a saved signature", () => {
     expect(sent("saved-signature")).not.toHaveProperty("save_adopted_signature");
   }, 25_000);
 
+  it("cannot be adopted while its own removal is being confirmed", async () => {
+    // The question on screen is "Remove your saved signature?", so the primary button must not
+    // quietly answer it with "use it": walking forward here would adopt the very signature the
+    // signer is in the middle of deleting, and the three cards show no route selected meanwhile.
+    await start("saved-signature");
+    await throughConsent();
+
+    await click(/Remove saved signature/);
+    expect(screen.getByTestId("remove-saved")).toBeInTheDocument();
+    const adopt = screen.getByRole("button", { name: "Use this signature" });
+    expect(adopt).toHaveAttribute("aria-disabled", "true");
+
+    await user.click(adopt);
+    // Still on the adopt step, still being asked, and nothing placed.
+    expect(screen.getByTestId("step-sign-adopt")).toBeInTheDocument();
+    expect(screen.getByTestId("remove-saved")).toBeInTheDocument();
+    expect(screen.queryByTestId("step-sign-field")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent(/remove it, or keep it/i);
+
+    // "Keep it" is the way back out, and then the saved signature can be used as before.
+    await click("Keep it");
+    expect(screen.queryByTestId("remove-saved")).toBeNull();
+    expect(screen.getByRole("radio", { name: /Use my saved signature/ })).toBeChecked();
+    expect(screen.getByRole("button", { name: "Use this signature" })).not.toHaveAttribute(
+      "aria-disabled",
+    );
+    await click("Use this signature");
+    await placeAndSign();
+
+    await screen.findByTestId("step-done");
+    expect(sent("saved-signature").captures).toContainEqual({
+      field_id: "patient_sig",
+      kind: "adopted",
+      adopted_signature_id: SAVED_SIGNATURE_ID,
+    });
+    expect(mockDb.peek("saved-signature")?.savedSignatures[0]?.revokedAt).toBeNull();
+  }, 25_000);
+
   it("is never offered to, or saved from, a shared tablet", async () => {
     // The patient on this kiosk has a signature on file; the session does not say so.
     await start("kiosk");

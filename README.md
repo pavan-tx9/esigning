@@ -418,7 +418,7 @@ X-Esign-Signature: t=1790053742,v1=9f2c…
 {
   "id": "7c1d…", "event": "envelope.sealed",
   "occurred_at": "2026-09-22T05:08:41.220914Z",
-  "envelope_id": "280ee839-…", "status": "sealed",
+  "envelope_id": "280ee839-…", "kind": "electronic", "status": "sealed",
   "template_key": "hipaa_acknowledgement", "template_version": 1,
   "presented_sha256": "9edfa997…", "current_revision_sha256": "cf3629c7…",
   "sealed_sha256": "3e5acf26…", "supersedes_envelope_id": null,
@@ -426,9 +426,15 @@ X-Esign-Signature: t=1790053742,v1=9f2c…
 }
 ```
 
-Ids, statuses and hashes. There is no name, no `patient_ref`, no `host_document_ref` and no
+Ids, statuses, hashes and `kind`. There is no name, no `patient_ref`, no `host_document_ref` and no
 document type in a payload: a webhook leaves the network, and the host already knows which envelope
 an id refers to. Fetch the sealed PDF yourself with `GET /v1/envelopes/{id}/document`.
+
+`kind` is on **every** delivery. A paper archive (§7) sends `"kind": "paper_archive"` with
+`template_key` and `template_version` null and `signers` empty, and fires only `envelope.sealed`
+and `envelope.voided` — it has no signers to progress through. Accept unknown fields: this service
+adds them, and the "unknown keys are rejected" rule applies to what you send it, not to what it
+sends you.
 
 **Verify the signature before you read the body.** `v1` is HMAC-SHA256 over the literal bytes
 `"{t}.{body}"` with the secret printed by `esign hosts create`; reject a `t` more than five minutes
@@ -513,7 +519,10 @@ Things worth knowing here:
 - `patient_ref` and `attestation.staff_user_id` must be opaque (`patient_ref_invalid`,
   `host_user_id_invalid`). The paper signers' and staff member's **names reach the cover page and
   the certificate only** — `archive.attested` records the opaque staff id, the statement, the
-  disposition and a *count* of paper signers.
+  disposition, a *count* of paper signers, and `attested_detail_sha256`: one SHA-256 over the
+  canonical JSON of `{staff_display_name, paper_signers, paper_signed_on}`, so those names and
+  that date can be contradicted by the append-only trail without ever appearing in it. Verify it
+  by hand as `docs/HOW-SIGNATURES-WORK.md` §2(g) shows.
 - `paper_signed_on` is a date, and one in the future is refused (`paper_signed_on_in_future`).
 - `statement` is a closed vocabulary of one: `true_copy`. `original_disposition` is `retained`,
   `returned_to_signer` or `destroyed_per_policy`, and it is printed on the cover. What actually
@@ -568,7 +577,10 @@ because staff must not be able to manufacture a doctor's signature.
   (`reason: replaced`). Rows are never deleted — a signature already applied points at one.
 
 Either side can remove it. The signer does it from their own session
-(`POST /v1/signing/adopted-signature/revoke`); a host does it for a user:
+(`POST /v1/signing/adopted-signature/revoke` — also refused from a kiosk, with
+`adoption_not_allowed`: a shared tablet is shown none of this and may not destroy it either, and
+the trail would otherwise record "the signer asked for this" for a request nobody's own session
+made); a host does it for a user:
 
 ```sh
 curl -s -X POST "$API/v1/users/user-0311/adopted-signature/revoke" \
@@ -620,7 +632,9 @@ and `reauth_at` is when the person actually confirmed their identity, so the UI 
 confirmed your identity at 08:08" instead of asking again. Every `signer.signed` event then records
 `reauth_attestation_id`, `reauth_scope` and `reauth_age_seconds`, and the certificate prints
 "password, at 2026-09-22 08:00:10 UTC in an earlier session, 5 seconds before signing" rather than
-"for this document". Verification re-checks all of it against the attestation row.
+"for this document". Verification re-checks all of it against the attestation row, including the
+`900`-second ceiling itself: a `span` signature naming an attestation older than the cap describes
+something this service could not have produced, whatever the host's configuration was at the time.
 
 **Set both windows together.** An attestation older than `REAUTH_MAX_AGE_SECONDS` (default 120 s)
 covers nothing, span or no span — so `REAUTH_SPAN_SECONDS=300` on its own still gives a two-minute

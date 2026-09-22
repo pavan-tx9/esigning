@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from tests.adopted_signatures.conftest import (
+    KIOSK,
     OTHER_PATIENT,
     PATIENT,
     adopt,
@@ -122,3 +123,30 @@ def test_a_revoked_row_stays(ehr: Ehr, world: World) -> None:
     rows = adopted_rows(world)
     assert len(rows) == 1
     assert rows[0].revoked_at is not None
+
+
+def test_a_kiosk_session_cannot_revoke_the_signers_saved_signature(ehr: Ehr, world: World) -> None:
+    """A shared tablet is untrusted for saved signatures everywhere else -- it is offered none,
+    may save none, and the identity module refuses it a third time -- and revocation is the one
+    irreversible door: ``0700``'s trigger permits exactly one revocation and forbids DELETE, so
+    the row can never be brought back.
+
+    The false attribution is the lasting damage. ``signature.adoption_revoked`` would go onto the
+    append-only ``system`` stream with ``reason: "user"`` and the signer as the actor -- a claim
+    that the person themselves asked for it -- when what happened is that staff holding a clinic
+    tablet asked, for a signature that same tablet is not even allowed to be shown.
+    """
+    adopt(ehr)
+    envelope = envelope_for(ehr)
+    kiosk = ehr.open_session(envelope, "patient", method="staff_verified", kiosk=KIOSK)
+    assert kiosk.session()["adopted_signature"] is None
+
+    response = kiosk.post("/adopted-signature/revoke", {})
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "adoption_not_allowed"
+    row = adopted_rows(world)[0]
+    assert row.revoked_at is None and row.revoke_reason is None
+    assert _revocations(world) == []
+    # And it is still there for the person whose signature it is.
+    assert offered(ehr) is not None

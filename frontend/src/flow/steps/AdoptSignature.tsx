@@ -107,6 +107,7 @@ export function AdoptSignature({
       await queryClient.invalidateQueries({ queryKey: signingKeys.session });
       setRemoving(false);
       setRoute("new");
+      setProblem(null);
       announce("Your saved signature has been removed.");
     },
   });
@@ -121,6 +122,16 @@ export function AdoptSignature({
   const choose = (next: Method) => {
     setMethod(next);
     setProblem(null);
+  };
+
+  // While the removal panel is open the question on screen is whether to keep this signature at
+  // all, and no route card reads as selected. Carrying on would adopt the very signature the
+  // signer is being asked about, so "Use this signature" is inert and says the panel comes first.
+  // (While the revoke request is in flight there is nothing to say: it is about to be answered.)
+  const nudgeAnswerThePanel = () => {
+    if (removing) {
+      setProblem("Please decide about your saved signature first: remove it, or keep it.");
+    }
   };
 
   const adopt = () => {
@@ -189,10 +200,12 @@ export function AdoptSignature({
           onRemove={() => {
             setRemoving(true);
             revoke.reset();
+            setProblem(null);
           }}
           onKeep={() => {
             setRemoving(false);
             revoke.reset();
+            setProblem(null);
           }}
           onConfirmRemove={() => revoke.mutate()}
         />
@@ -338,7 +351,12 @@ export function AdoptSignature({
         Whichever you choose counts the same as signing by hand. Nothing is added to the document
         until you place it yourself in the next step.
       </p>
-      <Button className="mt-4 w-full sm:w-auto" onClick={adopt} inert={revoke.isPending}>
+      <Button
+        className="mt-4 w-full sm:w-auto"
+        onClick={adopt}
+        inert={revoke.isPending || removing}
+        onInertClick={nudgeAnswerThePanel}
+      >
         Use this signature
       </Button>
     </div>

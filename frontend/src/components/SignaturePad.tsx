@@ -154,14 +154,10 @@ export function SignaturePad({ strokes, onChange, describedBy }: SignaturePadPro
         )}
       </div>
       <div className="mt-3 flex flex-wrap gap-3">
-        <Button
-          variant="secondary"
-          inert={!hasInk}
-          onClick={() => hasInk && onChange(strokes.slice(0, -1))}
-        >
+        <Button variant="secondary" inert={!hasInk} onClick={() => onChange(strokes.slice(0, -1))}>
           Undo<span className="sr-only"> last stroke</span>
         </Button>
-        <Button variant="secondary" inert={!hasInk} onClick={() => hasInk && onChange([])}>
+        <Button variant="secondary" inert={!hasInk} onClick={() => onChange([])}>
           Clear<span className="sr-only"> and start again</span>
         </Button>
       </div>

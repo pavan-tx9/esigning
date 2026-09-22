@@ -150,10 +150,6 @@ def create_archive(
     data = _read_scan(rt, scan)
     with rt.transaction() as db:
         host, ctx = authenticate_host(request, rt, db)
-        # Filing a scan stores a blob, appends two audit events and queues a seal job, none of
-        # which has a delete path. Metered on the host, like the other calls that create evidence.
-        limit = RateLimits.SESSION_CREATE
-        rt.limiter.hit(host_key("archive_create", host.id), limit=limit.limit, window_seconds=limit.window_seconds)
         scope = f"host:{host.id}"
         if idempotency_key is not None:
             # The digest covers the scan as well as the body: the same key with a different
@@ -176,6 +172,19 @@ def create_archive(
                 # shows that archive as it is now rather than a second copy of the first answer.
                 replayed = rt.envelopes.get(db, host, UUID(str(stored.body["envelope_id"])))
                 return JSONResponse(envelope_json(replayed), status_code=stored.status)
+        # Filing a scan stores a blob, appends two audit events and queues a seal job, none of
+        # which has a delete path. Metered on the host, like the other calls that create evidence.
+        #
+        # After the replay check, as ``POST /v1/signing/sign`` meters after its own and for the
+        # same reason: a retry of a filing that already succeeded must get its first answer back,
+        # not a 429, however many times the connection drops. It matters more here than there --
+        # signing has a second line of defence in the envelope service, which refuses a second
+        # signature whatever key is used, while nothing stops a host that got a 429 on a retry
+        # from re-filing under a fresh key and leaving two sealed archives of one piece of paper
+        # in the chart (``host_document_ref`` and the scan hash are not unique, and
+        # ``Idempotency-Key`` is optional on this route).
+        limit = RateLimits.SESSION_CREATE
+        rt.limiter.hit(host_key("archive_create", host.id), limit=limit.limit, window_seconds=limit.window_seconds)
         view = rt.envelopes.create_archive(db, host, parsed.to_contract(), data, ctx)
         if idempotency_key is not None:
             idempotency.complete(db, scope=scope, key=idempotency_key, status=201, body={"envelope_id": str(view.id)})

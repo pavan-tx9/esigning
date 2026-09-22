@@ -24,6 +24,12 @@ ObjectLockMode = Literal["COMPLIANCE", "GOVERNANCE"]
 #: Retention floor for anything the service stores, in years. Overridable per document type.
 DEFAULT_RETENTION_YEARS = 10
 
+#: Addendum 1 C: the hard ceiling on ``reauth_span_seconds``. A property of the code, not of
+#: configuration -- which is what lets verification re-check it years later, when the span a host
+#: was running with is long forgotten: no signature this service ever produced can have borrowed
+#: an attestation older than this.
+REAUTH_SPAN_MAX_SECONDS = 900
+
 _REPO_BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 
@@ -100,9 +106,9 @@ class Settings(BaseSettings):
     #: Addendum 1 C. How long, after its ``auth_time``, a re-authentication attestation for a user
     #: also covers that user's *other* sessions on the same host. ``0`` (the default) means it
     #: never does: an attestation covers the one session it was made for, which is one document.
-    #: Capped at 900 seconds by validation, and still subordinate to ``reauth_max_age_seconds``
-    #: (an attestation older than that covers nothing, span or no span).
-    reauth_span_seconds: int = Field(default=0, ge=0, le=900)
+    #: Capped at :data:`REAUTH_SPAN_MAX_SECONDS` by validation, and still subordinate to
+    #: ``reauth_max_age_seconds`` (an attestation older than that covers nothing, span or no span).
+    reauth_span_seconds: int = Field(default=0, ge=0, le=REAUTH_SPAN_MAX_SECONDS)
     #: Proxies whose X-Forwarded-For may be believed. Everything else uses the peer address.
     trusted_proxy_cidrs: tuple[str, ...] = ()
     default_locale: str = "en-US"

@@ -206,12 +206,17 @@ export function ConfirmStep({
     host.post({ type: "esign:reauth_required", session_id: session.session.id });
   };
 
-  const submit = () => {
-    if (!intent) {
-      setNudge(true);
+  // "Sign document" is inert until the person has both confirmed who they are (where the role
+  // needs it) and ticked the intent box. Pressing it then says which of the two is still missing
+  // -- re-authentication first, because the intent box is right above the button and the
+  // confirmation is further up the page.
+  const nudgeWhatIsMissing = () => {
+    if (!verified) {
+      setReauthNudge(true);
+      reauthButton.current?.focus();
       return;
     }
-    sign.mutate();
+    setNudge(true);
   };
 
   const signError = sign.error;
@@ -375,14 +380,8 @@ export function ConfirmStep({
           inert={!verified || !intent}
           busy={sign.isPending}
           aria-describedby={reauthNudge && !verified ? reauthHint : undefined}
-          onClick={() => {
-            if (!verified) {
-              setReauthNudge(true);
-              reauthButton.current?.focus();
-              return;
-            }
-            submit();
-          }}
+          onInertClick={nudgeWhatIsMissing}
+          onClick={() => sign.mutate()}
         >
           {sign.isPending ? "Signing" : sign.isError ? "Try again" : "Sign document"}
         </Button>

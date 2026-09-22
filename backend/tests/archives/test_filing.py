@@ -15,6 +15,7 @@ from typing import Any
 from pypdf import PdfReader
 from sqlalchemy import text
 
+from esign.audit.canonical import archive_attested_detail_digest
 from esign.worker import run_once
 from tests.archives.conftest import (
     PAPER_SIGNED_ON,
@@ -86,12 +87,25 @@ def test_the_trail_is_the_one_the_addendum_describes(host: Ehr) -> None:
         "capacity": None,
         "on_behalf_of": None,
     }
+    # Names by digest, never as text: one joint SHA-256 over the attesting staff member's display
+    # name, the ordered paper signers and the paper signing date. That is what lets verification
+    # and the seal contradict a rewritten ``attestation`` column, which for an archive carries the
+    # entire attribution -- there is no signer row, no session and no stamped revision behind it.
     assert attested["data"] == {
         "staff_user_id": STAFF_USER_ID,
         "statement": "true_copy",
         "original_disposition": "retained",
         "paper_signer_count": 1,
+        "attested_detail_sha256": archive_attested_detail_digest(
+            staff_display_name=STAFF_NAME,
+            paper_signers=[(PAPER_SIGNER_NAME, "self")],
+            paper_signed_on=PAPER_SIGNED_ON,
+        ).hex(),
     }
+    # And the digest is the only place any of them appears.
+    assert STAFF_NAME not in json.dumps(attested)
+    assert PAPER_SIGNER_NAME not in json.dumps(attested)
+    assert PAPER_SIGNED_ON not in json.dumps(attested)
 
 
 def test_the_scan_is_stored_write_once_as_revision_one(host: Ehr, world: World) -> None:

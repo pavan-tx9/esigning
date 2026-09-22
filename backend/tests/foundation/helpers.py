@@ -158,12 +158,46 @@ def insert_reauth_attestation(db: Session) -> UUID:
     return attestation_id
 
 
+def insert_adopted_signature(db: Session) -> UUID:
+    """One live saved signature, with the host, envelope, signer and session it points at.
+
+    ``typed`` rather than ``drawn`` so no blob is needed; the CHECKs tie each kind to its own
+    column. ``host_user_id`` is unique per row because of the partial unique index that keeps at
+    most one live signature per user per host.
+    """
+    signer_id = insert_signer(db)
+    session_id = insert_session(db, signer_id)
+    envelope_id = db.execute(_sql("SELECT envelope_id FROM signers WHERE id = :id"), {"id": signer_id}).scalar_one()
+    host_id = db.execute(_sql("SELECT host_id FROM envelopes WHERE id = :id"), {"id": envelope_id}).scalar_one()
+    adopted_id = new_id()
+    db.execute(
+        _sql(
+            "INSERT INTO adopted_signatures "
+            "(id, host_id, host_user_id, kind, typed_text, created_in_envelope_id, created_by_session_id) "
+            "VALUES (:id, :host, :user, 'typed', 'Probe Signer', :env, :session)"
+        ),
+        {
+            "id": adopted_id,
+            "host": host_id,
+            "user": f"probe-{adopted_id.hex[:8]}",
+            "env": envelope_id,
+            "session": session_id,
+        },
+    )
+    return adopted_id
+
+
 #: One row in each append-only table, so a trigger test has something to try to change.
+#:
+#: ``adopted_signatures`` (Addendum 1 B) is append-only with one exception -- a live row may be
+#: revoked, once -- so it holds UPDATE where the others do not, but DELETE and TRUNCATE are shut
+#: the same way and are proved here alongside them.
 APPEND_ONLY_ROW_MAKERS: dict[str, Any] = {
     "blobs": lambda db: insert_blob(db, f"trigger-probe:{new_id()}"),
     "document_revisions": insert_document_revision,
     "consent_texts": insert_consent_text,
     "reauth_attestations": insert_reauth_attestation,
+    "adopted_signatures": insert_adopted_signature,
 }
 
 

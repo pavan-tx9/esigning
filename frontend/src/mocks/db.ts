@@ -625,8 +625,20 @@ function validateCaptures(record: MockRecord, captures: unknown): Saveable | nul
 /**
  * `POST /v1/signing/adopted-signature/revoke`: the signer removes their own saved signature.
  * Answers whether there was one to revoke, as the service does (`{"revoked": bool}`).
+ *
+ * Never from a kiosk, exactly as saving is never from a kiosk (`api/signer_routes.py`): a shared
+ * tablet is shown no saved signature and may not destroy one either. The UI never offers it there,
+ * so this refusal should be unreachable -- which is the reason to mock it, rather than let the
+ * mocked API be more permissive than the real one and hide a regression that reaches it.
  */
 export function recordRevokeSaved(record: MockRecord): boolean {
+  if (record.scenario === "kiosk") {
+    throw new MockHttpError(
+      403,
+      "adoption_not_allowed",
+      "A saved signature cannot be removed from a shared tablet.",
+    );
+  }
   return revokeSavedSignature(record, "user") !== null;
 }
 

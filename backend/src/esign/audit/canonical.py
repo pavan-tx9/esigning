@@ -32,6 +32,7 @@ from uuid import UUID
 __all__ = [
     "HASHED_FIELDS",
     "ZERO_HASH",
+    "archive_attested_detail_digest",
     "canonical_json",
     "canonical_value",
     "compute_event_hash",
@@ -157,3 +158,36 @@ def hash_input(fields: Mapping[str, Any]) -> bytes:
 def compute_event_hash(fields: Mapping[str, Any]) -> bytes:
     """SHA-256 of :func:`hash_input`. The 32 raw bytes stored in ``audit_events.event_hash``."""
     return hashlib.sha256(hash_input(fields)).digest()
+
+
+def archive_attested_detail_digest(
+    *, staff_display_name: str, paper_signers: Sequence[tuple[str, str]], paper_signed_on: str
+) -> bytes:
+    """Addendum 1 A: the one digest that ties a paper archive's names and paper date to the chain.
+
+    A paper archive has no signer row, no session and no stamped revision: the attestation *is*
+    the attribution, and the cover page and certificate print it from the mutable
+    ``envelopes.attestation`` and ``envelopes.paper_signed_on`` columns. Those names are PHI and
+    cannot go in the trail as text, but their digest can -- exactly as ``CaptureRef`` and
+    ``SignatureAdoptedData`` already carry ``typed_text_sha256`` so a mutable row can be
+    contradicted.
+
+    One *joint* digest over the attesting name, the ordered list of paper signers and the paper
+    signing date, never one per field: SHA-256 of a bare ``YYYY-MM-DD`` is brute-forceable in
+    seconds, and publishing it would reinstate the date-shaped value that ``ArchiveCreatedData``
+    deliberately keeps out of the trail. Joint, the preimage is a name plus a list plus a date,
+    which is not guessable field by field.
+
+    ``paper_signed_on`` is passed as its ``YYYY-MM-DD`` text because a bare :class:`datetime.date`
+    has no canonical form here; the order of ``paper_signers`` is significant, being the order the
+    cover page and the certificate print them in.
+    """
+    return hashlib.sha256(
+        canonical_json(
+            {
+                "staff_display_name": staff_display_name,
+                "paper_signers": [{"display_name": name, "capacity": capacity} for name, capacity in paper_signers],
+                "paper_signed_on": paper_signed_on,
+            }
+        )
+    ).digest()

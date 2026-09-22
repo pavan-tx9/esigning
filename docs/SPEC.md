@@ -229,10 +229,17 @@ the paper original and the attesting staff member, and the cover page and the ce
 - IP and user agent are taken from the request server-side, honouring `TRUSTED_PROXY_CIDRS`.
 - Section 14 adds four event types. `archive.created` (document type, page count, size, scan hash,
   what it supersedes; the row's `document_sha256` is the scan hash too) and `archive.attested`
-  (the attesting `staff_user_id`, the statement, the disposition of the original, and the *count*
-  of paper signers -- their names are PHI and go on the cover page and the certificate, never
-  here; the paper signing date is a date and stays out for the same reason every other date-shaped
-  value does) are on the archive's envelope stream. `signature.adopted` is on the envelope stream
+  (the attesting `staff_user_id`, the statement, the disposition of the original, the *count*
+  of paper signers, and `attested_detail_sha256` -- their names are PHI and go on the cover page
+  and the certificate, never here, and the paper signing date is a date-shaped value about a
+  patient, so all of them reach the trail as one joint SHA-256 over the canonical JSON of
+  `{staff_display_name, paper_signers: [{display_name, capacity}], paper_signed_on}`
+  (`audit/events.py::attested_detail_digest`). Joint rather than per field: the digest of a bare
+  date is brute-forceable in seconds. An archive has no signer row, no session and no stamped
+  revision, so the attestation is its entire attribution, and a mutable column nothing can
+  contradict is not evidence -- the seal recomputes this before printing those names
+  (`certificate_evidence_mismatch`) and verification recomputes it again afterwards) are on the
+  archive's envelope stream. `signature.adopted` is on the envelope stream
   of the session the signature was saved in (the saved signature's id and kind, and the digest of
   its image or text, tying the saved ink to the chain like a `CaptureRef`).
   `signature.adoption_revoked` is on the `system` stream, with the *host id* as the stream id, so
@@ -324,8 +331,10 @@ the paper original and the attesting staff member, and the cover page and the ce
   `(host_id, host_user_id)` on any of that user's sessions with `auth_time` within the span
   (`scope = span`). In either scope the attestation must be within `REAUTH_MAX_AGE_SECONDS`, not
   in the future, and the session it was made for and the session asking must both be live. A
-  different user or host never matches. The span is off by default and capped at 900 seconds by
-  `Settings` validation.
+  different user or host never matches. The span is off by default and capped at
+  `config.REAUTH_SPAN_MAX_SECONDS` (900) by `Settings` validation -- the same constant
+  verification re-checks, so a `scope = span` signature naming an attestation older than the cap
+  is a finding however consistent the rest of the event is.
 - Adopted signatures (section 14 B): `adopted_signatures` holds at most one live row per
   `(host_id, host_user_id)` (partial unique index); `kind` is `drawn` (a `signature_image` blob)
   or `typed`. Only the signer creates one, from inside their own live, non-kiosk session, after
@@ -378,7 +387,7 @@ Requests outside the scope of section 1 (`POST /v1/envelopes/bulk`, `.../email-l
 | `POST /v1/signing/viewed` | `{pages_viewed: int}` must equal the page count |
 | `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?}` (`locale` as shown in the session payload; default locale when omitted) |
 | `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...], save_adopted_signature?: bool}` + `Idempotency-Key`. `save_adopted_signature: true` (section 14 B) saves the drawn or typed signature just applied, after the signature succeeds and in the same transaction; what is saved is the first such capture landing on a **signature** field, never an initials one (initials are the signer's own typed text and a template may ask for them first); refused (422 `no_signature_to_save`) when the request has no such capture, and always (403) from a kiosk session |
-| `POST /v1/signing/adopted-signature/revoke` | section 14 B: the signer removes their own saved signature (`reason: user`). No body. 200 `{"revoked": bool}` whether or not there was one |
+| `POST /v1/signing/adopted-signature/revoke` | section 14 B: the signer removes their own saved signature (`reason: user`). No body. 200 `{"revoked": bool}` whether or not there was one. Refused (403 `adoption_not_allowed`) from a kiosk session, as saving is: a shared tablet is not shown this signature and may not destroy it either, and the revocation is irreversible and would be recorded as the person's own request |
 | `POST /v1/signing/decline` | `{reason_code}` from a fixed list including `prefers_paper` |
 | `GET /v1/signing/copy` | sealed PDF (records `document.downloaded`), or 202 `{status: "sealing"}` while the seal is pending, or 409 `envelope_not_complete` while other signers are outstanding |
 
@@ -582,8 +591,10 @@ Third round, from the review of the integrated system:
   require re-authentication.
 - **`EnvelopeService.assert_reauth_allowed(db, envelope_id, signer_id)`**: the API calls it after
   `attest_reauth`, so an attestation cannot be recorded for a signer who has already signed
-  (`signer_finished`), for a role with `requires_reauth: false` (`reauth_not_required`), or on an
-  envelope that is no longer being signed (`envelope_not_live`). Declared on
+  (`signer_finished`), for a role that does not re-authenticate (`reauth_not_required`), or on an
+  envelope that is no longer being signed (`envelope_not_live`). Whether the role re-authenticates
+  is re-derived from the immutable template version, as at signing and at sealing, never read off
+  `signers.requires_reauth`. Declared on
   `runtime.GatedEnvelopeService` until it can move into `contracts.EnvelopeService`.
 - **`sign` requires the bytes to have been viewed, not just presented**: `signers.viewed_sha256`
   (`0501`) records the revision `record_viewed` confirmed, and signing refuses with
@@ -643,7 +654,17 @@ Fourth round, from the review of the integrated system. No change to `contracts.
   template whose role allows the `clinician` capacity without `requires_reauth`
   (`template_definitions_invalid`), and `EnvelopeService.create` sets `requires_reauth` for a
   clinician signer whatever an already-published version says. The developer guide makes this a
-  requirement; it was convention in `templates/procedure_consent.json`.
+  requirement; it was convention in `templates/procedure_consent.json`. `signers.requires_reauth`
+  is a mutable copy on a fully UPDATE-able table and no audit event records it, so it is never
+  read as the gate: `sign`, `_certificate_signer` and `assert_reauth_allowed` all re-derive the
+  rule from the immutable template version plus the capacity, and verification mirrors the
+  comparison under `signer_rows_match_trail`. A flipped column is refused at signing
+  (`reauth_required`), stops the seal (`certificate_evidence_mismatch`) and is reported
+  afterwards, instead of either waving a clinician signature through with no attestation or
+  stripping the attestation off a certificate while the envelope waits for a backing-off seal.
+  It also does not make `POST /v1/sessions/{id}/reauth` answer `reauth_not_required` for a
+  signature that will then demand one: three places decide the same question, so they decide it
+  the same way.
 - **The certificate's document-level facts are cross-checked too**: `created_at`, `document_type`,
   `template_version_id` and the template key and version are compared with the first
   `envelope.created` (whose `occurred_at` is the creation time), exactly as the per-signer facts are.
@@ -721,8 +742,9 @@ built, so the builders work against a fixed contract. Everything the addendum li
   and `signature_captures_kind_adopted`; `reauth_attestations.host_id` / `host_user_id` with the
   both-or-neither CHECK and a partial index by user.
 - **`config.py`**: `max_scan_bytes` (20 MiB), `max_scan_pages` (100), `reauth_span_seconds`
-  (0, validated 0..900). `check_production_settings` refuses nothing new; `.env.example` says
-  why the span is off by default.
+  (0, validated `0..REAUTH_SPAN_MAX_SECONDS`, the named constant verification also re-checks).
+  `check_production_settings` refuses nothing new; `.env.example` says why the span is off by
+  default.
 - **Audit allowlist**: the four new data models, `SignerSignedData`'s four new optional fields,
   and the widened capture and revision kind vocabularies, in `esign/audit/events.py` -- the one
   definition. `audit/README.md`'s worked vector was regenerated.

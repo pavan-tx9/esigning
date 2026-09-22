@@ -24,6 +24,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from esign.archives import repository as repo
+from esign.audit.events import attested_detail_digest
 from esign.clock import Clock
 from esign.config import Settings
 from esign.contracts import (
@@ -147,6 +148,13 @@ class ArchiveService:
                 "statement": attestation.statement,
                 "original_disposition": attestation.original_disposition,
                 "paper_signer_count": len(attestation.paper_signers),
+                # The names and the paper date, by digest. They are PHI and cannot be written as
+                # text, but an archive has no signer row and no session to corroborate them: the
+                # attestation is the whole attribution, and it is printed at *seal* time from
+                # columns the runtime role may UPDATE. Without this the cover page and the
+                # certificate could be sealed naming a different staff member, different paper
+                # signers and a different date, with nothing in the trail to contradict them.
+                "attested_detail_sha256": attested_detail_digest(attestation, paper_signed_on),
             },
         )
         if superseded is not None:

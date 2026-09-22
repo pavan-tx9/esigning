@@ -24,8 +24,9 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any, Final, Literal
 from uuid import UUID
 
@@ -34,6 +35,8 @@ from pypdf import PdfReader
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from esign.audit.canonical import archive_attested_detail_digest
+from esign.config import REAUTH_SPAN_MAX_SECONDS
 from esign.contracts import (
     Actor,
     AuditEvent,
@@ -489,12 +492,21 @@ class Verifier:
         envelope, and it is the load-bearing claim on the cover page and the certificate: who says
         this scan is a true copy, and what became of the paper. ``envelopes.attestation`` is an
         UPDATE-able jsonb column, so it is compared with ``archive.attested`` exactly as a signer's
-        row is compared with ``signer.signed`` -- the names inside it are not in the trail and
-        cannot be (they are PHI), but the staff member, the statement, the disposition and the
-        number of paper signers are, and a rewrite of any of them is a finding here.
+        row is compared with ``signer.signed``.
+
+        The names and the paper signing date are not in the trail *as text* -- they are PHI -- but
+        they are in it as one joint digest (``attested_detail_sha256``), for the same reason
+        ``CaptureRef`` carries ``typed_text_sha256``: a mutable column that nothing can contradict
+        is not evidence. So the staff member's opaque id, the statement, the disposition, the
+        number of paper signers, *and* the digest over the attesting name, the ordered paper
+        signers and ``paper_signed_on`` are all compared here, and a rewrite of any of them is a
+        finding.
         """
         row = db.execute(
-            text("SELECT created_at, document_type, attested_at, attestation FROM envelopes WHERE id = :id"),
+            text(
+                "SELECT created_at, document_type, attested_at, attestation, paper_signed_on "
+                "FROM envelopes WHERE id = :id"
+            ),
             {"id": envelope_id},
         ).first()
         created = next((e for e in events if e.event_type == EventType.ARCHIVE_CREATED), None)
@@ -525,6 +537,11 @@ class Verifier:
                 len(attestation.get("paper_signers") or []),
                 attested.data.get("paper_signer_count"),
             ),
+            (
+                "attested detail",
+                _attested_detail_digest(attestation, row.paper_signed_on),
+                attested.data.get("attested_detail_sha256"),
+            ),
         ):
             if _text(row_value) != _text(event_value):
                 problems.append(f"{what} is not what the archive's trail recorded")
@@ -542,15 +559,23 @@ class Verifier:
         are the ones ``_certificate_signer`` compares, not just the three timestamps: a rewrite of
         ``capacity`` (guardian -> self), ``role_key``, ``on_behalf_of`` or ``consent_text_id`` after
         sealing went unreported while the trail and the sealed bytes held the original values.
+
+        ``requires_reauth`` is the one column here that no event records, and it gates the whole
+        re-authentication block on the certificate. It is therefore not compared with the trail but
+        re-derived from the template version the envelope names -- immutable, so it still says what
+        it said at ``create`` -- plus the capacity ``signer.signed`` recorded. A flip after sealing
+        would otherwise turn "confirmed identity, borrowed from an earlier session 45 seconds ago"
+        into "not required" with nothing reporting it.
         """
         rows = db.execute(
             text(
                 "SELECT id, status, role_key, capacity, on_behalf_of, consent_text_id, "
-                "  viewed_at, consented_at, signed_at "
+                "  requires_reauth, viewed_at, consented_at, signed_at "
                 "FROM signers WHERE envelope_id = :id"
             ),
             {"id": envelope_id},
         ).all()
+        reauth_by_role = self._role_reauth(db, envelope_id)
         problems: list[str] = []
         for row in rows:
             signer_id = str(row.id)
@@ -588,6 +613,12 @@ class Verifier:
                 ):
                     if _text(row_value) != _text(event_value):
                         problems.append(f"{column} is not what signer.signed recorded")
+                # Not "what the trail recorded" -- nothing records it -- but what the immutable
+                # template role and the recorded capacity say it has to be.
+                capacity = _text(signed.data.get("capacity"))
+                expected = reauth_by_role.get(str(row.role_key), False) or capacity == "clinician"
+                if bool(row.requires_reauth) != expected:
+                    problems.append("requires_reauth is not what the template role and the capacity require")
             # The *first* consent.accepted, matching the row: ``accept_consent`` keeps the first
             # accepted disclosure in both ``consented_at`` and ``consent_text_id``.
             consent = next(
@@ -610,6 +641,29 @@ class Verifier:
                 problems.append("no document.viewed covers the revision signer.signed was built on")
         run.expect("signer_rows_match_trail", not problems, "; ".join(sorted(set(problems))))
 
+    def _role_reauth(self, db: Session, envelope_id: UUID) -> dict[str, bool]:
+        """``requires_reauth`` per role key, from the envelope's own template version.
+
+        ``template_versions`` is immutable once published (its trigger and the foundation tests
+        say so), which is what makes it usable as the authority for a column that is not in the
+        trail. A paper archive has no template version and no signers, so the empty map is the
+        right answer for it.
+        """
+        roles = db.execute(
+            text(
+                "SELECT v.signer_roles AS signer_roles FROM envelopes e "
+                "JOIN template_versions v ON v.id = e.template_version_id WHERE e.id = :id"
+            ),
+            {"id": envelope_id},
+        ).scalar()
+        if not isinstance(roles, list):
+            return {}
+        return {
+            str(role["key"]): bool(role.get("requires_reauth"))
+            for role in roles
+            if isinstance(role, Mapping) and role.get("key") is not None
+        }
+
     def _check_reauth_attestations(self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID) -> None:
         """Every signature that rests on a re-authentication still has the attestation it names.
 
@@ -620,8 +674,10 @@ class Verifier:
         something else entirely: the table is append-only against the application and the owner
         role, but the point of verification is to re-derive rather than to assume. A borrowed
         attestation is checked hardest, because it is the one the base spec would not have allowed:
-        it must exist, belong to this signer's own ``(host_id, host_user_id)``, and really come
-        from another session.
+        it must exist, belong to this signer's own ``(host_id, host_user_id)``, really come from
+        another session, and be no older than :data:`esign.config.REAUTH_SPAN_MAX_SECONDS` -- the
+        bound the addendum leans on to contain the weakening, and the one part of the span that is
+        a property of the code rather than of configuration nobody kept.
         """
         signed = [e for e in events if e.event_type == EventType.SIGNER_SIGNED and e.data.get("reauth_used")]
         if not signed:
@@ -678,6 +734,13 @@ class Verifier:
                 )
             if scope == "span" and row.host_id is None:
                 problems.append(f"{signer_id}: a borrowed attestation does not say whose it is")
+            if scope == "span" and int(age) > REAUTH_SPAN_MAX_SECONDS:
+                # The bound the addendum leans on to contain the weakening. The span a host was
+                # configured with at the time is not recoverable, but the 900-second ceiling is a
+                # property of the code (``Settings.reauth_span_seconds`` cannot exceed it), so a
+                # signature claiming a day-old borrowed attestation is one this service could
+                # never have produced, however consistent the rest of the event looks.
+                problems.append(f"{signer_id}: a borrowed attestation is older than the maximum span")
         run.expect("reauth_attestations_match_trail", not problems, "; ".join(sorted(set(problems))))
 
     def _check_sealed_pages_match_final_revision(
@@ -848,6 +911,28 @@ def _opt(value: Any) -> bytes | None:
 def _text(value: Any) -> str | None:
     """A row value and a canonicalised event value compared as the same kind of thing."""
     return None if value is None else str(value)
+
+
+def _attested_detail_digest(attestation: Mapping[str, Any], paper_signed_on: date | None) -> str | None:
+    """The digest ``archive.attested`` must carry for the row's names and paper signing date.
+
+    Rebuilt from the ``envelopes`` row alone, so it is a claim about the row rather than a copy of
+    the event. Anything the row cannot supply in the shape the digest was taken over -- an absent
+    date, ``paper_signers`` that is not a list of objects -- yields ``None``, which does not match
+    a recorded digest and is reported as a disagreement rather than passed over.
+    """
+    signers = attestation.get("paper_signers")
+    if paper_signed_on is None or not isinstance(signers, list):
+        return None
+    return archive_attested_detail_digest(
+        staff_display_name=str(attestation.get("staff_display_name")),
+        paper_signers=[
+            (str(signer.get("display_name")), str(signer.get("capacity")))
+            for signer in signers
+            if isinstance(signer, Mapping)
+        ],
+        paper_signed_on=paper_signed_on.isoformat(),
+    ).hex()
 
 
 def _uuid(value: Any) -> UUID | None:

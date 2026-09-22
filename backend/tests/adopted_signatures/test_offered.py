@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
+from esign.storage import content_key
 from tests.adopted_signatures.conftest import (
     KIOSK,
     OTHER_PATIENT,
@@ -19,8 +21,9 @@ from tests.adopted_signatures.conftest import (
     envelope_for,
     offered,
     sign,
+    stored_image_hex,
 )
-from tests.e2e.conftest import Ehr
+from tests.e2e.conftest import Ehr, World
 
 
 def test_a_signature_saved_in_one_session_is_offered_in_the_next(ehr: Ehr) -> None:
@@ -102,3 +105,36 @@ def test_the_saved_image_reaches_only_its_own_user(ehr: Ehr) -> None:
     )
     assert response.status_code == 403, response.text
     assert response.json()["error"]["code"] == "adopted_signature_unavailable"
+
+
+def test_an_unreadable_saved_image_is_offered_as_nothing_rather_than_failing_the_session(
+    ehr: Ehr, world: World
+) -> None:
+    """The saved signature is a convenience; the rest of the payload is how anyone signs at all.
+
+    ``GET /v1/signing/session`` carries the consent text, the fields and the re-authentication
+    state. Letting a missing or corrupt PNG take all of that down would strand the signer -- and
+    an ``IntegrityFailure`` here is permanent, not transient, so they could not even reach
+    ``POST /v1/signing/adopted-signature/revoke`` from a UI that never loads. They draw a new one
+    instead. Nothing here records a signature, so "never fail open" is untouched.
+    """
+    adopt(ehr)
+    mine = offered(ehr)
+    assert mine is not None and mine["image_png_base64"]
+
+    path = world.settings.blob_fs_root / content_key(bytes.fromhex(stored_image_hex(world, mine["id"])))
+    tampered = bytearray(path.read_bytes())
+    tampered[len(tampered) // 2] ^= 0x01
+    os.chmod(path, 0o644)  # noqa: PTH101 - the file is deliberately read-only
+    path.write_bytes(bytes(tampered))
+
+    envelope = envelope_for(ehr)
+    signer = ehr.open_session(envelope, "patient")
+    response = signer.get("/session")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["adopted_signature"] is None
+    # ...and everything the signer actually needs is still there.
+    assert payload["consent"]["version"]
+    assert payload["fields"]

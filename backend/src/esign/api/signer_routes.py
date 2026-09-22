@@ -30,12 +30,15 @@ from esign.api.schemas import (
     signer_ack_json,
     signing_session_json,
 )
-from esign.contracts import AdoptedSignature, RequestContext, SessionInfo, ValidationFailed
+from esign.contracts import AdoptedSignature, EsignError, Forbidden, RequestContext, SessionInfo, ValidationFailed
 from esign.identity import Limit, RateLimits, ip_key, session_key
+from esign.logging import get_logger
 from esign.runtime import Runtime
 from esign.worker import claim_seal_job, seal_one
 
 __all__ = ["router"]
+
+log = get_logger(__name__)
 
 router = APIRouter(prefix="/v1/signing", tags=["signer"])
 
@@ -81,13 +84,28 @@ def _adopted_signature(rt: Runtime, db: Session, session: SessionInfo) -> dict[s
     The pair it is looked up by comes from the session's rows, so a session can only ever be
     offered the signature of the person whose session it is. A kiosk session is offered nothing:
     the tablet is shared, and the next patient must not be handed the last one's signature.
+
+    An unreadable image is offered as nothing rather than as an error. The saved signature is a
+    convenience; the consent text, the fields and the re-authentication state in the same payload
+    are how the signer signs at all, and letting a missing or corrupt PNG take the whole
+    ``GET /v1/signing/session`` down would strand them -- permanently, for an ``IntegrityFailure``
+    -- with no way to reach the revoke route from the UI. They draw a new one instead. This is not
+    "failing open": nothing here records a signature, and an ``adopted`` capture pointing at the
+    same row is still resolved and re-hashed under the envelope lock by ``EnvelopeService.sign``.
     """
     if session.kiosk is not None:
         return None
     adopted: AdoptedSignature | None = rt.identity.get_adopted_signature(
         db, host_id=session.host_id, host_user_id=session.host_user_id
     )
-    image = None if adopted is None or adopted.image_sha256 is None else rt.blobs.get(db, adopted.image_sha256)
+    image = None
+    if adopted is not None and adopted.image_sha256 is not None:
+        try:
+            image = rt.blobs.get(db, adopted.image_sha256)
+        except EsignError as exc:
+            # No digest and no user id: the structured logger and the no-PHI rule still apply.
+            log.warning("adopted_signature.unreadable", error_code=exc.code)
+            return None
     return adopted_signature_json(adopted, image)
 
 
@@ -191,6 +209,12 @@ def post_sign(
         # nothing here to save" is a refusal the signer sees instead of a rolled-back signature.
         # The field types come from the template, because only a capture on a *signature* field is
         # the signature to save: an initials field earlier in the document is not one.
+        if body.save_adopted_signature and session.kiosk is not None:
+            # Before anything is applied, for the same reason as the pre-flight below: a shared
+            # tablet keeps nothing, and ``save_adopted_signature`` refusing *after*
+            # ``EnvelopeService.sign`` would stamp the revision, store the blobs and append
+            # ``signer.signed``, then roll all of it back to say so.
+            raise Forbidden("a shared tablet does not keep a signature", code="adoption_not_allowed")
         source = (
             adoption_source(captures, {f.id: f.type for f in rt.envelopes.signing_view(db, session).fields})
             if body.save_adopted_signature
@@ -221,6 +245,13 @@ def revoke_adopted_signature(request: Request) -> JSONResponse:
     200 whether or not there was one: the signer asked for it to be gone, and it is. Nothing is
     deleted -- the row is revoked and stays, because a signature already applied points at it.
 
+    Never from a kiosk, exactly as the rest of the feature is never from a kiosk: the shared
+    tablet is not shown this signature (``_adopted_signature`` returns ``None`` for it) and may not
+    save one, so it may not destroy one either -- and the revocation is irreversible, the trigger
+    in ``0700`` permitting exactly one. Recording it as ``reason: "user"`` with the signer as the
+    actor would also put "the person asked for this" on an append-only stream that can never be
+    corrected, when what happened is that someone holding a clinic tablet asked.
+
     Unmetered, unlike the calls around it: a repeat writes no audit event (there is nothing live
     left to revoke), so a loop here cannot grow the append-only trail. Saving another signature to
     revoke costs a whole signature.
@@ -228,6 +259,8 @@ def revoke_adopted_signature(request: Request) -> JSONResponse:
     rt = runtime_of(request)
     with rt.transaction() as db:
         session, ctx = authenticate_signer(request, rt, db)
+        if session.kiosk is not None:
+            raise Forbidden("a shared tablet does not manage a saved signature", code="adoption_not_allowed")
         revoked = revoke_and_record(
             rt,
             db,

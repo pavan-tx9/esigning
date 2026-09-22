@@ -122,15 +122,10 @@ export function ConsentStep({ session, onContinue, onPreferPaper }: ConsentStepP
       <div className="mt-6 grid gap-3 sm:grid-cols-2">
         <Button
           inert={!agreed}
+          onInertClick={() => setNudge(true)}
           busy={consent.isPending}
           className="min-h-14"
-          onClick={() => {
-            if (!agreed) {
-              setNudge(true);
-              return;
-            }
-            consent.mutate();
-          }}
+          onClick={() => consent.mutate()}
         >
           Agree and continue
         </Button>

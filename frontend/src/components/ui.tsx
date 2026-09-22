@@ -1,6 +1,7 @@
 import {
   type ButtonHTMLAttributes,
   createContext,
+  type MouseEventHandler,
   type ReactNode,
   type Ref,
   useCallback,
@@ -61,8 +62,18 @@ const variants: Record<Variant, string> = {
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: Variant;
-  /** Shown but inert. The button stays focusable so a keyboard user can find out why. */
+  /**
+   * Shown but inert: `onClick` does not run. The button stays focusable and clickable — a
+   * disabled button tells a keyboard or screen-reader user nothing about why it will not work —
+   * so the click is turned into `onInertClick` instead, which is where the "why" is said.
+   */
   inert?: boolean;
+  /**
+   * What an inert button does when it is pressed: the nudge that says what is still missing. Say
+   * it on screen with ``role="alert"``, not only to the live region. Without one, nothing happens,
+   * which is right for a button that is inert because something else is already in flight.
+   */
+  onInertClick?: MouseEventHandler<HTMLButtonElement>;
   busy?: boolean;
   ref?: Ref<HTMLButtonElement>;
 }
@@ -70,6 +81,7 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 export function Button({
   variant = "primary",
   inert = false,
+  onInertClick,
   busy = false,
   className = "",
   children,
@@ -86,8 +98,13 @@ export function Button({
       aria-busy={busy || undefined}
       className={`${base} ${variants[variant]} ${blocked ? "cursor-not-allowed" : "cursor-pointer"} ${className}`}
       onClick={(event) => {
-        if (busy) {
+        // A blocked button never reaches `onClick`. The guard lives here, not in each caller's
+        // own `if` at the top of its handler: every action in this flow is either a step towards
+        // a signature or the signature itself, and "the button looked inert and fired anyway" is
+        // not a class of bug worth leaving to each call site to remember.
+        if (blocked) {
           event.preventDefault();
+          if (!busy) onInertClick?.(event);
           return;
         }
         onClick?.(event);

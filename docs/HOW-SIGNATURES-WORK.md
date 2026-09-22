@@ -391,14 +391,41 @@ psql -At -c "SELECT jsonb_pretty(data) FROM audit_events
              WHERE stream_type='envelope' AND stream_id='<envelope id>'
                AND event_type='archive.attested'"
 # {"statement": "true_copy", "staff_user_id": "staff-3310",
-#  "paper_signer_count": 1, "original_disposition": "retained"}
+#  "paper_signer_count": 1, "original_disposition": "retained",
+#  "attested_detail_sha256": "5c2e…"}
 ```
 
-The trail holds the opaque staff id, the statement, the disposition and a *count* — the names are
-PHI, and they live in the row and inside the sealed PDF, nowhere else. Verification compares the
-two as `envelope_row_matches_trail`, so an edited `attestation` column is a finding rather than a
-new truth. `archive.created` carries the scan's hash, size and page count, and its `occurred_at` is
-the filing time the cover page and the certificate print.
+The trail holds the opaque staff id, the statement, the disposition and a *count* — the names
+themselves are PHI, and they live in the row and inside the sealed PDF, nowhere else. But names a
+trail cannot contradict are not evidence, and for an archive they are the whole attribution: there
+is no signer row, no session and no stamped revision behind them. So the trail also holds
+`attested_detail_sha256`, one SHA-256 over the canonical JSON of the attesting staff member's
+display name, the ordered paper signers and the paper signing date:
+
+```sh
+python - <<'PY'
+import hashlib, json
+detail = {
+    "staff_display_name": "Alice Wu",
+    "paper_signers": [{"display_name": "Maria Alvarez", "capacity": "self"}],
+    "paper_signed_on": "2026-03-10",
+}
+print(hashlib.sha256(json.dumps(detail, sort_keys=True, separators=(",", ":"),
+                                ensure_ascii=False).encode()).hexdigest())
+PY
+```
+
+Read `staff_display_name`, `paper_signers` and `paper_signed_on` out of the row (the last from the
+`envelopes.paper_signed_on` column, as `YYYY-MM-DD`), recompute, and it must equal what
+`archive.attested` recorded. One *joint* digest rather than one per field on purpose: a SHA-256 of
+a bare date is brute-forceable in seconds, and publishing one would put a date-shaped value about a
+patient back in the trail — joint, the preimage is a name plus an ordered list plus a date.
+
+Verification compares all of it as `envelope_row_matches_trail`, and the seal refuses
+(`certificate_evidence_mismatch`) before printing names that disagree, so an edited `attestation`
+column or an edited `paper_signed_on` is a finding rather than a new truth. `archive.created`
+carries the scan's hash, size and page count, and its `occurred_at` is the filing time the cover
+page and the certificate print.
 
 Then read page 1 of the sealed PDF. It is inside the seal, so it cannot have been changed after the
 fact, and it says in plain words what this document is worth:

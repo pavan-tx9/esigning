@@ -220,3 +220,35 @@ def test_a_host_cannot_create_a_saved_signature(ehr: Ehr, world: World) -> None:
         == 404
     )
     assert adopted_rows(world, OTHER_PATIENT) == []
+
+
+def _blob_files(world: World) -> set[str]:
+    root = world.settings.blob_fs_root
+    return {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
+
+
+def test_a_kiosk_save_is_refused_before_the_signature_is_applied(ehr: Ehr, world: World) -> None:
+    """The refusal is a pre-flight, not a rollback.
+
+    ``save_adopted_signature`` in ``api/adopted.py`` runs *after* ``EnvelopeService.sign``, so on
+    its own it means a kiosk client that sets the flag has its whole signature applied -- revision
+    stamped, blobs written, ``signer.signed`` appended -- and then rolled back. The database
+    rollback is clean, but the blob store is not transactional: the sanitised PNG and the stamped
+    revision PDF are written to it before the row that records them, and they stay behind. So the
+    blob store is what this test watches, alongside the trail.
+    """
+    envelope = envelope_for(ehr)
+    kiosk = ehr.open_session(envelope, "patient", method="staff_verified", kiosk=KIOSK)
+    payload = kiosk.review_and_consent()
+    before = _blob_files(world)
+
+    response = kiosk.post(
+        "/sign", sign_body(kiosk, payload, save=True), **{"Idempotency-Key": f"kiosk-preflight-{envelope['id']}"}
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "adoption_not_allowed"
+    assert _blob_files(world) == before
+    assert "signer.signed" not in [e["event_type"] for e in ehr.audit(envelope["id"])]
+    assert adopted_rows(world) == []
+    assert ehr.envelope(envelope["id"])["signers"][0]["status"] == "consented"

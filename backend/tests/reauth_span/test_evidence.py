@@ -17,6 +17,7 @@ from pypdf import PdfReader
 from sqlalchemy import Engine, text
 
 from esign.clock import FixedClock
+from esign.config import REAUTH_SPAN_MAX_SECONDS, Settings
 from tests.reauth_span.conftest import DEMO_SPAN_SECONDS, Queue, QueueFactory
 from tests.reauth_span.test_signing_queue import envelope_for, first_document, signed_data
 
@@ -135,3 +136,63 @@ def test_tampering_with_the_borrowed_attestation_is_caught(
     # The seal and the chain are untouched: the report says exactly what failed and what did not.
     assert "audit_chain" not in failed
     assert report["seal"]["ok"] is True
+
+
+@pytest.mark.parametrize("seconds", [REAUTH_SPAN_MAX_SECONDS + 1, 86_400])
+def test_a_span_past_the_cap_is_refused_at_startup_rather_than_clamped(seconds: int) -> None:
+    """The 900 second ceiling is the number compliance is quoted, so it is a test rather than a
+    reading of the code: a span past it refuses to start, and is never quietly narrowed."""
+    with pytest.raises(ValueError, match="reauth_span_seconds"):
+        Settings(reauth_span_seconds=seconds)
+
+
+def test_the_cap_itself_is_accepted() -> None:
+    """And the boundary is the boundary: 900 is a legal span, 901 is not."""
+    assert Settings(reauth_span_seconds=REAUTH_SPAN_MAX_SECONDS).reauth_span_seconds == REAUTH_SPAN_MAX_SECONDS
+
+
+def test_a_borrowed_attestation_older_than_the_cap_is_caught(
+    queue: QueueFactory, clock: FixedClock, owner_engine: Engine
+) -> None:
+    """A ``span`` signature can never have borrowed an attestation older than the cap.
+
+    The span a host was configured with at the time is not recoverable years later, but the
+    900-second ceiling is a property of the code -- ``Settings`` refuses to hold more -- so an
+    event claiming a day-old borrowed attestation describes a signature this service could not
+    have produced, however consistent the rest of it is made to look. The row is backdated to
+    match, so the ``auth_time`` cross-check is satisfied and the only thing left to object is the
+    bound itself.
+    """
+    q = queue(DEMO_SPAN_SECONDS)
+    _, second = a_queue_of_two(q, clock)
+    attestation_id = q.attestation_ids()[0]
+    over_cap = 86_400
+
+    with owner_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE audit_events DISABLE TRIGGER USER"))
+        conn.execute(
+            text(
+                "UPDATE audit_events SET data = jsonb_set(data, '{reauth_age_seconds}', to_jsonb(CAST(:age AS bigint))) "
+                "WHERE stream_id = :env AND event_type = 'signer.signed' AND data ->> 'reauth_used' = 'true'"
+            ),
+            {"age": over_cap, "env": second["id"]},
+        )
+        conn.execute(text("ALTER TABLE audit_events ENABLE TRIGGER USER"))
+        conn.execute(text("ALTER TABLE reauth_attestations DISABLE TRIGGER USER"))
+        conn.execute(
+            text(
+                "UPDATE reauth_attestations SET auth_time = ("
+                "  SELECT occurred_at - make_interval(secs => CAST(:age AS int)) FROM audit_events "
+                "  WHERE stream_id = :env AND event_type = 'signer.signed' AND data ->> 'reauth_used' = 'true'"
+                ") WHERE id = :id"
+            ),
+            {"age": over_cap, "env": second["id"], "id": attestation_id},
+        )
+        conn.execute(text("ALTER TABLE reauth_attestations ENABLE TRIGGER USER"))
+
+    failed = failed_checks(q.ehr.verification(str(second["id"])))
+    assert "reauth_attestations_match_trail" in failed
+    assert "older than the maximum span" in failed["reauth_attestations_match_trail"]
+    # The bound is what objected, not the age cross-check: the row was moved to agree with the
+    # forged age, which is exactly what a careful forger would do.
+    assert "auth_time" not in failed["reauth_attestations_match_trail"]

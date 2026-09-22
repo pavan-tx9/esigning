@@ -187,6 +187,9 @@ _SAMPLES: dict[EventType, Callable[[], dict[str, Any]]] = {
         "statement": "true_copy",
         "original_disposition": "retained",
         "paper_signer_count": 2,
+        # The names and the paper date, jointly digested: they are PHI, and a mutable column the
+        # trail cannot contradict is not evidence.
+        "attested_detail_sha256": DIGEST_B,
     },
     EventType.SIGNATURE_ADOPTED: lambda: {
         "signer_id": UUID_A,

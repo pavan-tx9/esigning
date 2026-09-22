@@ -85,6 +85,10 @@ NO_DELETE_TABLES = [
     "signature_captures",
     "seal_jobs",
     "webhook_deliveries",
+    # `0700`: a saved signature is never deleted, because a `signature_captures` row may point at
+    # one. The app role holds the UPDATE the revocation needs and nothing more; what that UPDATE
+    # may touch is the trigger's business (`tests/adopted_signatures/test_write_once.py`).
+    "adopted_signatures",
 ]
 
 #: Append-only from `0502`: the raw signer input, insert-only like every other piece of evidence.
@@ -161,7 +165,10 @@ def test_owner_cannot_delete_from_the_other_append_only_tables(owner_db: Session
     with pytest.raises(DBAPIError) as caught, owner_db.begin_nested():
         owner_db.execute(text(f"DELETE FROM {table}"))
     assert sqlstate(caught.value) == RAISE_EXCEPTION
-    assert "append-only" in str(caught.value.orig)
+    # By name, so a trigger wired to the wrong table cannot pass this: `adopted_signatures` says
+    # "rows are revoked, never removed" where the rest say "table is append-only", and both are
+    # refusals of a DELETE on the table that was asked for.
+    assert f"DELETE on {table} is forbidden" in str(caught.value.orig)
 
 
 @pytest.mark.parametrize("table", sorted(APPEND_ONLY_ROW_MAKERS))

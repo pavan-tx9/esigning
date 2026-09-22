@@ -524,8 +524,10 @@ class EventType(StrEnum):
     ENVELOPE_SUPERSEDED = "envelope.superseded"
     VERIFICATION_PERFORMED = "verification.performed"
     # Addendum 1 A: the scan was filed (data: document_type, page_count, scan hash) and attested
-    # (data: staff_user_id, statement, original_disposition, paper_signer_count; never a name).
-    # Then the existing document.finalized / document.sealed / document.stored follow.
+    # (data: staff_user_id, statement, original_disposition, paper_signer_count, and
+    # attested_detail_sha256 -- one digest over the attesting name, the ordered paper signers and
+    # paper_signed_on, so those facts are bound by the chain without ever being in it; never a
+    # name). Then the existing document.finalized / document.sealed / document.stored follow.
     ARCHIVE_CREATED = "archive.created"
     ARCHIVE_ATTESTED = "archive.attested"
     # Addendum 1 B: on the envelope stream of the session the signature was saved in (data:

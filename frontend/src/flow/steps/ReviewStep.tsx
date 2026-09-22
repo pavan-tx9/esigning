@@ -67,17 +67,18 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
 
   const changeZoom = (step: -1 | 1) => {
     const next = zoomIndex + step;
-    if (next < 0 || next >= ZOOMS.length) {
-      announce(
-        step === 1
-          ? "The document is already at the largest size."
-          : "The document is already at the smallest size.",
-      );
-      return;
-    }
     setZoomIndex(next);
     announce(`Zoom ${Math.round((ZOOMS[next] ?? 1) * 100)} percent.`);
   };
+
+  // The zoom buttons go inert at either end of the scale. Nothing is missing and nothing is on
+  // screen to say so, so the answer is spoken: a sighted user sees the readout stop moving.
+  const announceZoomLimit = (step: -1 | 1) =>
+    announce(
+      step === 1
+        ? "The document is already at the largest size."
+        : "The document is already at the smallest size.",
+    );
 
   const goTo = (page: number) => {
     const target = Math.min(pageCount, Math.max(1, page));
@@ -85,14 +86,12 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
     announce(`Page ${target} of ${pageCount}`);
   };
 
-  const handleContinue = () => {
-    if (!allSeen) {
-      const first = unseen[0] ?? 1;
-      setNudge(`Please look at ${listPages(unseen)} before you continue.`);
-      viewer.current?.goToPage(first);
-      return;
-    }
-    viewed.mutate();
+  // Pressing Continue before every page has been displayed: say which pages are left and take the
+  // reader to the first of them. "I have looked at every page" is the claim the signature rests
+  // on, so this is a nudge rather than a dead button (SPEC section 6).
+  const nudgeUnseen = () => {
+    setNudge(`Please look at ${listPages(unseen)} before you continue.`);
+    viewer.current?.goToPage(unseen[0] ?? 1);
   };
 
   const failed = document_.isError || pdf.status === "failed" || pageFailed;
@@ -174,6 +173,7 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
               aria-label="Make the document smaller"
               aria-describedby={zoomReadout}
               inert={zoomIndex === 0}
+              onInertClick={() => announceZoomLimit(-1)}
               onClick={() => changeZoom(-1)}
               className="px-0 text-xl"
             >
@@ -184,6 +184,7 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
               aria-label="Make the document larger"
               aria-describedby={zoomReadout}
               inert={zoomIndex === ZOOMS.length - 1}
+              onInertClick={() => announceZoomLimit(1)}
               onClick={() => changeZoom(1)}
               className="px-0 text-xl"
             >
@@ -236,7 +237,7 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
                   variant="secondary"
                   className="px-3.5"
                   inert={current <= 1}
-                  onClick={() => current > 1 && goTo(current - 1)}
+                  onClick={() => goTo(current - 1)}
                 >
                   Previous<span className="sr-only"> page</span>
                 </Button>
@@ -244,7 +245,7 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
                   variant="secondary"
                   className="px-3.5"
                   inert={current >= pageCount}
-                  onClick={() => current < pageCount && goTo(current + 1)}
+                  onClick={() => goTo(current + 1)}
                 >
                   Next<span className="sr-only"> page</span>
                 </Button>
@@ -253,8 +254,9 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
             <Button
               className="w-full sm:w-auto"
               inert={!allSeen}
+              onInertClick={nudgeUnseen}
               busy={viewed.isPending}
-              onClick={handleContinue}
+              onClick={() => viewed.mutate()}
             >
               Continue
             </Button>

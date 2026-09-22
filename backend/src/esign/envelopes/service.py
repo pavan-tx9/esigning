@@ -31,6 +31,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from esign.audit.events import attested_detail_digest
 from esign.clock import Clock
 from esign.config import Settings
 from esign.contracts import (
@@ -344,7 +345,8 @@ class EnvelopeServiceImpl:
         template = self._template_of(loaded)
         fields = parse_field_defs(template.fields)
         current = _require_revision(loaded.envelope.current_revision_sha256)
-        fresh = self._identity.fresh_reauth(db, session.id) if signer.requires_reauth else None
+        requires_reauth = _requires_reauth(loaded.roles.get(signer.role_key), signer.capacity)
+        fresh = self._identity.fresh_reauth(db, session.id) if requires_reauth else None
         return SigningView(
             envelope_id=loaded.envelope.id,
             envelope_status=loaded.envelope.status,
@@ -546,7 +548,7 @@ class EnvelopeServiceImpl:
         transition = self._decide(loaded, Command.SIGN, signer.id)
         now = self._clock.now()
 
-        reauth = self._require_fresh_reauth(db, signer, session)
+        reauth = self._require_fresh_reauth(db, loaded, signer, session)
         presented = repo.session_presented_sha(db, session.id)
         if presented is None:
             raise Conflict("the document has not been served to this session", code="not_presented")
@@ -1120,7 +1122,7 @@ class EnvelopeServiceImpl:
             raise IntegrityFailure("the envelope has no audit trail", code="missing_audit_trail")
         scan_sha = _require_revision(envelope.presented_sha256)
         attestation = envelope.attestation
-        if attestation is None or envelope.attested_at is None:
+        if attestation is None or envelope.attested_at is None or envelope.paper_signed_on is None:
             # The schema's ``envelopes_kind_paper`` CHECK makes this unrepresentable.
             raise IntegrityFailure("the archive has no attestation", code="incomplete_archive_evidence")
 
@@ -1159,6 +1161,20 @@ class EnvelopeServiceImpl:
             "attestation.paper_signers",
             len(attestation.paper_signers),
             attested.data.get("paper_signer_count"),
+        )
+        # The names and the paper date, which the count above says nothing about. For an archive
+        # they *are* the attribution -- there is no signer row, no session and no stamped revision
+        # behind them -- and the cover page and the certificate print them from these same mutable
+        # columns at seal time. ``archive.attested`` carries one joint digest over the attesting
+        # staff member's display name, the ordered paper signers and ``paper_signed_on``, so a
+        # rewrite of any of them stops the seal instead of being certified into bytes nobody can
+        # correct. PHI stays out of the trail; only its digest is there (SPEC section 14 A).
+        _require_same(
+            envelope.id,
+            None,
+            "attestation detail",
+            attested_detail_digest(attestation, envelope.paper_signed_on).hex(),
+            attested.data.get("attested_detail_sha256"),
         )
         return CertificateSummary(
             envelope_id=envelope.id,
@@ -1245,6 +1261,20 @@ class EnvelopeServiceImpl:
         )
 
         role = loaded.roles.get(row.role_key)
+        # ``signers.requires_reauth`` is the only column this method reads that the trail does not
+        # record, and the whole re-authentication block on the certificate hangs off it: flipped to
+        # false while an envelope waits in ``completed_pending_seal`` (an expected, hours-long
+        # state whenever KMS, the TSA or storage is backing off), the certificate would print
+        # "Re-authentication / not required" and lose the attestation, its method, its scope and
+        # its time from bytes that can never be corrected. So it is re-derived instead of trusted:
+        # the template version it was copied from at ``create`` is immutable, and a clinician
+        # re-authenticates whatever the role says (service.py, ``EnvelopeService.create``).
+        _require_same(
+            *mismatch,
+            "signers.requires_reauth",
+            row.requires_reauth,
+            _requires_reauth(role, row.capacity),
+        )
         # Addendum 1 B: the saved signature this signature applied, read by id because the row may
         # since have been replaced or revoked. Nothing ever deletes one, so an id in the trail with
         # no row behind it is evidence disagreeing with itself, not an absent feature.
@@ -1263,12 +1293,12 @@ class EnvelopeServiceImpl:
             # The method actually used for *this* signature, not the newest attestation on the
             # session: a host can still POST /reauth while the copy-download session is alive, and
             # a role that does not require re-authentication never used one (SPEC section 6).
-            reauth_method=_reauth_method(signed, requires_reauth=row.requires_reauth),
+            reauth_method=_reauth_method(signed),
             # Addendum 1 C, from the same event: which attestation covered the signature and when
             # the person actually proved who they were. The certificate says whether that happened
             # for this document or in an earlier session of the same signing queue.
-            reauth_scope=_reauth_scope(signed, requires_reauth=row.requires_reauth),
-            reauth_at=_reauth_at(signed, requires_reauth=row.requires_reauth),
+            reauth_scope=_reauth_scope(signed),
+            reauth_at=_reauth_at(signed),
             adopted_signature_id=adopted_id,
             adopted_at=adopted_at,
             consent_version=consent.version,
@@ -1296,7 +1326,12 @@ class EnvelopeServiceImpl:
             raise Conflict("this envelope is no longer being signed", code="envelope_not_live")
         if signer.status in ("signed", "declined"):
             raise Conflict("this signer has finished", code="signer_finished")
-        if not signer.requires_reauth:
+        # Re-derived from the immutable template version rather than read off the UPDATE-able
+        # column, exactly as ``_require_fresh_reauth`` and ``_certificate_signer`` do. A flipped
+        # column here only ever refuses an attestation that a signature will then demand, so this
+        # is consistency rather than a hole -- but three places deciding "does this role
+        # re-authenticate?" must decide it the same way, or the refusal and the gate drift apart.
+        if not _requires_reauth(loaded.roles.get(signer.role_key), signer.capacity):
             raise Conflict("this role does not re-authenticate", code="reauth_not_required")
 
     # ----------------------------------------------------------------- captures
@@ -1590,15 +1625,24 @@ class EnvelopeServiceImpl:
             window = min(window, self._settings.reauth_span_seconds)
         return fresh.auth_time + timedelta(seconds=window)
 
-    def _require_fresh_reauth(self, db: Session, signer: repo.SignerRow, session: SessionInfo) -> ReauthEvidence | None:
-        """``requires_reauth`` was copied from the template role at creation. Never from input.
+    def _require_fresh_reauth(
+        self, db: Session, loaded: _Loaded, signer: repo.SignerRow, session: SessionInfo
+    ) -> ReauthEvidence | None:
+        """Whether this signature needs an attestation, re-derived rather than read off the row.
+
+        ``signers.requires_reauth`` was copied from the template role at creation -- never from
+        input -- but ``signers`` is fully UPDATE-able and no audit event records the column, so an
+        UPDATE before signing would be the whole gate: a clinician signature accepted with no
+        ``POST /v1/sessions/{id}/reauth`` at all, and ``reauth_used: false`` in the trail to make
+        it look consistent. The template version the requirement came from is immutable, so the
+        rule ``EnvelopeService.create`` applied is simply applied again here.
 
         The whole attestation comes back, not just its method: ``signer.signed`` records which
         attestation covered this signature and whether it was made in this session or borrowed
         from another within the span (Addendum 1 C), so the weakening the span allows is visible
         in the trail rather than inferred from configuration nobody kept.
         """
-        if not signer.requires_reauth:
+        if not _requires_reauth(loaded.roles.get(signer.role_key), signer.capacity):
             return None
         fresh = self._identity.fresh_reauth(db, session.id)
         if fresh is None:
@@ -1789,7 +1833,9 @@ class EnvelopeServiceImpl:
             display_name=row.display_name,
             capacity=row.capacity,
             order_index=row.order_index,
-            requires_reauth=row.requires_reauth,
+            # Re-derived from the immutable template role, like the gate in ``sign``, so the UI
+            # is never told a hand-off is unnecessary for a signature the server will then refuse.
+            requires_reauth=_requires_reauth(role, row.capacity),
             status=row.status,
         )
 
@@ -1804,6 +1850,22 @@ _ACTOR_ROLE_BY_CAPACITY: Final[dict[Capacity, ActorRole]] = {
     "interpreter": "staff",
     "clinician": "clinician",
 }
+
+
+def _requires_reauth(role: SignerRoleDef | None, capacity: str) -> bool:
+    """Whether this signer must re-authenticate at the moment of signing.
+
+    The one definition of the rule ``EnvelopeService.create`` applied when it wrote
+    ``signers.requires_reauth``: from the template role, plus the standing rule that a clinician
+    re-authenticates whatever the role says. The template version is immutable, so this can be
+    re-derived at signing time and again at sealing time -- which is the point. The column is a
+    mutable copy on a fully UPDATE-able table and nothing in the append-only trail records it, so
+    trusting it would let a flipped row either wave a clinician signature through with no
+    attestation or strip the attestation off the certificate afterwards.
+
+    A role the template no longer has is not a licence to skip: the capacity alone still decides.
+    """
+    return (role.requires_reauth if role is not None else False) or capacity == "clinician"
 
 
 def _signer_actor(signer: repo.SignerRow) -> Actor:
@@ -1966,25 +2028,28 @@ def _attested_value(
     return from_event
 
 
-def _reauth_method(signed: AuditEvent, *, requires_reauth: bool) -> str | None:
-    if not requires_reauth or not signed.data.get("reauth_used"):
+def _reauth_method(signed: AuditEvent) -> str | None:
+    """Gated on the event alone. ``reauth_used`` is already false for a role that does not
+    re-authenticate -- ``_require_fresh_reauth`` returned ``None`` for it -- so the mutable
+    ``signers.requires_reauth`` column could only ever subtract from what the trail recorded."""
+    if not signed.data.get("reauth_used"):
         return None
     return _opt_str(signed.data.get("reauth_method"))
 
 
-def _reauth_scope(signed: AuditEvent, *, requires_reauth: bool) -> ReauthScope | None:
+def _reauth_scope(signed: AuditEvent) -> ReauthScope | None:
     """``session`` or ``span``, as ``signer.signed`` recorded it (Addendum 1 C).
 
     Anything else is treated as absent rather than printed: the certificate is inside the sealed
     bytes, and an unrecognised word there would be evidence of nothing.
     """
-    if not requires_reauth or not signed.data.get("reauth_used"):
+    if not signed.data.get("reauth_used"):
         return None
     scope = _opt_str(signed.data.get("reauth_scope"))
     return cast(ReauthScope, scope) if scope in _REAUTH_SCOPES else None
 
 
-def _reauth_at(signed: AuditEvent, *, requires_reauth: bool) -> datetime | None:
+def _reauth_at(signed: AuditEvent) -> datetime | None:
     """When the attestation this signature rests on was made.
 
     Derived from the trail alone, like every other fact on the certificate: the event records the
@@ -1992,7 +2057,7 @@ def _reauth_at(signed: AuditEvent, *, requires_reauth: bool) -> datetime | None:
     the signature. The ``reauth_attestations`` row is the cross-check, and verification does it
     (``reauth_attestations_match_trail``).
     """
-    if not requires_reauth or not signed.data.get("reauth_used"):
+    if not signed.data.get("reauth_used"):
         return None
     age = signed.data.get("reauth_age_seconds")
     if age is None:

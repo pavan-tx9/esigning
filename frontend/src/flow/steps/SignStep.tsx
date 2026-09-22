@@ -231,19 +231,16 @@ function FieldScreen({
     announce(`${field.type === "initials" ? "Initials" : "Signature"} added. ${leftMessage(left)}`);
   };
 
-  const next = () => {
-    if (!complete) {
-      setNudge(
-        field.type === "checkbox"
-          ? "This box needs to be ticked before you can continue. If you don't agree with it, you can stop and sign on paper instead."
-          : field.type === "text"
-            ? "Please fill this in before you continue."
-            : "Please add your signature here before you continue.",
-      );
-      return;
-    }
-    onNext();
-  };
+  // Pressing Next before this field is done. The button is inert, so it says what is missing
+  // rather than doing nothing: a required field left empty is the commonest way to get stuck here.
+  const nudgeIncomplete = () =>
+    setNudge(
+      field.type === "checkbox"
+        ? "This box needs to be ticked before you can continue. If you don't agree with it, you can stop and sign on paper instead."
+        : field.type === "text"
+          ? "Please fill this in before you continue."
+          : "Please add your signature here before you continue.",
+    );
 
   const adopted = draft.adopted;
   const preview =
@@ -382,7 +379,8 @@ function FieldScreen({
           ref={nextButton}
           variant={complete ? "primary" : "secondary"}
           inert={!complete}
-          onClick={next}
+          onInertClick={nudgeIncomplete}
+          onClick={onNext}
         >
           {isLast ? "Check your answers" : field.required || value !== undefined ? "Next" : "Skip"}
         </Button>
@@ -505,13 +503,8 @@ function SummaryScreen({
         )}
         <Button
           inert={remaining.length > 0}
-          onClick={() => {
-            if (remaining.length > 0) {
-              setNudge(true);
-              return;
-            }
-            onContinue();
-          }}
+          onInertClick={() => setNudge(true)}
+          onClick={onContinue}
         >
           Continue
         </Button>

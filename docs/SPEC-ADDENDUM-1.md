@@ -32,8 +32,12 @@ words, and so does the certificate.
   except where noted.
 - Audit events (new `EventType` members): `archive.created` (data: document_type, page_count,
   scan hash), `archive.attested` (data: staff_user_id, statement, original_disposition,
-  paper_signer_count; never names), then the existing `document.finalized`, `document.sealed`,
-  `document.stored`.
+  paper_signer_count, `attested_detail_sha256`; never names), then the existing
+  `document.finalized`, `document.sealed`, `document.stored`. `attested_detail_sha256` is one
+  SHA-256 over the canonical JSON of `{staff_display_name, paper_signers, paper_signed_on}`: those
+  are PHI and belong on the cover page, not in the trail, but the mutable `attestation` column is
+  the whole attribution of a paper signature, so the chain has to be able to contradict a rewritten
+  name or date. The digest is what lets it (`docs/SPEC.md` section 4).
 
 ### API (host, `Authorization: Bearer esk_...`)
 - `POST /v1/archives` multipart: `scan` (PDF only; image files are the host's job to convert),
