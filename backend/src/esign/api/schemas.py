@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any, Final, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from esign.api.template_service import TemplateVersionView, TemplateView
 from esign.config import Settings
@@ -149,12 +149,30 @@ class ConsentBody(_Body):
 
 
 class CaptureBody(_Body):
+    """One of the wire shapes in SPEC section 9: a signature capture (``kind`` plus its payload) or
+    a value capture (``checked`` or ``text_value``). The mixture is refused here, at the edge,
+    before it can become a ``Capture`` (whose constructor refuses it too)."""
+
     field_id: str = Field(max_length=64)
     kind: CaptureKind | None = None
     image_png_base64: str | None = None
-    typed_text: str | None = Field(default=None, max_length=200)
+    typed_text: str | None = None
     checked: bool | None = None
-    text_value: str | None = Field(default=None, max_length=2000)
+    text_value: str | None = None
+
+    @model_validator(mode="after")
+    def _one_shape(self) -> CaptureBody:
+        signature = self.kind is not None or self.image_png_base64 is not None or self.typed_text is not None
+        value = self.checked is not None or self.text_value is not None
+        if signature and value:
+            raise ValueError("a capture is a signature or a value, not both")
+        if self.kind is None and signature:
+            raise ValueError("a signature payload needs a kind")
+        if self.checked is not None and self.text_value is not None:
+            raise ValueError("a capture carries checked or text_value, not both")
+        if not signature and not value:
+            raise ValueError("a capture carries something")
+        return self
 
 
 class SignBody(_Body):
@@ -162,8 +180,8 @@ class SignBody(_Body):
     captures: list[CaptureBody] = Field(max_length=200)
 
     def to_contract(self, settings: Settings) -> list[Capture]:
-        """Decode, nothing more. Which field takes which shape is the envelope service's decision,
-        made against the template under the envelope lock."""
+        """Decode and bound, nothing more. Which field takes which shape is the envelope service's
+        decision, made against the template under the envelope lock."""
         # Base64 is 4 characters per 3 bytes; refuse an oversized image before decoding it.
         max_chars = (settings.max_signature_png_bytes * 4) // 3 + 8
         out: list[Capture] = []
@@ -178,6 +196,10 @@ class SignBody(_Body):
                     raise ValidationFailed(
                         "the signature image is not valid base64", code="capture_shape_invalid"
                     ) from None
+            if item.typed_text is not None and len(item.typed_text) > settings.max_typed_signature_chars:
+                raise ValidationFailed("the typed signature is too long", code="capture_shape_invalid")
+            if item.text_value is not None and len(item.text_value) > settings.max_text_field_chars:
+                raise ValidationFailed("the text value is too long", code="capture_shape_invalid")
             out.append(
                 Capture(
                     field_id=item.field_id,

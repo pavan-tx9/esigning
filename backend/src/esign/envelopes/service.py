@@ -106,13 +106,6 @@ SessionScope = Callable[[], AbstractContextManager[Session]]
 
 _SEAL_REASON = "Certified complete by the e-signing service"
 
-#: Bounds on the two client-supplied strings that reach the sealed document. They match the API's
-#: body limits (``esign.api.schemas.CaptureBody``) deliberately: the service is also driven by the
-#: worker, the CLI and the tests, and the value ends up stamped into bytes that are kept for years,
-#: so the rule lives with the code that stores it rather than only at the HTTP edge.
-_MAX_TYPED_TEXT: Final[int] = 200
-_MAX_TEXT_VALUE: Final[int] = 2000
-
 
 @dataclass(frozen=True)
 class _Loaded:
@@ -1024,7 +1017,9 @@ class EnvelopeServiceImpl:
                 return Capture(
                     field_id=field.id,
                     kind="typed",
-                    typed_text=_require_text(capture.typed_text, "capture_shape_invalid", limit=_MAX_TYPED_TEXT),
+                    typed_text=_require_text(
+                        capture.typed_text, "capture_shape_invalid", limit=self._settings.max_typed_signature_chars
+                    ),
                 )
             if capture.kind == "click":
                 if capture.image_png is not None or capture.typed_text is not None:
@@ -1048,7 +1043,9 @@ class EnvelopeServiceImpl:
             _refuse_signature_payload(capture)
             return Capture(
                 field_id=field.id,
-                text_value=_require_text(capture.text_value, "capture_shape_invalid", limit=_MAX_TEXT_VALUE),
+                text_value=_require_text(
+                    capture.text_value, "capture_shape_invalid", limit=self._settings.max_text_field_chars
+                ),
             )
 
         raise ValidationFailed("unsupported field type", code="capture_shape_invalid")

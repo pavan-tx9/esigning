@@ -304,7 +304,12 @@ refused (422) rather than ignored.
 ```
 Capture shapes: `{"field_id", "kind": "drawn", "image_png_base64"}`, `{"field_id", "kind":
 "typed", "typed_text"}`, `{"field_id", "kind": "click"}`, and for non-signature fields
-`{"field_id", "checked"}` or `{"field_id", "text_value"}`.
+`{"field_id", "checked"}` or `{"field_id", "text_value"}`. The two families never mix: a capture
+with a `kind` (or a signature payload) *and* a `checked`/`text_value` is refused with 422 at the
+edge and is not representable as a `contracts.Capture` at all, because the trail records a
+signature's `kind` and a value field's type, and a client must not choose that wording. Signature
+and initials fields accept any of the three kinds (the UI sends initials typed); `typed_text` and
+`text_value` are bounded by `MAX_TYPED_SIGNATURE_CHARS` (200) and `MAX_TEXT_FIELD_CHARS` (2000).
 
 ### Embedding protocol
 The UI is served at `/sign?host=<host id>` and loaded in an iframe. The host id is not a secret and
@@ -431,3 +436,17 @@ changes were made once, by the integration owner, with this document updated alo
   `webhook_deliveries` an insertion sequence to order by.
 - **Foundation**: `configure_logging` no longer caches loggers or binds `sys.stdout` at configure
   time (it broke full-suite runs); signature PNG per-axis limits moved into `Settings`.
+
+Second round, from the envelopes module's review of the integrated system:
+
+- **`Capture` is one shape or the other**: `Capture.__post_init__` refuses a signature `kind` (or
+  `image_png`/`typed_text`) together with `checked`/`text_value`, a payload without a `kind`, and
+  `checked` with `text_value`. `esign.api.schemas.CaptureBody` refuses the same shapes on the wire
+  (422 `validation_failed`), and the envelope service's own check remains as the last line. Before
+  this, `Capture(field_id=..., kind="click", checked=True)` was a legal value that reached the
+  `signer.signed` payload with the client's word for how the field was filled.
+- **Bounds live in `Settings`**: `max_typed_signature_chars` (200) and `max_text_field_chars`
+  (2000), read by both the API body and the envelope service, replacing a private copy in each.
+- **`EnvelopeService.seal_pending` docstring** now lists `IntegrityFailure` among the exceptions
+  that escape and says what a worker must do with it: the envelope stays pending, `seal.failed`
+  is recorded, and no retry can fix it.

@@ -288,13 +288,13 @@ def test_a_checkbox_is_ticked_inside_its_rect(documents: DocumentService, stamp:
     out = documents.apply_signer_marks(
         make_pdf(),
         [sig_field(), box],
-        [typed(), Capture(field_id="agrees", checked=True, kind="click")],
+        [typed(), Capture(field_id="agrees", checked=True)],
         stamp,
     )
     assert out != documents.apply_signer_marks(
         make_pdf(),
         [sig_field(), box],
-        [typed(), Capture(field_id="agrees", checked=False, kind="click")],
+        [typed(), Capture(field_id="agrees", checked=False)],
         stamp,
     )
 
@@ -312,7 +312,7 @@ def test_a_text_field_is_drawn_inside_its_rect(documents: DocumentService, stamp
     text_field = FieldDef(
         id="relationship", type="text", page=1, rect=Rect(x=100, y=300, w=200, h=16), signer_role="patient"
     )
-    capture = Capture(field_id="relationship", kind="typed", text_value="Parent")
+    capture = Capture(field_id="relationship", text_value="Parent")
     out = documents.apply_signer_marks(make_pdf(), [sig_field(), text_field], [typed(), capture], stamp)
     runs = [run for run in placed_text(out) if run.text == "Parent"]
     assert runs
@@ -323,7 +323,7 @@ def test_an_over_long_text_value_is_rejected(documents: DocumentService, stamp: 
     text_field = FieldDef(
         id="relationship", type="text", page=1, rect=Rect(x=100, y=300, w=200, h=16), signer_role="patient"
     )
-    capture = Capture(field_id="relationship", kind="typed", text_value="x" * 900)
+    capture = Capture(field_id="relationship", text_value="x" * 900)
     with pytest.raises(ValidationFailed):
         documents.apply_signer_marks(make_pdf(), [sig_field(), text_field], [typed(), capture], stamp)
 

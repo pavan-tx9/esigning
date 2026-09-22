@@ -384,8 +384,6 @@ def test_the_same_field_cannot_be_captured_twice(bench: Bench, db: Session) -> N
         pytest.param(Capture(field_id="patient_sig", kind="typed"), id="typed without text"),
         pytest.param(Capture(field_id="patient_sig", kind="click", typed_text="x"), id="click with a payload"),
         pytest.param(Capture(field_id="patient_sig", kind="drawn", image_png=PNG, typed_text="x"), id="both payloads"),
-        pytest.param(Capture(field_id="patient_sig", kind="click", checked=True), id="a checkbox value"),
-        pytest.param(Capture(field_id="patient_sig", kind="click", text_value="x"), id="a text value"),
     ],
 )
 def test_a_malformed_signature_capture_is_refused(bench: Bench, db: Session, capture: Capture) -> None:
@@ -394,6 +392,19 @@ def test_a_malformed_signature_capture_is_refused(bench: Bench, db: Session, cap
     with pytest.raises(ValidationFailed) as seen:
         bench.service.sign(db, session, [capture], CTX)
     assert seen.value.code == "capture_shape_invalid"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"kind": "click", "checked": True}, id="a signature kind with a checkbox value"),
+        pytest.param({"kind": "click", "text_value": "x"}, id="a signature kind with a text value"),
+    ],
+)
+def test_a_signature_capture_cannot_carry_a_value(kwargs: dict[str, object]) -> None:
+    """The mixed shape is not representable: ``Capture`` refuses it before the service sees it."""
+    with pytest.raises(ValueError):
+        Capture(field_id="patient_sig", **kwargs)  # type: ignore[arg-type]
 
 
 def test_a_png_that_is_not_a_png_is_refused(bench: Bench, db: Session) -> None:

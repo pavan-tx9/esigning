@@ -113,22 +113,40 @@ def test_the_trail_takes_a_capture_kind_from_the_template_not_the_client(bench: 
 
 
 @pytest.mark.parametrize(
-    "capture",
+    "kwargs",
     [
-        pytest.param(Capture(field_id="patient_ack", kind="click", checked=True), id="checkbox claiming click"),
-        pytest.param(Capture(field_id="patient_ack", kind="drawn", checked=True), id="checkbox claiming drawn"),
-        pytest.param(Capture(field_id="patient_note", kind="typed", text_value="x"), id="text claiming typed"),
-        pytest.param(Capture(field_id="patient_ack", checked=True, image_png=PNG), id="checkbox with an image payload"),
-        pytest.param(Capture(field_id="patient_note", text_value="x", typed_text="y"), id="text with a typed payload"),
+        pytest.param({"kind": "click", "checked": True}, id="checkbox claiming click"),
+        pytest.param({"kind": "drawn", "checked": True}, id="checkbox claiming drawn"),
+        pytest.param({"kind": "typed", "text_value": "x"}, id="text claiming typed"),
+        pytest.param({"checked": True, "image_png": PNG}, id="checkbox with an image payload"),
+        pytest.param({"text_value": "x", "typed_text": "y"}, id="text with a typed payload"),
         # The two non-signature shapes must not accept each other's value either: a value the
         # service silently dropped would be a value the signer believes they supplied.
-        pytest.param(Capture(field_id="patient_ack", checked=True, text_value="x"), id="checkbox with a text value"),
-        pytest.param(Capture(field_id="patient_note", text_value="x", checked=True), id="text with a checked value"),
+        pytest.param({"checked": True, "text_value": "x"}, id="checkbox with a text value"),
+        pytest.param({"image_png": PNG}, id="an image without a kind"),
+        pytest.param({"typed_text": "x"}, id="typed text without a kind"),
     ],
 )
-def test_a_non_signature_capture_carrying_a_signature_shape_is_refused(
-    bench: Bench, db: Session, capture: Capture
-) -> None:
+def test_a_capture_cannot_mix_a_signature_shape_with_a_value(kwargs: dict[str, object]) -> None:
+    """``Capture.kind`` decides what the trail says a field was filled with, so a value capture
+    carrying a signature shape (or the reverse) is not representable at all: the constructor
+    refuses it, the API body refuses the same shape on the wire, and the service's own check is
+    the last line."""
+    with pytest.raises(ValueError):
+        Capture(field_id="patient_ack", **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        pytest.param(Capture(field_id="patient_ack", kind="click"), id="click at a checkbox"),
+        pytest.param(Capture(field_id="patient_note", kind="typed", typed_text="x"), id="typed at a text field"),
+        pytest.param(Capture(field_id="patient_note", kind="drawn", image_png=PNG), id="drawn at a text field"),
+    ],
+)
+def test_a_checkbox_or_text_field_refuses_a_signature_capture(bench: Bench, db: Session, capture: Capture) -> None:
+    """The shape that *is* representable -- a well-formed signature capture aimed at a value
+    field -- is refused by the service against the template."""
     _view, session = ready(bench, db, WITH_VALUES)
 
     with pytest.raises(ValidationFailed) as seen:

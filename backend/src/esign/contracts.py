@@ -183,12 +183,39 @@ SealProfile = Literal["PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA"]
 
 @dataclass(frozen=True)
 class Capture:
+    """One signer input for one field. Two shapes share the type, and they never mix:
+
+    - a *signature* capture (signature and initials fields) has a ``kind`` and, depending on it,
+      an ``image_png`` or a ``typed_text``; ``checked`` and ``text_value`` are ``None``.
+    - a *value* capture (checkbox and text fields) has ``checked`` or ``text_value`` and no
+      ``kind``, ``image_png`` or ``typed_text``.
+
+    The trail records a signature's ``kind`` and a value field's type, so a ``kind`` on a checkbox
+    would let the client choose what the audit trail says. The constructor refuses the mixture, so
+    the mistake cannot be written; whether a given field takes a given shape is the envelope
+    service's decision, made against the template.
+    """
+
     field_id: str
     kind: CaptureKind | None = None  # signature and initials fields only; None for checkbox/text
     image_png: bytes | None = None  # sanitized PNG, drawn only
     typed_text: str | None = None  # typed only
     checked: bool | None = None  # checkbox fields
     text_value: str | None = None  # text fields
+
+    def __post_init__(self) -> None:
+        has_signature_payload = self.kind is not None or self.image_png is not None or self.typed_text is not None
+        has_value = self.checked is not None or self.text_value is not None
+        if has_signature_payload and has_value:
+            raise ValueError("a capture is either a signature (kind) or a value (checked/text_value), never both")
+        if self.kind is None and (self.image_png is not None or self.typed_text is not None):
+            raise ValueError("a signature payload needs a kind")
+        if self.checked is not None and self.text_value is not None:
+            raise ValueError("a capture carries a checked value or a text value, not both")
+
+    @property
+    def is_signature(self) -> bool:
+        return self.kind is not None
 
 
 @dataclass(frozen=True)
@@ -712,7 +739,14 @@ class EnvelopeService(Protocol):
         SealUnavailable or StorageUnavailable so the job runner can back off. Before raising it
         records ``seal.failed`` and the job's backoff in a *separate, committed* transaction
         (the ``new_session`` factory given at construction), because the caller is about to roll
-        ``db`` back and the evidence of the failure has to survive that."""
+        ``db`` back and the evidence of the failure has to survive that.
+
+        IntegrityFailure escapes likewise (a stored revision that does not re-hash, a broken audit
+        chain) and no retry can fix it: the envelope still stays ``completed_pending_seal`` and
+        ``seal.failed`` is still recorded with its error code, so a worker must treat it as a
+        recorded failure to surface to an operator, never as a reason to skip the record or to
+        report the document complete (SPEC section 3: pending, recorded, loud). Any other exception
+        is a bug and is handled the same way."""
 
     def may_download_copy(self, db: Session, session: SessionInfo) -> bool: ...
 

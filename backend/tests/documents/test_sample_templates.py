@@ -104,7 +104,9 @@ def test_a_full_round_trip_works_on_every_sample(documents: DocumentService, key
         captures = [
             Capture(field_id=field.id, kind="drawn", image_png=png)
             if field.type in ("signature", "initials")
-            else Capture(field_id=field.id, kind="click", checked=True, text_value="x")
+            else Capture(field_id=field.id, checked=True)
+            if field.type == "checkbox"
+            else Capture(field_id=field.id, text_value="x")
             for field in fields
             if field.type != "date_signed"
         ]

@@ -94,8 +94,44 @@ def test_a_signer_cannot_fill_someone_elses_field_or_supply_the_date(ehr: Ehr, w
     unconfirmed = patient.post("/sign", {"intent_confirmed": False, "captures": mine}, **{"Idempotency-Key": "k4"})
     assert unconfirmed.status_code == 422
 
+    # The typed-signature bound is a setting, applied at the edge before anything is stamped.
+    signature = next(item["id"] for item in payload["fields"] if item["type"] == "signature")
+    too_long = [c for c in mine if c["field_id"] != signature] + [
+        {"field_id": signature, "kind": "typed", "typed_text": "x" * (world.settings.max_typed_signature_chars + 1)}
+    ]
+    long = patient.post("/sign", {"intent_confirmed": True, "captures": too_long}, **{"Idempotency-Key": "k7"})
+    assert long.status_code == 422
+    assert long.json()["error"]["code"] == "capture_shape_invalid"
+
     assert ehr.envelope(envelope["id"])["current_revision_sha256"] == envelope["presented_sha256"]
     assert patient.sign(payload, key="k5").status_code == 200
+
+
+def test_a_value_capture_cannot_claim_a_signature_kind(ehr: Ehr, world: World) -> None:
+    """The trail records how a field was filled. A checkbox capture that also says ``kind: click``
+    would let the browser choose that wording, so the mixture is not a wire shape at all: 422 at
+    the edge, nothing stamped, and the well-formed request still goes through afterwards."""
+    envelope = ehr.create_envelope("patient_consent")
+    patient = ehr.open_session(envelope, "patient")
+    payload = patient.review_and_consent()
+    mine = patient.captures(payload)
+    checkbox = next(item["id"] for item in payload["fields"] if item["type"] == "checkbox")
+
+    for claimed in (
+        {"field_id": checkbox, "kind": "click", "checked": True},
+        {"field_id": checkbox, "kind": "drawn", "checked": True},
+        {"field_id": checkbox, "checked": True, "typed_text": "x"},
+        {"field_id": checkbox},
+    ):
+        captures = [c for c in mine if c["field_id"] != checkbox] + [claimed]
+        response = patient.post("/sign", {"intent_confirmed": True, "captures": captures}, **{"Idempotency-Key": "k1"})
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "validation_failed"
+
+    assert ehr.envelope(envelope["id"])["current_revision_sha256"] == envelope["presented_sha256"]
+    assert patient.sign(payload, key="k2").status_code == 200
+    signed = next(e for e in ehr.audit(envelope["id"]) if e["event_type"] == "signer.signed")
+    assert {c["field_id"]: c["kind"] for c in signed["data"]["captures"]}[checkbox] == "checkbox"
 
 
 def test_signing_before_viewing_or_consenting_is_a_conflict(ehr: Ehr, world: World) -> None:

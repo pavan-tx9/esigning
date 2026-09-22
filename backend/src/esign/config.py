@@ -119,6 +119,11 @@ class Settings(BaseSettings):
     #: and a per-axis bound is the cheapest guard against a header-declared bomb.
     max_signature_png_dimension: int = 4000
     min_signature_png_dimension: int = 8
+    #: The two client-supplied strings that are stamped into the document and kept for years: a
+    #: typed signature and a text field's value. One definition, read by the API body and by the
+    #: envelope service (which the worker, the CLI and the tests also drive).
+    max_typed_signature_chars: int = 200
+    max_text_field_chars: int = 2000
     max_request_bytes: int = 8 * 1024 * 1024
 
     # ----------------------------------------------------------------- api and worker

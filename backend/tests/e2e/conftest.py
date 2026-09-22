@@ -266,10 +266,14 @@ class Ehr:
             f"/sessions/{signer.session_id}/reauth", {"method": method, "auth_time": self.clock.now().isoformat()}
         )
 
-    def audit_types(self, envelope_id: str) -> list[str]:
+    def audit(self, envelope_id: str) -> list[dict[str, Any]]:
         response = self.get(f"/envelopes/{envelope_id}/audit")
         assert response.status_code == 200, response.text
-        return [str(e["event_type"]) for e in response.json()["events"]]
+        events: list[dict[str, Any]] = response.json()["events"]
+        return events
+
+    def audit_types(self, envelope_id: str) -> list[str]:
+        return [str(e["event_type"]) for e in self.audit(envelope_id)]
 
     def verification(self, envelope_id: str) -> dict[str, Any]:
         response = self.get(f"/envelopes/{envelope_id}/verification")
