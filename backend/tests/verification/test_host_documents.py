@@ -9,6 +9,8 @@ which check fails.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import Engine, text
 from sqlalchemy.exc import DBAPIError
@@ -145,3 +147,37 @@ def test_a_sealed_host_document_is_complete(ehr: Ehr) -> None:
     # The pages inside the seal are still the signed ones, counted from the ``signer_applied``
     # revision exactly as for a template envelope.
     assert "sealed_pages_match_final_revision" in {c["name"] for c in report["checks"] if c["status"] == "passed"}
+
+
+def test_rewritten_signer_roles_are_caught_by_the_digest_in_the_trail(ehr: Ehr, world: World) -> None:
+    """``envelopes.field_definitions`` is UPDATE-able and holds this envelope's roles.
+
+    A template envelope's roles live in an immutable ``template_versions`` row, so the
+    certificate's re-authentication block and the report's ``requires_reauth`` check are
+    re-derivations from something fixed. A host document has no published version, so the same two
+    lists sit in a column the runtime role may rewrite -- and turning ``requires_reauth`` off after
+    the fact would otherwise leave nothing to contradict it. ``document.supplied`` carries the
+    digest of the roles the envelope was created with, and this is the check that reads it.
+    """
+    envelope = ehr.create_host_document_envelope(_report())
+    with world.sessions() as db:
+        definitions = db.execute(
+            text("SELECT field_definitions FROM envelopes WHERE id = :id"), {"id": envelope["id"]}
+        ).scalar_one()
+        assert definitions["signer_roles"][0]["requires_reauth"] is True
+        definitions["signer_roles"][0]["requires_reauth"] = False
+        db.execute(
+            text("UPDATE envelopes SET field_definitions = CAST(:defs AS jsonb) WHERE id = :id"),
+            {"defs": json.dumps(definitions), "id": envelope["id"]},
+        )
+        db.commit()
+
+    report = ehr.verification(envelope["id"])
+    failed = _failed(report)
+    assert not report["ok"]
+    assert set(failed) == {"envelope_row_matches_trail"}
+    assert "signer roles" in failed["envelope_row_matches_trail"]
+    # The rewrite is caught here rather than left to the per-signer comparison further down, which
+    # only speaks about signers who have already signed. A delayed seal refuses it too, for the
+    # same reason and from the same digest -- see
+    # tests/envelopes/test_host_documents.py::test_the_seal_refuses_roles_that_are_no_longer_the_ones_the_trail_recorded.

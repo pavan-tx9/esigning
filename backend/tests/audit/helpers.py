@@ -210,6 +210,7 @@ _SAMPLES: dict[EventType, Callable[[], dict[str, Any]]] = {
         "presented_sha256": DIGEST_B,
         "page_count": 27,
         "field_source": "named_fields",
+        "signer_roles_sha256": DIGEST_C,
         "host_document_ref": "report-55120",
     },
 }

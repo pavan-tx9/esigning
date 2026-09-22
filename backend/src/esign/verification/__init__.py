@@ -35,7 +35,7 @@ from pypdf import PdfReader
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from esign.audit.canonical import archive_attested_detail_digest
+from esign.audit.canonical import archive_attested_detail_digest, host_document_roles_digest
 from esign.config import REAUTH_SPAN_MAX_SECONDS
 from esign.contracts import (
     Actor,
@@ -586,6 +586,15 @@ class Verifier:
         comparisons exist for. ``host_document_ref`` is compared too, because the certificate
         prints it beside "Document supplied by the host" and the column it would otherwise come
         from is UPDATE-able.
+
+        So are the role definitions, and they decide more: ``requires_reauth`` per role, which is
+        what ``_role_reauth`` below compares each signer row against and what the certificate's
+        re-authentication block rests on. For a template that check re-derives from an immutable
+        ``template_versions`` row; here it would be two mutable copies of each other, so
+        ``document.supplied`` carries their digest and it is checked here (and again before the
+        seal). The *fields* have no digest: where every mark landed is already in the presented
+        revision's hash, in each stamped revision's hash and in the captures ``signer.signed``
+        records.
         """
         row = db.execute(
             text(
@@ -613,8 +622,11 @@ class Verifier:
             problems.append("envelope.created names a template for a host-document envelope")
         if _text(row.host_document_ref) != _text(supplied.data.get("host_document_ref")):
             problems.append("host_document_ref is not what document.supplied recorded")
-        if row.field_definitions is None:
-            problems.append("a host-document envelope has no field definitions")
+        roles = row.field_definitions.get("signer_roles") if isinstance(row.field_definitions, dict) else None
+        if not isinstance(roles, list):
+            problems.append("a host-document envelope has no signer role definitions")
+        elif host_document_roles_digest(roles).hex() != _text(supplied.data.get("signer_roles_sha256")):
+            problems.append("the envelope's signer roles are not the ones document.supplied recorded")
         run.expect("envelope_row_matches_trail", not problems, "; ".join(problems))
 
     def _check_archive_row_against_trail(
@@ -783,13 +795,12 @@ class Verifier:
         trail. A paper archive has no template version and no signers, so the empty map is the
         right answer for it.
 
-        Addendum 2: a host document keeps its roles in ``envelopes.field_definitions``, which is
-        *not* immutable -- ``envelopes`` has no update guard. So for that source this is a
-        consistency check between two mutable copies rather than a re-derivation from something
-        fixed, and it is weaker than the template case by exactly that much. What still holds
-        whatever either says: ``signer.signed.reauth_used`` and ``reauth_attestation_id`` are in
-        the append-only trail, and ``reauth_attestations_match_trail`` checks the attestation
-        behind them. See the hand-off report.
+        Addendum 2: a host document keeps its roles in ``envelopes.field_definitions``, and
+        ``envelopes`` has no update guard -- so on its own this would be a comparison between two
+        mutable copies rather than a re-derivation from something fixed. It is not on its own:
+        ``document.supplied`` carries ``signer_roles_sha256`` over exactly this list, and
+        ``envelope_row_matches_trail`` above fails if the column no longer hashes to it. A rewrite
+        that made this check pass is therefore a finding one line earlier in the same report.
         """
         roles = db.execute(
             text(

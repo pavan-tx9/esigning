@@ -397,6 +397,12 @@ class CertificateSummary:
     #: (``is_opaque_id``) on that path, because it reaches the audit trail there. ``None`` for a
     #: template envelope and for a paper archive, whose references stay out of the trail.
     host_document_ref: str | None = None
+    #: Addendum 2: the host document *as uploaded*, before flattening -- the ``supplied_pdf`` blob.
+    #: ``presented_sha256`` is what the signer was shown; this is what the host sent, and printing
+    #: both is what makes "we flattened what you sent us" checkable from the certificate alone.
+    #: Taken from ``document.supplied.upload_sha256``, like ``host_document_ref``, so no part of
+    #: this line comes from a mutable row. ``None`` for a template envelope and a paper archive.
+    upload_sha256: bytes | None = None
 
 
 @dataclass(frozen=True)

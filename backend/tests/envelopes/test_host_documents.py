@@ -10,6 +10,7 @@ envelope instead of a template version and is otherwise untouched.
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 from sqlalchemy import text
@@ -22,6 +23,7 @@ from esign.contracts import (
     FieldDef,
     Forbidden,
     Host,
+    IntegrityFailure,
     NewSigner,
     Rect,
     SignerRoleDef,
@@ -440,3 +442,57 @@ def _cosigned_report() -> bytes:
 
 def _signature(field_id: str) -> Capture:
     return Capture(field_id=field_id, kind="typed", typed_text="Q Ravensworth")
+
+
+def test_the_seal_refuses_roles_that_are_no_longer_the_ones_the_trail_recorded(
+    bench: Bench, db: Session, host: Host
+) -> None:
+    """The certificate's re-authentication block rests on ``envelopes.field_definitions``, and
+    ``envelopes`` has no append-only trigger.
+
+    For a template envelope the same block is re-derived from an immutable ``template_versions``
+    row. Here the roles are a column the runtime role may UPDATE, so ``document.supplied`` records
+    their digest when the envelope is created and the seal re-checks it: a delayed seal cannot be
+    talked into certifying "re-authentication not required" for a role that required it. The
+    document itself is untouched in this test -- only the sentence about it would have changed.
+    """
+    document = supplied_pdf(pages=REPORT_PAGES)
+    view = bench.create_from_document(db, host, document=document)
+    session = bench.session(db, bench.signer_id(view, "clinician"), method="password+mfa")
+    bench.ready_to_sign_pages(db, session, REPORT_PAGES)
+    bench.reauth(db, session)
+    bench.service.sign(db, session, [_signature("clinician_signature")], CTX)
+
+    definitions = db.execute(
+        text("SELECT field_definitions FROM envelopes WHERE id = :id"), {"id": view.id}
+    ).scalar_one()
+    assert definitions["signer_roles"][0]["requires_reauth"] is True
+    definitions["signer_roles"][0]["requires_reauth"] = False
+    db.execute(
+        text("UPDATE envelopes SET field_definitions = CAST(:defs AS jsonb) WHERE id = :id"),
+        {"defs": json.dumps(definitions), "id": view.id},
+    )
+
+    with pytest.raises(IntegrityFailure) as refused:
+        bench.service.seal_pending(db, view.id)
+    assert refused.value.code == "certificate_evidence_mismatch"
+
+
+def test_the_certificate_carries_both_ends_of_the_one_transformation(bench: Bench, db: Session, host: Host) -> None:
+    """The upload's hash and the presented hash, both from the trail rather than from a row.
+
+    Together they are what lets a reader holding the host's own copy of the report check that this
+    certificate is about that file, before asking anything about what happened after it arrived.
+    """
+    document = supplied_pdf(pages=REPORT_PAGES)
+    view = bench.create_from_document(db, host, document=document)
+    session = bench.session(db, bench.signer_id(view, "clinician"), method="password+mfa")
+    bench.ready_to_sign_pages(db, session, REPORT_PAGES)
+    bench.reauth(db, session)
+    bench.service.sign(db, session, [_signature("clinician_signature")], CTX)
+    bench.service.seal_pending(db, view.id)
+
+    summary = bench.documents.last_summary
+    assert summary.upload_sha256 == hashlib.sha256(document).digest()
+    assert summary.presented_sha256 != summary.upload_sha256
+    assert summary.source == "host_document"

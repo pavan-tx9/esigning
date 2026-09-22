@@ -37,6 +37,7 @@ __all__ = [
     "canonical_value",
     "compute_event_hash",
     "hash_input",
+    "host_document_roles_digest",
     "rfc3339",
 ]
 
@@ -191,3 +192,34 @@ def archive_attested_detail_digest(
             }
         )
     ).digest()
+
+
+def host_document_roles_digest(signer_roles: Sequence[Mapping[str, Any]]) -> bytes:
+    """Addendum 2: the digest that ties a host document's signer roles to the chain.
+
+    A template envelope's roles live in ``template_versions``, which is immutable once published:
+    the certificate's "re-authenticated ..." line and verification's ``requires_reauth`` check can
+    both be *re-derived* from something nothing can rewrite. A host document has no published
+    version, so the same two lists live in ``envelopes.field_definitions`` -- and ``envelopes``
+    carries no append-only trigger. Without this digest those two checks would compare two mutable
+    copies of each other, and the re-authentication block on a sealed certificate could be stripped
+    afterwards without leaving a mark.
+
+    So the roles go into the trail as one joint digest, exactly as a paper archive's attestation
+    detail does (:func:`archive_attested_detail_digest`) and for the same reason: a mutable column
+    that nothing can contradict is not evidence. The roles themselves are not PHI -- they are
+    ``clinician``, "Attending physician", ``requires_reauth`` -- but a digest is still the right
+    shape, because it is *one* value whatever the roles are and it cannot become a place for the
+    next field to be smuggled in.
+
+    The *fields* deliberately have no digest of their own. Where each mark went is already evidence:
+    it is in the presented revision's hash, in every stamped revision's hash, and in the captures
+    ``signer.signed`` records. Rects are floats, and floats have no canonical form here (see
+    :func:`canonical_value`) -- so a fields digest would have to invent a second encoding to say
+    something the chain already says.
+
+    ``signer_roles`` is the list exactly as ``envelopes.field_definitions -> 'signer_roles'`` holds
+    it, so the envelope service hashes what it is about to store and verification hashes what it
+    finds; :func:`canonical_json` sorts keys, so a jsonb round trip cannot change the answer.
+    """
+    return hashlib.sha256(canonical_json({"signer_roles": list(signer_roles)})).digest()

@@ -136,6 +136,10 @@ def test_nothing_but_the_summary_reaches_the_page(documents: DocumentService) ->
         # this page is built from, so it is not a new place for chart data to arrive from.
         "source",
         "host_document_ref",
+        # The upload, before flattening. `presented_sha256` beside it is what the signer saw, and
+        # the pair is what makes the one transformation this source performs checkable from the
+        # page alone. Both come from `document.supplied`, not from a row.
+        "upload_sha256",
     }
 
 

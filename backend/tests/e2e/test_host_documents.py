@@ -204,8 +204,14 @@ def test_a_two_role_report_is_signed_then_co_signed_in_order(ehr: Ehr, world: Wo
     printed = _sealed_text(ehr.get(f"/envelopes/{envelope['id']}/document").content)
     assert "Document supplied by the host" in printed
     assert "Co-signing physician" in printed
-    # Both re-authenticated, and the certificate says so per signer.
-    assert printed.count("Re-authenticated") >= 2 or "re-authenticated" in printed.lower()
+    # Both roles required re-authentication and both did it for this document, and the certificate
+    # says so per signer -- in the same words it uses for a template envelope, since the role
+    # definitions a host document supplies are read back through the same `SignerRoleDef` shape.
+    assert printed.count("Re-authentication") == 2
+    # Each of the two says *when* it happened and that it was for this document, not borrowed from
+    # an earlier one in a signing queue; neither says "not required".
+    assert printed.count("for this document") == 2
+    assert "not required" not in printed
 
 
 def test_the_webhooks_name_no_template_and_carry_nothing_about_the_report(ehr: Ehr, world: World) -> None:

@@ -451,12 +451,20 @@ class DocumentSuppliedData(EventData):
     id. It is the one place a ``host_document_ref`` reaches the trail, so on this path it must be
     opaque like every other host-chosen identifier (:data:`OpaqueId`): the reference of a report
     "about" someone must not become a sentence about them.
+
+    ``signer_roles_sha256`` is the digest of the roles this envelope was created with
+    (:func:`esign.audit.canonical.host_document_roles_digest`, which says why it is here). A
+    template envelope re-derives ``requires_reauth`` from an immutable ``template_versions`` row; a
+    host document keeps its roles in the UPDATE-able ``envelopes.field_definitions``, so without
+    this the certificate's re-authentication block and verification's ``requires_reauth`` check
+    would be comparing two mutable copies of each other.
     """
 
     upload_sha256: Sha256
     presented_sha256: Sha256
     page_count: Ordinal
     field_source: FieldSourceKind
+    signer_roles_sha256: Sha256
     host_document_ref: OpaqueId | None = None
 
 

@@ -31,6 +31,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from esign.audit.canonical import host_document_roles_digest
 from esign.audit.events import attested_detail_digest
 from esign.clock import Clock
 from esign.config import Settings
@@ -252,6 +253,9 @@ class EnvelopeServiceImpl:
         page_count = info.page_count
 
         envelope_id = new_id()
+        # Built once: it is what the column holds *and* what the trail's digest is taken over, so
+        # the two cannot drift apart at the moment they are written.
+        definitions = field_definitions_json(fields, roles)
         repo.insert_envelope(
             db,
             envelope_id=envelope_id,
@@ -266,7 +270,7 @@ class EnvelopeServiceImpl:
             expires_at=expires_at,
             created_at=now,
             source="host_document",
-            field_definitions=field_definitions_json(fields, roles),
+            field_definitions=definitions,
         )
         for signer, role in planned:
             repo.insert_signer(
@@ -325,6 +329,10 @@ class EnvelopeServiceImpl:
                 "presented_sha256": presented.sha256,
                 "page_count": page_count,
                 "field_source": spec.fields.field_source,
+                # The roles this envelope was created with, as one digest. ``envelopes`` is
+                # UPDATE-able and a template version is not, so without this the certificate's
+                # re-authentication block would rest on a column nothing could contradict.
+                "signer_roles_sha256": host_document_roles_digest(definitions["signer_roles"]),
                 "host_document_ref": host_document_ref,
             },
         )
@@ -1282,6 +1290,7 @@ class EnvelopeServiceImpl:
         # certificate prints in place of the template line. Both come from the trail, not from the
         # (UPDATE-able) ``envelopes`` row.
         host_document_ref: str | None = None
+        upload_sha256: bytes | None = None
         if envelope.source == "host_document":
             supplied = _first_event(events, EventType.DOCUMENT_SUPPLIED)
             if supplied is None or supplied.document_sha256 != presented_sha:
@@ -1289,6 +1298,8 @@ class EnvelopeServiceImpl:
                     "the presented revision does not match document.supplied", code="certificate_evidence_mismatch"
                 )
             host_document_ref = _opt_str(supplied.data.get("host_document_ref"))
+            upload_sha256 = _require_hex(supplied.data.get("upload_sha256"), "document.supplied.upload_sha256")
+            self._require_definitions_match_trail(loaded, supplied)
         else:
             prepared = _first_event(events, EventType.DOCUMENT_PREPARED)
             if prepared is None or prepared.document_sha256 != presented_sha:
@@ -1352,6 +1363,31 @@ class EnvelopeServiceImpl:
             # reference in place of the template line.
             source=envelope.source,
             host_document_ref=host_document_ref,
+            upload_sha256=upload_sha256,
+        )
+
+    @staticmethod
+    def _require_definitions_match_trail(loaded: _Loaded, supplied: AuditEvent) -> None:
+        """Addendum 2: the roles the certificate is about to print from must be the ones recorded.
+
+        A template envelope's ``requires_reauth`` is re-derived from ``template_versions``, which
+        is immutable once published. A host document's roles live in ``envelopes.field_definitions``
+        and ``envelopes`` has no append-only trigger, so the certificate's "re-authenticated ..."
+        line would otherwise rest on a column that could be rewritten during a delayed seal -- into
+        bytes nobody can correct. ``document.supplied`` carries the digest of those roles as
+        created; this is the same comparison ``archive.attested``'s ``attested_detail_sha256``
+        already gets, and a disagreement stops the seal rather than being certified.
+        """
+        raw = loaded.envelope.field_definitions
+        roles = raw.get("signer_roles") if isinstance(raw, dict) else None
+        if not isinstance(roles, list):
+            raise IntegrityFailure("the envelope has no signer role definitions", code="missing_definitions")
+        _require_same(
+            loaded.envelope.id,
+            None,
+            "envelopes.field_definitions.signer_roles",
+            host_document_roles_digest(roles).hex(),
+            supplied.data.get("signer_roles_sha256"),
         )
 
     def _archive_certificate_summary(
@@ -2425,6 +2461,23 @@ def _require_agreement(
 def _require_same(envelope_id: UUID, signer_id: UUID | None, what: str, row_value: Any, event_value: Any) -> None:
     if event_value is None or str(row_value) != str(event_value):
         _mismatch(envelope_id, signer_id, what)
+
+
+def _require_hex(value: Any, what: str) -> bytes:
+    """A digest the trail recorded, back as the 32 bytes it is.
+
+    Audit ``data`` comes back canonicalised, so a hash in it is lowercase hex. Anything else means
+    the event is not the shape its allowlist model requires, which is a refusal and not a value to
+    print on a certificate.
+    """
+    try:
+        digest = bytes.fromhex(str(value))
+    except ValueError:
+        digest = b""
+    if len(digest) != 32:
+        log.error("seal.certificate_evidence_mismatch", problem=what)
+        raise IntegrityFailure("the trail does not carry a usable digest", code="certificate_evidence_mismatch")
+    return digest
 
 
 def build_envelope_service(

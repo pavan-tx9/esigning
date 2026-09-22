@@ -271,7 +271,15 @@ the paper original and the attesting staff member, and the cover page and the ce
   count, `field_source` (`named_fields | explicit`) and `host_document_ref`. Two hashes rather
   than one because "we flattened what you sent" is a claim, and two stored blobs are evidence of
   it. `host_document_ref` is the only place that reference reaches the trail, so on that path it
-  must be opaque like every other host-chosen identifier. `envelope.created`'s `template_key`,
+  must be opaque like every other host-chosen identifier. It also carries `signer_roles_sha256`,
+  the digest of the `SignerRoleDef` list the envelope was created with: a template envelope's
+  roles live in an immutable `template_versions` row, but a host document's live in
+  `envelopes.field_definitions`, which the runtime role may UPDATE, and the certificate's
+  re-authentication block and verification's `requires_reauth` check would otherwise be two
+  mutable copies of each other. The digest is checked by `envelope_row_matches_trail` and again
+  before the seal, the same way `archive.attested`'s `attested_detail_sha256` is. The *fields*
+  have no digest: where every mark landed is already in the presented revision's hash, in each
+  stamped revision's hash and in the captures `signer.signed` records. `envelope.created`'s `template_key`,
   `template_version` and `template_version_id` became optional, and are all null together on a
   `host_document` envelope: there is no published version to name, and the `document.supplied`
   that follows says where the document did come from.
