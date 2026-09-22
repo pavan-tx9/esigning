@@ -456,8 +456,14 @@ class DocumentService(Protocol):
 
         Every declared role must resolve to at least one *signature* field, or this raises
         ValidationFailed (``fields_unresolved``) naming the roles that did not -- never the widget
-        names, which the host chose and which the message would echo. Widgets no role claims are
-        not an error: they are dropped here and removed from the bytes by ``flatten_supplied``.
+        names, which the host chose and which the message would echo. Initials are a mark and are
+        resolved as one, but they do not make a role signable here, which is stricter than
+        ``validate_definitions``' "no signature or initials field" deliberately: that rule was
+        written for a template somebody authored field by field, and in a generated report the
+        difference between a signature and initials is a substring of a widget's name. A host that
+        really wants an initials-only role has ``ExplicitFields`` to say so in as many words.
+        Widgets no role claims are not an error: they are dropped here and removed from the bytes
+        by ``flatten_supplied``.
         Field ids are unique and stable within the envelope; the result is what
         ``validate_definitions`` is then run against, like a template's."""
 

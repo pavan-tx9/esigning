@@ -62,9 +62,20 @@ _SHORT_SUFFIXES: Final[dict[str, FieldType]] = {
     "date_signed": "date_signed",
 }
 
-#: Field types that stand in for the act of signing. A role has to resolve to one of these, which
-#: is exactly the rule ``validate_definitions`` applies afterwards -- resolution that was stricter
-#: than validation would refuse documents the validator would have accepted.
+#: What a role has to resolve to for the document to be signable by it: a *signature* field.
+#:
+#: This is deliberately stricter than ``validate_definitions``, which accepts a role whose only
+#: mark is initials (the base spec's rule, written for templates a person authored field by
+#: field). Here nobody authored anything: a role's mark is whatever a report generator happened to
+#: name a widget, and "the physician initialled the report" is not what a 30-page clinical
+#: sign-off is for. Both the addendum ("at least one signature field") and
+#: ``DocumentService.resolve_named_fields`` say signature, and the refusal names the role, so a
+#: host that really does want an initials-only role has an accurate error and the explicit-rects
+#: mode to say so in as many words.
+_SIGNING_TYPES: Final[frozenset[str]] = frozenset({"signature"})
+
+#: The marks a signer makes, as opposed to the values a form collects: always required, whatever
+#: the widget's own ``/Ff`` says, because the document asking for a mark is the point of it.
 _MARK_TYPES: Final[frozenset[str]] = frozenset({"signature", "initials"})
 
 #: What a field's generated label says it is. Labels are shown in the signing UI, so they are built
@@ -303,11 +314,11 @@ def resolve_named_fields(pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[
         role_key, field_type = claimed
         field_id = _unique(widget.name, taken)
         taken.add(field_id)
-        if field_type in _MARK_TYPES:
+        if field_type in _SIGNING_TYPES:
             signing_roles.add(role_key)
         # A mark and the date beside it are the document asking for them; only the host's own
         # ``/Ff`` decides whether a text or checkbox field has to be filled in.
-        required = True if field_type != "text" and field_type != "checkbox" else widget.required
+        required = widget.required if field_type in ("text", "checkbox") else True
         label = f"{labels.get(role_key, role_key)} {_TYPE_WORDS[field_type]}"[:MAX_LABEL_CHARS]
         fields.append(
             FieldDef(
@@ -326,7 +337,7 @@ def resolve_named_fields(pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[
         # Role keys come from the request body the host just sent, so naming them tells the
         # integrator what to fix. Widget names come from inside the file and stay there.
         raise ValidationFailed(
-            f"the document has no signature or initials field for signer role(s): {', '.join(missing)}",
+            f"the document has no signature field for signer role(s): {', '.join(missing)}",
             code="fields_unresolved",
         )
     return fields

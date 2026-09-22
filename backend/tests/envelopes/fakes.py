@@ -69,6 +69,7 @@ from esign.contracts import (
     ValidationFailed,
     is_opaque_id,
 )
+from esign.documents.definitions import MAX_LABEL_CHARS
 from esign.ids import advisory_lock_key, new_id
 
 # --------------------------------------------------------------------------- blobs
@@ -344,6 +345,17 @@ _WIDGET_TYPES: dict[str, str] = {
     "date": "date_signed",
 }
 
+#: The word a generated label ends with, per field type. Kept the same as
+#: ``esign.documents.supplied._TYPE_WORDS`` so a label that reaches the envelope tests through the
+#: fake is spelled the way the real resolver spells it.
+_LABEL_WORDS: dict[str, str] = {
+    "signature": "signature",
+    "initials": "initials",
+    "date_signed": "date signed",
+    "text": "field",
+    "checkbox": "checkbox",
+}
+
 
 def supplied_pdf(
     *,
@@ -461,13 +473,20 @@ class FakeDocumentService:
                     page=pages,
                     rect=Rect(x=72.0, y=120.0 + 60.0 * index, w=220.0, h=48.0),
                     signer_role=role_key,
-                    label=name.replace("_", " ").strip().capitalize(),
+                    # The label the signing UI shows is built from the role label the host
+                    # declared in the *request body*, never from the widget's name inside the
+                    # file -- `esign.documents.supplied` does exactly this, and a fake that
+                    # echoed the file's names would teach the envelope tests the opposite.
+                    label=f"{by_key[role_key].label} {_LABEL_WORDS[field_type]}"[:MAX_LABEL_CHARS],
                 )
             )
         unresolved = sorted(
             role.key
             for role in signer_roles
-            if not any(f.signer_role == role.key and f.type in ("signature", "initials") for f in fields)
+            # A *signature*, not merely a mark: the real resolver is stricter here than
+            # ``validate_definitions`` is, because a named-resolution role's mark is whatever a
+            # generator called a widget (`esign.documents.supplied._SIGNING_TYPES`).
+            if not any(f.signer_role == role.key and f.type == "signature" for f in fields)
         )
         if unresolved:
             # The roles, never the widget names: the host chose those and the message would echo them.

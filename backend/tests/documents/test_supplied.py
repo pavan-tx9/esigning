@@ -219,12 +219,34 @@ def test_the_refusal_never_echoes_a_widget_name(documents: DocumentService) -> N
     assert "hodgkins" not in str(excinfo.value)
 
 
-def test_an_initials_only_role_resolves(documents: DocumentService) -> None:
-    """``validate_definitions`` accepts a role whose only mark is initials, so resolution does too:
-    a stricter reader here would refuse documents the validator would have passed."""
+def test_an_initials_only_role_is_refused_and_the_role_is_named(documents: DocumentService) -> None:
+    """Initials are a mark, but they are not what a role *resolves* on.
+
+    ``validate_definitions`` would accept this list -- the base spec's rule, written for templates
+    somebody authored field by field. Named resolution is stricter on purpose, because here nobody
+    authored anything: the mark is whatever a report generator called a widget, and the addendum
+    asks for "at least one signature field" per role. A host that means it can still say so with
+    explicit rects; what it cannot do is get there by accident.
+    """
     pdf = pdf_with_named_widgets([NamedWidget(name="clinician_initials", rect=SIGNATURE_RECT)])
+    with pytest.raises(ValidationFailed) as excinfo:
+        documents.resolve_named_fields(pdf, [CLINICIAN])
+    assert excinfo.value.code == "fields_unresolved"
+    assert "clinician" in str(excinfo.value)
+
+
+def test_initials_beside_a_signature_are_kept_as_a_field(documents: DocumentService) -> None:
+    """The strictness above is about what makes a role signable, not about dropping initials: a
+    role that signs may also initial, and both fields reach the envelope."""
+    pdf = pdf_with_named_widgets(
+        [
+            NamedWidget(name="clinician_signature", rect=SIGNATURE_RECT),
+            NamedWidget(name="clinician_initials", rect=(320.0, 96.0, 460.0, 146.0)),
+        ]
+    )
     fields = documents.resolve_named_fields(pdf, [CLINICIAN])
-    assert [field.type for field in fields] == ["initials"]
+    assert sorted(field.type for field in fields) == ["initials", "signature"]
+    assert all(field.required for field in fields)
 
 
 def test_required_follows_the_field_flag_for_value_fields(documents: DocumentService) -> None:
