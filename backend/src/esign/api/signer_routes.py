@@ -40,12 +40,18 @@ router = APIRouter(prefix="/v1/signing", tags=["signer"])
 _PDF_HEADERS = {"Cache-Control": "no-store", "Content-Disposition": 'inline; filename="document.pdf"'}
 
 
-#: Which rule each limited scope uses. ``sign`` and ``consent`` are SPEC section 8's; ``present``
-#: and ``copy`` cover the two GETs that append an audit event or re-hash a revision on every call.
+#: Which rule each limited scope uses. ``sign`` and ``consent`` are SPEC section 8's; ``present``,
+#: ``viewed`` and ``copy`` cover the calls that append an audit event or re-hash a revision every
+#: time. ``viewed`` gets its own key under the ``present`` rule: reporting a view is legal
+#: repeatedly (a signer who has consented may re-read), and every call re-fetches the revision,
+#: re-hashes it, re-parses the PDF for its page count and appends ``document.viewed`` -- which has
+#: no delete path, so an unbounded loop would grow the trail for ever and slow every later
+#: ``audit.verify``, including the one ``seal_pending`` runs.
 _LIMITS: Final[dict[str, Limit]] = {
     "sign": RateLimits.SIGN,
     "consent": RateLimits.CONSENT,
     "present": RateLimits.PRESENT,
+    "viewed": RateLimits.PRESENT,
     "copy": RateLimits.COPY,
 }
 
@@ -102,6 +108,9 @@ def post_viewed(request: Request, body: ViewedBody) -> JSONResponse:
     rt = runtime_of(request)
     with rt.transaction() as db:
         session, ctx = authenticate_signer(request, rt, db)
+        # Reporting a view re-hashes the revision, re-parses it for its page count and appends
+        # ``document.viewed``. Metered like the GETs that do the same work.
+        _limit(rt, "viewed", session, ctx)
         rt.envelopes.record_viewed(db, session, body.pages_viewed, ctx)
         ack = _signer_ack(rt, db, session)
     return JSONResponse(ack)

@@ -199,7 +199,13 @@ class EnvelopeServiceImpl:
                 capacity=signer.capacity,
                 on_behalf_of=signer.on_behalf_of,
                 order_index=role.order_index,
-                requires_reauth=role.requires_reauth,  # from the role, never from the request
+                # From the role, never from the request -- and a clinician re-authenticates
+                # whatever the role says. ``validate_definitions`` refuses to publish a
+                # clinician-capable role without ``requires_reauth``, but a version published
+                # before that check existed (or inserted around it) must not be able to produce a
+                # clinician signature with no re-authentication: the developer guide requires it at
+                # the moment of signing.
+                requires_reauth=role.requires_reauth or signer.capacity == "clinician",
             )
         repo.insert_revision(
             db,
@@ -467,7 +473,14 @@ class EnvelopeServiceImpl:
             status=transition.signer_status,
             consent_text_id=current.id,
             consented_at=now,
-            only_if_unset=frozenset({"consented_at"}),
+            # The row keeps the *first* accepted disclosure, both the time and the text. Consent is
+            # legal again for a signer who is already ``consented`` (another locale, or the
+            # disclosure rolled over and the client re-posted), and a second call that moved
+            # ``consent_text_id`` while ``consented_at`` stayed put left the row describing one
+            # disclosure and the certificate builder's ``_first_event`` another -- which stopped the
+            # seal for ever with ``certificate_evidence_mismatch``. Both columns move together or
+            # neither does.
+            only_if_unset=frozenset({"consented_at", "consent_text_id"}),
         )
         self._append(
             db,
@@ -505,12 +518,22 @@ class EnvelopeServiceImpl:
             # signer has not said they read them. A fresh POST /viewed is the way forward.
             raise Conflict("this document has not been read in full", code="not_viewed")
 
+        # ...and the bytes they read must still be the bytes the marks will land on. In a parallel
+        # envelope a co-signer can commit a new revision while this signer is reading, and that
+        # co-signer's own marks and field values are in it. Without this the signature would be
+        # stamped onto a revision nobody ever showed them (SPEC section 13, third round: the 409
+        # ``not_viewed`` exists for exactly "another signer signed while they were reading"). The
+        # check runs under the envelope row lock, so the loser of the race is refused rather than
+        # silently signing the winner's edits.
+        base_sha = _require_revision(loaded.envelope.current_revision_sha256)
+        if presented != base_sha:
+            raise Conflict("this document has changed since it was read", code="not_viewed")
+
         fields = parse_field_defs(loaded.template.fields)
         mine = tuple(f for f in fields if f.signer_role == signer.role_key)
         by_id = {f.id: f for f in fields}
         accepted = self._check_captures(fields, mine, captures, signer.role_key)
 
-        base_sha = _require_revision(loaded.envelope.current_revision_sha256)
         base_pdf = self._blobs.get(db, base_sha)
 
         stamp = SignerStamp(
@@ -937,6 +960,31 @@ class EnvelopeServiceImpl:
             raise IntegrityFailure(
                 "the presented revision does not match document.prepared", code="certificate_evidence_mismatch"
             )
+
+        # The document-level facts get the same treatment as the per-signer ones. ``envelopes`` is
+        # UPDATE-able by the runtime role and ``template_version_id`` is a pointer, so "Created",
+        # the document type and the template key and version were all printed from rows that could
+        # have been rewritten during a delayed seal -- into bytes that can never be corrected.
+        # ``envelope.created`` carries every one of them, and its ``occurred_at`` *is* the creation
+        # time, so the comparison was available and simply not made.
+        created = _first_event(events, EventType.ENVELOPE_CREATED)
+        if created is None:
+            raise IntegrityFailure("the envelope has no creation event", code="certificate_evidence_mismatch")
+        _require_agreement(envelope.id, None, "envelopes.created_at", envelope.created_at, created.occurred_at)
+        _require_same(
+            envelope.id, None, "envelopes.document_type", envelope.document_type, created.data.get("document_type")
+        )
+        _require_same(
+            envelope.id,
+            None,
+            "envelopes.template_version_id",
+            str(envelope.template_version_id),
+            created.data.get("template_version_id"),
+        )
+        _require_same(envelope.id, None, "template_key", loaded.template.template_key, created.data.get("template_key"))
+        _require_same(
+            envelope.id, None, "template_version", loaded.template.version, created.data.get("template_version")
+        )
 
         signers = tuple(
             self._certificate_signer(db, loaded, events, row)

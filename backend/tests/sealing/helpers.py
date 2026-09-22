@@ -8,11 +8,16 @@ still permits form filling -- the tests have to produce those themselves, with p
 from __future__ import annotations
 
 import io
+from datetime import datetime, timedelta
 
+from asn1crypto import crl as asn1_crl  # type: ignore[import-untyped]
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.sign import signers
 from pyhanko.sign.fields import MDPPerm, SigSeedSubFilter
 from pyhanko.sign.timestamps import DummyTimeStamper
+from pyhanko.sign.validation.dss import DocumentSecurityStore
 from pyhanko_certvalidator.registry import SimpleCertificateStore
 
 from esign.clock import FixedClock
@@ -20,7 +25,7 @@ from esign.sealing.keys import to_asn1_cert, to_asn1_key
 from tests.conftest import FROZEN_NOW
 from tests.sealing.conftest import Pki
 
-__all__ = ["sign_with"]
+__all__ = ["revoke_seal_certificate", "sign_with"]
 
 
 def sign_with(
@@ -65,3 +70,40 @@ def sign_with(
     output = signers.sign_pdf(writer, meta, signer, timestamper=timestamper)
     result: bytes = output.getvalue()
     return result
+
+
+def revoke_seal_certificate(pki: Pki, sealed: bytes, *, revoked_at: datetime) -> bytes:
+    """The same sealed document, with a CRL revoking its seal certificate in the DSS.
+
+    This is how a compromised or superseded seal key reaches a verifier years later: the CA issues
+    a CRL, and an archival system folds the fresher revocation data into the document's own
+    security store as an incremental update (which is what the store is for, and what DocMDP
+    permits). The document is otherwise untouched -- intact, covering itself, chaining to the
+    configured root -- so the only thing that can refuse it is a validator that actually reads the
+    revocation data.
+    """
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(pki.pki.intermediate_cert.subject)
+        .last_update(revoked_at - timedelta(hours=2))
+        .next_update(revoked_at + timedelta(days=365 * 10))
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(pki.pki.intermediate_cert.public_key()),  # type: ignore[arg-type]
+            critical=False,
+        )
+        .add_extension(x509.CRLNumber(2), critical=False)
+        .add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(pki.pki.seal_cert.serial_number)
+            .revocation_date(revoked_at)
+            .add_extension(x509.CRLReason(x509.ReasonFlags.key_compromise), critical=False)
+            .build()
+        )
+        .sign(pki.pki.intermediate_key, hashes.SHA256())
+    )
+    loaded = asn1_crl.CertificateList.load(crl.public_bytes(serialization.Encoding.DER))
+    writer = IncrementalPdfFileWriter(io.BytesIO(sealed), strict=False)
+    DocumentSecurityStore.supply_dss_in_writer(writer, None, crls=[loaded])
+    output = io.BytesIO()
+    writer.write(output)  # type: ignore[no-untyped-call]
+    return output.getvalue()

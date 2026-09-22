@@ -326,3 +326,156 @@ def test_a_capture_the_trail_records_cannot_quietly_disappear(ehr: Ehr, world: W
     assert "captures_match_trail" in failed
     assert "is gone" in failed["captures_match_trail"]
     assert report["ok"] is False
+
+
+def test_an_envelope_row_rewritten_after_sealing_is_reported(ehr: Ehr, world: World) -> None:
+    """The certificate's own header came from rows nothing cross-checked.
+
+    ``envelopes.created_at`` and ``document_type`` are UPDATE-able by the runtime role, and
+    ``template_version_id`` points at the row holding the key and version printed under "Template".
+    ``envelope.created`` carries all four, and its ``occurred_at`` is the creation time.
+    """
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    payload = patient.review_and_consent()
+    assert patient.sign(payload, key="sign-envelope-row").status_code == 200
+    assert ehr.verification(envelope["id"])["complete"] is True
+
+    with world.sessions() as db:
+        db.execute(
+            text("UPDATE envelopes SET created_at = TIMESTAMPTZ '2019-01-01 00:00:00+00' WHERE id = :id"),
+            {"id": envelope["id"]},
+        )
+        db.commit()
+
+    report = ehr.verification(envelope["id"])
+    failed = {c["name"]: c["detail"] for c in report["checks"] if c["status"] == "failed"}
+    assert "envelope_row_matches_trail" in failed
+    assert "created_at" in failed["envelope_row_matches_trail"]
+    assert report["ok"] is False
+
+
+def test_a_rewritten_capacity_or_consent_after_sealing_is_reported(ehr: Ehr, world: World) -> None:
+    """The seal cross-checks ``role_key``, ``capacity`` and ``consent_text_id`` too.
+
+    Verification compared only the three timestamps, so a rewrite of ``capacity`` (guardian -> self)
+    or of the disclosure the signer accepted went unreported after sealing, while the trail and the
+    sealed certificate still held the original values.
+    """
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    payload = patient.review_and_consent()
+    assert patient.sign(payload, key="sign-capacity-drift").status_code == 200
+    assert ehr.verification(envelope["id"])["complete"] is True
+
+    with world.sessions() as db:
+        db.execute(text("UPDATE signers SET capacity = 'witness' WHERE envelope_id = :id"), {"id": envelope["id"]})
+        db.commit()
+    report = ehr.verification(envelope["id"])
+    failed = {c["name"]: c["detail"] for c in report["checks"] if c["status"] == "failed"}
+    assert "signer_rows_match_trail" in failed
+    assert "capacity" in failed["signer_rows_match_trail"]
+
+    with world.sessions() as db:
+        db.execute(
+            text("UPDATE signers SET capacity = 'self', consent_text_id = :c WHERE envelope_id = :id"),
+            {"c": _another_consent(world), "id": envelope["id"]},
+        )
+        db.commit()
+    report = ehr.verification(envelope["id"])
+    failed = {c["name"]: c["detail"] for c in report["checks"] if c["status"] == "failed"}
+    assert "signer_rows_match_trail" in failed
+    assert "consent_text_id" in failed["signer_rows_match_trail"]
+    assert report["ok"] is False
+
+
+def _another_consent(world: World) -> UUID:
+    """A second disclosure row to repoint a signer at. ``consent_texts`` is insert-only, not frozen."""
+    import hashlib
+
+    consent_id = uuid4()
+    body = "A different disclosure entirely."
+    with world.sessions() as db:
+        db.execute(
+            text(
+                "INSERT INTO consent_texts (id, version, locale, body, body_sha256, effective_at) "
+                "VALUES (:id, '1999-01', 'en-US', :body, :sha, TIMESTAMPTZ '1999-01-01 00:00:00+00')"
+            ),
+            {"id": consent_id, "body": body, "sha": hashlib.sha256(body.encode()).digest()},
+        )
+        db.commit()
+    return consent_id
+
+
+def test_a_swapped_signature_image_inside_the_seal_is_reported(ehr: Ehr, world: World, owner_engine: Engine) -> None:
+    """A drawn signature is an image XObject the content stream invokes by name.
+
+    So replacing one signature image with another leaves the page's content stream byte-identical
+    and its boxes unchanged -- and ``sealed_pages_match_final_revision``, which is documented as
+    proving "the pages inside the seal are the pages of the last signer-applied revision", passed.
+    The resources the stream names are part of the page.
+    """
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, NameObject, NumberObject
+
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    payload = patient.review_and_consent()
+    assert patient.sign(payload, key="sign-swapped-image").status_code == 200
+    assert ehr.verification(envelope["id"])["complete"] is True
+
+    with world.sessions() as db:
+        sha = db.execute(
+            text("SELECT sha256 FROM document_revisions WHERE envelope_id = :id AND kind = 'final_unsealed'"),
+            {"id": envelope["id"]},
+        ).scalar_one()
+        final = world.rt.blobs.get(db, bytes(sha))
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(final)))
+    swapped = 0
+    for page in writer.pages:
+        resources = page.get("/Resources")
+        xobjects = None if resources is None else resources.get_object().get("/XObject")
+        if xobjects is None:
+            continue
+        entry = xobjects.get_object()
+        for name in list(entry.keys()):
+            image = entry[name].get_object()
+            if str(image.get("/Subtype")) != "/Image":
+                continue
+            # Somebody else's ink, under the name the content stream already invokes: same size,
+            # same colour space, blank pixels. The page's own bytes do not change at all.
+            replacement = DecodedStreamObject()
+            replacement.set_data(bytes(int(image["/Width"]) * int(image["/Height"]) * 3))
+            for key, value in (
+                ("/Type", NameObject("/XObject")),
+                ("/Subtype", NameObject("/Image")),
+                ("/Width", NumberObject(int(image["/Width"]))),
+                ("/Height", NumberObject(int(image["/Height"]))),
+                ("/ColorSpace", NameObject("/DeviceRGB")),
+                ("/BitsPerComponent", NumberObject(8)),
+            ):
+                replacement[NameObject(key)] = value
+            entry[NameObject(str(name))] = writer._add_object(replacement)
+            swapped += 1
+    assert swapped, "the signed revision carries no signature image to swap"
+    buffer = io.BytesIO()
+    writer.write(buffer)
+
+    # Store the doctored document and point the finalized revision at it, which is what a bug in
+    # ``finalize`` or a compromised sealer would produce. Every hash still re-checks.
+    with world.sessions() as db:
+        ref = world.rt.blobs.put(db, buffer.getvalue(), kind="final_unsealed_pdf")
+        db.commit()
+    with owner_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE document_revisions DISABLE TRIGGER USER"))
+        conn.execute(
+            text("UPDATE document_revisions SET sha256 = :sha WHERE envelope_id = :id AND kind = 'final_unsealed'"),
+            {"sha": ref.sha256, "id": envelope["id"]},
+        )
+        conn.execute(text("ALTER TABLE document_revisions ENABLE TRIGGER USER"))
+
+    report = ehr.verification(envelope["id"])
+    failed = {c["name"] for c in report["checks"] if c["status"] == "failed"}
+    assert "sealed_pages_match_final_revision" in failed
+    assert report["ok"] is False

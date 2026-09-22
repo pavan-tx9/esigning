@@ -161,3 +161,58 @@ def test_building_a_runtime_refuses_a_production_dev_profile(settings_no_db: Set
     with pytest.raises(ConfigurationError) as refused:
         build_runtime(prod, clock=FixedClock(FROZEN_NOW))
     assert "SEAL_PROFILE" in str(refused.value)
+
+
+def test_serve_does_not_let_uvicorn_install_its_own_loggers(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``esign serve`` must not hand logging back to uvicorn's defaults.
+
+    ``uvicorn.LOGGING_CONFIG`` gives ``uvicorn`` and ``uvicorn.access`` their own stdout handlers
+    with ``propagate: False``, so their records never reach the root handler ``configure_logging``
+    installs and never pass ``drop_unlisted_keys``. The access line carries the raw path and query
+    string -- which the ``AccessLog`` middleware deliberately avoids, logging the route template
+    only -- inside the reserved ``event`` key, where it could not be sanitised even if it did
+    propagate. So the log config is dropped and the access log is off.
+    """
+    import uvicorn
+
+    captured: dict[str, object] = {}
+
+    def fake_run(app: str, **kwargs: object) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    assert main(["serve", "--port", "8123"], runtime=world.rt) == 0
+
+    assert captured["app"] == "esign.api:app"
+    assert captured["log_config"] is None
+    assert captured["access_log"] is False
+    # And the app still owns the peer address and the server header (TRUSTED_PROXY_CIDRS).
+    assert captured["proxy_headers"] is False
+    assert captured["server_header"] is False
+    assert captured["reload"] is False
+
+
+def test_serve_reloads_only_when_asked_and_still_drops_the_log_config(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``make dev-api`` runs the development server through ``esign serve --reload``.
+
+    It used to call uvicorn itself with ``--no-access-log``, which silences the raw-URL access line
+    but leaves uvicorn's error logger on its own non-propagating handler. Reloading is the only
+    reason that invocation existed, so it is a flag here and the logging is the same either way.
+    """
+    import uvicorn
+
+    captured: dict[str, object] = {}
+
+    def fake_run(app: str, **kwargs: object) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    assert main(["serve", "--port", "8123", "--reload"], runtime=world.rt) == 0
+
+    assert captured["reload"] is True
+    assert captured["log_config"] is None
+    assert captured["access_log"] is False

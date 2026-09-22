@@ -1,6 +1,7 @@
 /**
- * Dev-only entry: start the MSW worker, expose the two things a host *backend* would do
- * (attest re-authentication, let a session lapse), then boot the real app unchanged.
+ * Dev-only entry: start the MSW worker, expose the things that happen *outside* this browser (a
+ * host backend attesting re-authentication, a session lapsing, a co-signer signing the same
+ * envelope), then boot the real app unchanged.
  */
 
 import { setupWorker } from "msw/browser";
@@ -12,6 +13,8 @@ declare global {
     __esignMock?: {
       attestReauth: (scenario: Scenario) => void;
       expireSession: (scenario: Scenario) => void;
+      /** Another signer on the same envelope signs: the current revision moves on. */
+      otherSignerSigned: (scenario: Scenario) => void;
       peek: (scenario: Scenario) => unknown;
     };
   }
@@ -31,6 +34,7 @@ await worker.start({
 window.__esignMock = {
   attestReauth: (scenario) => mockDb.attestReauth(scenario),
   expireSession: (scenario) => mockDb.expireSession(scenario),
+  otherSignerSigned: (scenario) => mockDb.otherSignerSigned(scenario),
   peek: (scenario) => mockDb.peek(scenario),
 };
 

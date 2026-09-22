@@ -160,3 +160,51 @@ def test_validation_is_against_displayed_sizes(documents: DocumentService) -> No
     )
     with pytest.raises(ValidationFailed):
         documents.validate_definitions(landscape, [tall], [], [role()])
+
+
+def clinician_role(*, requires_reauth: bool) -> SignerRoleDef:
+    return SignerRoleDef(
+        key="clinician",
+        label="Clinician",
+        allowed_capacities=("clinician",),
+        requires_reauth=requires_reauth,
+        order_index=0,
+    )
+
+
+def test_a_clinician_role_that_does_not_reauthenticate_is_refused(documents: DocumentService) -> None:
+    """``docs/ehr-esignature-developer-guide.pdf``: "Re-authenticate clinicians at the moment of
+    signing", repeated in its Definition of Done.
+
+    ``requires_reauth`` defaults to ``false`` and nothing tied it to the clinician capacity, so this
+    was enforced only by convention in ``templates/procedure_consent.json``. A host template with
+    ``"allowed_capacities": ["clinician"]`` and ``requires_reauth`` omitted produced clinician
+    signatures with no ``auth.reauthenticated`` event and a certificate presenting that as expected.
+    """
+    message = problems_from(
+        documents,
+        fields=[signature("clinician_signature", "clinician")],
+        roles=[clinician_role(requires_reauth=False)],
+    )
+    assert "role 'clinician': a role that allows the clinician capacity must set requires_reauth: true" in message
+
+
+def test_a_clinician_role_that_reauthenticates_passes(documents: DocumentService) -> None:
+    documents.validate_definitions(
+        INFO,
+        [signature("clinician_signature", "clinician")],
+        [],
+        [clinician_role(requires_reauth=True)],
+    )
+
+
+def test_a_role_that_merely_allows_other_capacities_is_unaffected(documents: DocumentService) -> None:
+    """Only the clinician capacity carries the requirement; a witness or guardian does not."""
+    role_def = SignerRoleDef(
+        key="witness",
+        label="Witness",
+        allowed_capacities=("witness", "interpreter"),
+        requires_reauth=False,
+        order_index=0,
+    )
+    documents.validate_definitions(INFO, [signature("witness_signature", "witness")], [], [role_def])

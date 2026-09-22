@@ -366,6 +366,59 @@ describe("when the document moves on under the signer", () => {
     expect(record?.viewedRevision).toBe(2);
     expect(types(host)).toContain("esign:signed");
   }, 30_000);
+
+  /**
+   * The same refusal without a reload, which is the shape it actually takes in a parallel envelope:
+   * the signer is on the confirm screen when a co-signer commits a new revision. The bytes this
+   * session was served and the bytes it confirmed reading are still the same revision, so only the
+   * *current* revision says the marks would land on something nobody showed them (SPEC section 13,
+   * fourth round). The way out is the same one.
+   */
+  it("refuses when a co-signer moves the document on under the confirm screen", async () => {
+    const host = await start("multi");
+    await throughConsent();
+    await adoptPrintedName();
+    await click("Add my initials here");
+    await click("Next");
+    await click("Skip");
+    await click("Sign here");
+    await click("Check your answers");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+
+    // The witness signs. Nothing about this signer's session changes: it holds revision 1, and it
+    // is revision 1 that they read.
+    mockDb.otherSignerSigned("multi");
+    const held = mockDb.peek("multi");
+    expect(held?.presentedRevision).toBe(1);
+    expect(held?.viewedRevision).toBe(1);
+
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    await screen.findByTestId("review-again");
+    expect(screen.getByTestId("step-review")).toBeInTheDocument();
+    expect(mockDb.peek("multi")?.signerStatus).toBe("consented");
+
+    // The review step was handed fresh bytes, so reading them through is all it takes.
+    await user.click(await screen.findByRole("button", { name: "test: display every page" }));
+    await click("Continue");
+    await screen.findByTestId("step-consent");
+    await user.click(screen.getByRole("checkbox", { name: /I agree to sign electronically/ }));
+    await click("Agree and continue");
+    await screen.findByTestId("step-sign-summary");
+    await click("Continue");
+    await screen.findByTestId("step-confirm");
+    await user.click(await screen.findByRole("checkbox", { name: /I want to sign/ }));
+    await click("Sign document");
+
+    await screen.findByTestId("waiting-on-others");
+    const record = mockDb.peek("multi");
+    expect(record?.signerStatus).toBe("signed");
+    expect(record?.presentedRevision).toBe(2);
+    expect(record?.viewedRevision).toBe(2);
+    expect(types(host)).toContain("esign:signed");
+  }, 30_000);
 });
 
 describe("re-authentication", () => {

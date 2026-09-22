@@ -154,12 +154,20 @@ def test_parallel_signers_may_sign_in_any_order(ehr: Ehr, world: World) -> None:
     assert ehr.reauth(clinician).status_code == 200
     assert clinician.sign(clinician_payload, key="c").status_code == 200
 
-    # The patient was shown revision 1 and signs on top of the clinician's revision: both hashes
-    # are in the trail, so the divergence is visible rather than smoothed over.
-    assert patient.sign(patient_payload, key="p").status_code == 200
+    # The patient was shown revision 1, which the clinician's signature has moved on from. Signing
+    # would stamp their mark onto a revision they have never been shown -- the clinician's own marks
+    # included -- so it is refused, and the step the signing UI owns is to read the document again
+    # (SPEC section 13: back to Review, re-post /viewed, retry with the kept draft).
+    refused = patient.sign(patient_payload, key="p")
+    assert refused.status_code == 409
+    assert refused.json()["error"]["code"] == "not_viewed"
+    patient_payload = patient.review_and_consent()
+    assert patient.sign(patient_payload, key="p-again").status_code == 200
+
     events = ehr.get(f"/envelopes/{envelope['id']}/audit").json()["events"]
     patient_signed = [e for e in events if e["event_type"] == "signer.signed"][1]
-    assert patient_signed["data"]["presented_sha256"] == envelope["presented_sha256"]
+    # What they signed is what they last read, and it is visibly not revision 1 any more.
+    assert patient_signed["data"]["presented_sha256"] == patient_signed["data"]["base_revision_sha256"]
     assert patient_signed["data"]["base_revision_sha256"] != envelope["presented_sha256"]
 
     witness_payload = witness.review_and_consent()

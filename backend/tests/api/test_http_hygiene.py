@@ -159,6 +159,32 @@ def test_presenting_the_document_is_rate_limited_per_session(ehr: Ehr, world: Wo
     assert patient.get("/document").status_code == 200
 
 
+def test_reporting_the_document_viewed_is_rate_limited_per_session(ehr: Ehr, world: World) -> None:
+    """``POST /v1/signing/viewed`` was the one mutating signer endpoint with no limit at all.
+
+    VIEW is legal repeatedly (a signer who has consented may re-read), and every call re-fetches the
+    revision, re-hashes it, re-parses the PDF for its page count and appends ``document.viewed`` --
+    which has no delete path. A token holder could add thousands of events in a 30-minute session,
+    bloating ``audit_event_count`` on the certificate and slowing every later ``audit.verify``,
+    including the one ``seal_pending`` runs.
+    """
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    patient = ehr.open_session(envelope, "patient")
+    pages = patient.session()["envelope"]["page_count"]
+    assert patient.get("/document").status_code == 200
+
+    limit = RateLimits.PRESENT.limit
+    statuses = [patient.post("/viewed", {"pages_viewed": pages}).status_code for _ in range(limit + 1)]
+    assert statuses[:limit] == [200] * limit
+    assert statuses[limit] == 429
+    limited = patient.post("/viewed", {"pages_viewed": pages})
+    assert limited.json()["error"]["code"] == "rate_limited"
+    assert 1 <= int(limited.headers["retry-after"]) <= RateLimits.PRESENT.window_seconds
+
+    world.clock.advance(RateLimits.PRESENT.window_seconds + 1)
+    assert patient.post("/viewed", {"pages_viewed": pages}).status_code == 200
+
+
 def test_running_a_verification_is_rate_limited_per_host(ehr: Ehr, world: World) -> None:
     """Every call re-hashes every revision, validates the seal and appends an audit event."""
     envelope = ehr.create_envelope("hipaa_acknowledgement")
@@ -216,6 +242,19 @@ def test_production_refuses_to_start_half_configured(e2e_settings: Settings) -> 
     with pytest.raises(ValueError, match="does not appear to be"):
         check_production_settings(e2e_settings.model_copy(update={"trusted_proxy_cidrs": ("not-a-network",)}))
 
+    # The s3 backend with no bucket is refused in *any* environment: left to the backend it was a
+    # bare ValueError at the first blob write, and ``esign worker`` / ``esign verify`` catch
+    # ConfigurationError and EsignError only, so it reached the operator as a traceback.
+    with pytest.raises(ConfigurationError) as no_bucket:
+        check_production_settings(e2e_settings.model_copy(update={"blob_backend": "s3", "blob_s3_bucket": ""}))
+    assert "BLOB_S3_BUCKET" in str(no_bucket.value)
+
+    # And a production key or bucket with the default environment is a deployment that forgot
+    # APP_ENV -- every rule above is keyed on it, the timestamp authority most of all.
+    with pytest.raises(ConfigurationError) as forgot:
+        check_production_settings(e2e_settings.model_copy(update={"app_env": "dev", "seal_key_backend": "aws_kms"}))
+    assert "APP_ENV" in str(forgot.value)
+
 
 def test_production_refuses_dev_database_credentials_and_sql_echo(e2e_settings: Settings, tmp_path: Path) -> None:
     """The seal and the blob store were covered; the database was not.
@@ -235,6 +274,7 @@ def test_production_refuses_dev_database_credentials_and_sql_echo(e2e_settings: 
             "seal_kms_key_id": "alias/esign-seal",
             "seal_cert_path": roots,
             "blob_backend": "s3",
+            "blob_s3_bucket": "esign-documents",
             "trust_roots_path": roots,
             "tsa_url": "https://tsa.example/rfc3161",
             "database_url": "postgresql+psycopg://esign_app:esign_app_dev@db/esign",
@@ -270,6 +310,7 @@ def test_production_refuses_a_kms_backend_with_no_key_or_certificate(e2e_setting
             "seal_profile": "PAdES-B-LT",
             "seal_key_backend": "aws_kms",
             "blob_backend": "s3",
+            "blob_s3_bucket": "esign-documents",
             "trust_roots_path": roots,
             "tsa_url": "https://tsa.example/rfc3161",
             "database_url": "postgresql+psycopg://esign_app:s3cret@db/esign",

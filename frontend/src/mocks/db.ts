@@ -140,9 +140,10 @@ export interface MockRecord {
   presented: number;
   /**
    * The revision this session was last served (`document.presented`), and the revision the signer
-   * said they had read (`signers.viewed_sha256`). Signing needs them to be the same one: a signer
-   * whose co-signer signed while they were reading is served newer bytes than the ones they
-   * confirmed, and the service refuses with `not_viewed` until they read again.
+   * said they had read (`signers.viewed_sha256`). Signing needs them to be the same one *and* to
+   * still be the current revision (`revisions`): a signer whose co-signer signed while they were
+   * reading either holds bytes they never confirmed, or bytes that are no longer the ones the
+   * marks would land on. Both are refused with `not_viewed` until they read the document again.
    */
   presentedRevision: number | null;
   viewedRevision: number | null;
@@ -481,6 +482,18 @@ export function recordSign(
     throw new MockHttpError(409, "not_presented", "The document has not been opened.");
   }
   if (record.viewedRevision !== record.presentedRevision) {
+    throw new MockHttpError(
+      409,
+      "not_viewed",
+      "The document has changed. Please look through every page again before you sign.",
+    );
+  }
+  // ...and what they read must still be the current revision. A co-signer who commits while this
+  // signer sits on the confirm screen leaves both hashes naming the old bytes, so the check above
+  // is happy and the marks would land on a revision nobody showed them, co-signer's field values
+  // included. The real service refuses this under the envelope row lock (SPEC section 13, fourth
+  // round); the mocked flow has to refuse it too, or the specs never see the case that happens.
+  if (record.presentedRevision !== record.revisions) {
     throw new MockHttpError(
       409,
       "not_viewed",

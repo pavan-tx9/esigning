@@ -50,6 +50,30 @@ def run_together(tasks: list[Callable[[], Any]]) -> list[Any]:
     return results
 
 
+def sign_racing(bench: Bench, db_factory: SessionFactory, session: SessionInfo, field_id: str) -> tuple[str, bool]:
+    """Sign, and if a co-signer got there first, re-read the document and sign that.
+
+    Whoever loses the race is refused with 409 ``not_viewed``: the revision their marks would land
+    on is one a co-signer just made, and they have never been shown it. That is the refusal the
+    signing UI owns (SPEC section 13: drop the document, back to Review, re-post ``/viewed``, retry
+    with the kept draft), and this is that recovery. Returns the envelope status the signature was
+    taken at, and whether the re-read was needed.
+    """
+    try:
+        with db_factory() as db:
+            status = bench.service.sign(db, session, [sig(field_id)], CTX).status
+            db.commit()
+            return status, False
+    except Conflict as refusal:
+        assert refusal.code == "not_viewed", refusal.code
+    with db_factory() as db:
+        bench.service.present(db, session, CTX)
+        bench.service.record_viewed(db, session, PAGES, CTX)
+        status = bench.service.sign(db, session, [sig(field_id)], CTX).status
+        db.commit()
+        return status, True
+
+
 def ready_parallel_pair(bench: Bench, db_factory: SessionFactory) -> tuple[EnvelopeView, SessionInfo, SessionInfo]:
     """A two-signer parallel envelope with both signers presented, viewed and consented."""
     with db_factory() as setup:
@@ -71,25 +95,23 @@ def test_two_threads_signing_one_parallel_envelope_serialise(
     """SPEC 12: parallel signers serialise correctly.
 
     Both signatures land, each on its own revision number, and the envelope completes exactly
-    once -- which is the whole job of the ``SELECT ... FOR UPDATE`` on the envelope row.
+    once -- which is the whole job of the ``SELECT ... FOR UPDATE`` on the envelope row. The loser
+    of the race is refused with ``not_viewed`` first, because the revision it would have signed is
+    the winner's, and it re-reads the document before its signature is allowed through.
     """
     bench = committing_bench
     view, patient, witness = ready_parallel_pair(bench, db_factory)
 
-    def sign_as(session: SessionInfo, field_id: str) -> str:
-        with db_factory() as db:
-            result = bench.service.sign(db, session, [sig(field_id)], CTX)
-            db.commit()
-            return result.status
-
     outcomes = run_together(
         [
-            lambda: sign_as(patient, "patient_sig"),
-            lambda: sign_as(witness, "witness_sig"),
+            lambda: sign_racing(bench, db_factory, patient, "patient_sig"),
+            lambda: sign_racing(bench, db_factory, witness, "witness_sig"),
         ]
     )
     assert all(kind == "ok" for kind, _ in outcomes), outcomes
-    assert sorted(value for _, value in outcomes) == ["completed_pending_seal", "in_progress"]
+    assert sorted(value[0] for _, value in outcomes) == ["completed_pending_seal", "in_progress"]
+    # Exactly one of the two had to read the document again: the one that went second.
+    assert sorted(value[1] for _, value in outcomes) == [False, True]
 
     with db_factory() as check:
         assert bench.status(check, view.id) == "completed_pending_seal"
@@ -108,15 +130,10 @@ def test_concurrent_signatures_leave_a_gapless_audit_chain(committing_bench: Ben
     bench = committing_bench
     view, patient, witness = ready_parallel_pair(bench, db_factory)
 
-    def sign_as(session: SessionInfo, field_id: str) -> None:
-        with db_factory() as db:
-            bench.service.sign(db, session, [sig(field_id)], CTX)
-            db.commit()
-
     run_together(
         [
-            lambda: sign_as(patient, "patient_sig"),
-            lambda: sign_as(witness, "witness_sig"),
+            lambda: sign_racing(bench, db_factory, patient, "patient_sig"),
+            lambda: sign_racing(bench, db_factory, witness, "witness_sig"),
         ]
     )
 
@@ -134,15 +151,10 @@ def test_the_second_signer_signs_on_top_of_the_first(committing_bench: Bench, db
     bench = committing_bench
     view, patient, witness = ready_parallel_pair(bench, db_factory)
 
-    def sign_as(session: SessionInfo, field_id: str) -> None:
-        with db_factory() as db:
-            bench.service.sign(db, session, [sig(field_id)], CTX)
-            db.commit()
-
     run_together(
         [
-            lambda: sign_as(patient, "patient_sig"),
-            lambda: sign_as(witness, "witness_sig"),
+            lambda: sign_racing(bench, db_factory, patient, "patient_sig"),
+            lambda: sign_racing(bench, db_factory, witness, "witness_sig"),
         ]
     )
 
@@ -153,23 +165,20 @@ def test_the_second_signer_signs_on_top_of_the_first(committing_bench: Bench, db
         assert second.data["revision_no"] == 3
         # The second signature's base is the first signature's output.
         assert second.data["base_revision_sha256"] == first.document_sha256.hex()  # type: ignore[union-attr]
-        # And it is visibly not what that signer was shown, which is why both hashes are recorded.
-        assert second.data["presented_sha256"] == view.presented_sha256.hex()  # type: ignore[union-attr]
+        # ...and that is also what the second signer was shown, because a signature onto a revision
+        # they had not read was refused until they read it.
+        assert second.data["presented_sha256"] == second.data["base_revision_sha256"]
+        assert first.data["presented_sha256"] == view.presented_sha256.hex()  # type: ignore[union-attr]
 
 
 def test_exactly_one_seal_job_is_enqueued(committing_bench: Bench, db_factory: SessionFactory) -> None:
     bench = committing_bench
     view, patient, witness = ready_parallel_pair(bench, db_factory)
 
-    def sign_as(session: SessionInfo, field_id: str) -> None:
-        with db_factory() as db:
-            bench.service.sign(db, session, [sig(field_id)], CTX)
-            db.commit()
-
     run_together(
         [
-            lambda: sign_as(patient, "patient_sig"),
-            lambda: sign_as(witness, "witness_sig"),
+            lambda: sign_racing(bench, db_factory, patient, "patient_sig"),
+            lambda: sign_racing(bench, db_factory, witness, "witness_sig"),
         ]
     )
 

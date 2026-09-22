@@ -208,6 +208,7 @@ class Verifier:
         events = self._audit.list(db, "envelope", envelope_id)
         self._check_trail_against_revisions(run, events, revisions, status)
 
+        self._check_envelope_row_against_trail(db, run, events, envelope_id)
         self._check_signer_rows_against_trail(db, run, events, envelope_id)
         blobs_checked += self._check_capture_images(db, run, events, envelope_id)
         self._check_sealed_pages_match_final_revision(run, fetched, status)
@@ -415,18 +416,65 @@ class Verifier:
             f"the seal names {found!r}; this envelope is {expected!r}",
         )
 
+    def _check_envelope_row_against_trail(
+        self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID
+    ) -> None:
+        """The document-level facts the certificate prints must still say what the trail says.
+
+        ``envelopes.created_at`` and ``document_type`` are UPDATE-able by the runtime role, and
+        ``template_version_id`` is a pointer at a row that carries the key and version printed under
+        "Template". The seal now refuses on a disagreement; this reports the same five comparisons
+        for an envelope that was already sealed when a row was changed.
+        """
+        row = db.execute(
+            text(
+                "SELECT e.created_at, e.document_type, e.template_version_id, t.version, tpl.key AS template_key "
+                "FROM envelopes e "
+                "JOIN template_versions t ON t.id = e.template_version_id "
+                "JOIN templates tpl ON tpl.id = t.template_id "
+                "WHERE e.id = :id"
+            ),
+            {"id": envelope_id},
+        ).first()
+        created = next((e for e in events if e.event_type == EventType.ENVELOPE_CREATED), None)
+        if created is None:
+            run.failed("envelope_row_matches_trail", "there is no envelope.created event")
+            return
+        if row is None:
+            run.failed("envelope_row_matches_trail", "the envelope's template version is missing")
+            return
+        problems: list[str] = []
+        if abs(row.created_at - created.occurred_at) > _ROW_EVENT_TOLERANCE:
+            problems.append("created_at is not the time envelope.created recorded")
+        for what, row_value, event_value in (
+            ("document_type", row.document_type, created.data.get("document_type")),
+            ("template_version_id", row.template_version_id, created.data.get("template_version_id")),
+            ("template_key", row.template_key, created.data.get("template_key")),
+            ("template_version", row.version, created.data.get("template_version")),
+        ):
+            if _text(row_value) != _text(event_value):
+                problems.append(f"{what} is not what envelope.created recorded")
+        run.expect("envelope_row_matches_trail", not problems, "; ".join(problems))
+
     def _check_signer_rows_against_trail(
         self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID
     ) -> None:
         """The ``signers`` rows must still say what the append-only trail says.
 
         ``signers`` is fully UPDATE-able by the runtime role, and it is where the certificate of
-        completion's per-signer times come from. The seal refuses on a disagreement
+        completion's per-signer facts come from. The seal refuses on a disagreement
         (``certificate_evidence_mismatch``); this reports the same comparison afterwards, for an
-        envelope that was already sealed when the row was changed.
+        envelope that was already sealed when the row was changed -- so the columns compared here
+        are the ones ``_certificate_signer`` compares, not just the three timestamps: a rewrite of
+        ``capacity`` (guardian -> self), ``role_key``, ``on_behalf_of`` or ``consent_text_id`` after
+        sealing went unreported while the trail and the sealed bytes held the original values.
         """
         rows = db.execute(
-            text("SELECT id, status, viewed_at, consented_at, signed_at FROM signers WHERE envelope_id = :id"),
+            text(
+                "SELECT id, status, role_key, capacity, on_behalf_of, consent_text_id, "
+                "  viewed_at, consented_at, signed_at "
+                "FROM signers WHERE envelope_id = :id"
+            ),
             {"id": envelope_id},
         ).all()
         problems: list[str] = []
@@ -457,6 +505,30 @@ class Verifier:
             )
             if (str(row.status) == "signed") != (signed is not None):
                 problems.append("a signer's status does not match whether signer.signed is in the trail")
+            if signed is not None:
+                # What the certificate prints beside the name, and what the seal cross-checked.
+                for column, row_value, event_value in (
+                    ("role_key", row.role_key, signed.data.get("role_key")),
+                    ("capacity", row.capacity, signed.data.get("capacity")),
+                    ("on_behalf_of", row.on_behalf_of or None, signed.actor.on_behalf_of or None),
+                ):
+                    if _text(row_value) != _text(event_value):
+                        problems.append(f"{column} is not what signer.signed recorded")
+            # The *first* consent.accepted, matching the row: ``accept_consent`` keeps the first
+            # accepted disclosure in both ``consented_at`` and ``consent_text_id``.
+            consent = next(
+                (
+                    e
+                    for e in events
+                    if e.event_type == EventType.CONSENT_ACCEPTED and str(e.data.get("signer_id")) == signer_id
+                ),
+                None,
+            )
+            if consent is not None and row.consent_text_id is not None:
+                if _text(row.consent_text_id) != _text(consent.data.get("consent_text_id")):
+                    problems.append("consent_text_id is not the disclosure consent.accepted recorded")
+            elif (row.consent_text_id is not None) != (consent is not None):
+                problems.append("consent_text_id and consent.accepted disagree about whether it happened")
             if signed is not None and not _viewed_what_was_signed(events, signer_id, signed):
                 # SPEC section 3 step 3: the server refuses signing before the document was viewed.
                 # The bytes have to line up, not just the order of events: ``viewed`` is a
@@ -612,12 +684,21 @@ def _opt(value: Any) -> bytes | None:
     return None if value is None else bytes(value)
 
 
+def _text(value: Any) -> str | None:
+    """A row value and a canonicalised event value compared as the same kind of thing."""
+    return None if value is None else str(value)
+
+
 def _same_page(before: Any, after: Any) -> bool:
     """Whether two pages draw the same thing in the same place.
 
     The content stream is compared decoded, because ``finalize`` re-writes the file and may choose a
     different compression; the boxes and rotation are compared because the same ink at a different
-    offset is a different page.
+    offset is a different page; and the resources the stream *names* are compared because that is
+    where a signature actually lives. A drawn signature is an image XObject invoked by name
+    (``/Im3 Do``) and a typed one is an embedded font, so swapping one signature image for another
+    leaves the content stream byte-identical -- which is precisely the substitution this check
+    exists to catch.
     """
     try:
         first = before.get_contents()
@@ -629,19 +710,114 @@ def _same_page(before: Any, after: Any) -> bool:
         for key in ("/MediaBox", "/CropBox", "/Rotate"):
             if str(before.get(key)) != str(after.get(key)):
                 return False
+        if _resource_digests(before.get("/Resources")) != _resource_digests(after.get("/Resources")):
+            return False
     except Exception:
         return False
     return True
 
 
+#: Resource categories whose contents a page's ink depends on. Images and fonts are what a
+#: signature mark is made of; a form XObject can hold a whole nested content stream.
+_DRAWING_RESOURCES: Final = ("/XObject", "/Font")
+
+#: How far into a resource's own dictionary to look. A font reaches its descriptor and from there
+#: its embedded font file, which is three levels; a form XObject's resources add a couple more.
+_MAX_RESOURCE_DEPTH: Final = 8
+
+#: Keys that point back up the document tree rather than down into the resource. Following them
+#: would walk the whole file (and go round in circles) for no gain.
+_UPWARD_KEYS: Final = frozenset({"/Parent", "/P", "/Prev", "/Next", "/First", "/Last", "/Root"})
+
+
+def _resource_digests(resources: Any) -> dict[str, str]:
+    """One digest per named image, font or form XObject the page can draw with.
+
+    Keyed by the name the content stream invokes (``/Im3``, ``/F2``), so a resource replaced under
+    the same name shows up as a different digest rather than as no difference at all.
+    """
+    digests: dict[str, str] = {}
+    if resources is None:
+        return digests
+    try:
+        resolved = resources.get_object()
+    except Exception:
+        return {"/Resources": "unreadable"}
+    for category in _DRAWING_RESOURCES:
+        entries = resolved.get(category)
+        if entries is None:
+            continue
+        try:
+            entries = entries.get_object()
+            names = list(entries.keys())
+        except Exception:
+            digests[category] = "unreadable"
+            continue
+        for name in names:
+            digests[f"{category}{name}"] = _object_digest(entries[name])
+    return digests
+
+
+def _object_digest(value: Any, *, depth: int = 0, seen: frozenset[int] = frozenset()) -> str:
+    """A digest of one PDF object as it *renders*, not as it is stored.
+
+    Every indirect reference is resolved before it is hashed, so the object numbers ``finalize``
+    hands out when it rebuilds the file -- which differ from the signed revision's for the same
+    content -- never reach the digest. What does reach it is the dictionary's own keys and values
+    and, for a stream, its decoded data: the pixels of a signature image, the glyphs of an embedded
+    font. ``depth`` and ``seen`` bound the walk, because a PDF object graph may be cyclic and a
+    verifier must not be made to hang by a hostile file.
+    """
+    try:
+        obj = value.get_object() if hasattr(value, "get_object") else value
+    except Exception:
+        return "unreadable"
+    if depth > _MAX_RESOURCE_DEPTH:
+        return "too-deep"
+    identity = id(obj)
+    if identity in seen:
+        return "cycle"
+    deeper = seen | {identity}
+
+    digest = hashlib.sha256()
+    try:
+        if hasattr(obj, "keys"):
+            for key in sorted(str(k) for k in obj):
+                if key in _UPWARD_KEYS:
+                    continue
+                digest.update(f"{key}=".encode())
+                digest.update(_object_digest(obj[key], depth=depth + 1, seen=deeper).encode())
+                digest.update(b"\n")
+        elif isinstance(obj, list):
+            for item in obj:
+                digest.update(_object_digest(item, depth=depth + 1, seen=deeper).encode())
+                digest.update(b",")
+        else:
+            digest.update(str(obj).encode())
+        data = obj.get_data() if hasattr(obj, "get_data") else None
+    except Exception:
+        return "unreadable"
+    if data is not None:
+        digest.update(b"data:")
+        digest.update(data if isinstance(data, bytes) else str(data).encode())
+    return digest.hexdigest()
+
+
 def _viewed_what_was_signed(events: list[AuditEvent], signer_id: str, signed: AuditEvent) -> bool:
-    """Whether a ``document.viewed`` for these exact bytes precedes this signature."""
-    presented = str(signed.data.get("presented_sha256", ""))
-    return any(
+    """Whether a ``document.viewed`` for the revision the signature was built on precedes it.
+
+    ``base_revision_sha256``, not ``presented_sha256``: the marks were applied to the base
+    revision, so that is the document this signer has to have read. The two are the same hash for
+    every signature written under the current ``sign`` (it refuses ``not_viewed`` when they differ),
+    and comparing the base is what turns a trail written before that refusal existed -- a signature
+    stamped onto a co-signer's revision the signer never saw -- into a finding here.
+    """
+    base = str(signed.data.get("base_revision_sha256", ""))
+    return bool(base) and any(
         e.event_type == EventType.DOCUMENT_VIEWED
         and str(e.data.get("signer_id")) == signer_id
         and e.document_sha256 is not None
-        and e.document_sha256.hex() == presented
+        and e.document_sha256.hex() == base
         and e.sequence < signed.sequence
         for e in events
     )

@@ -13,8 +13,11 @@ not a downgrade.
 
 **Never trust the document.** ``validate`` takes its trust roots from settings and only from
 settings. A certificate embedded in the file is material for building a path, never a reason to
-believe one. ``validate`` never raises: a shredded, unsigned or forged PDF comes back as a
-failing :class:`SealValidation` with a problem string saying exactly what was wrong.
+believe one -- and the same holds for the revocation data in the document security store, which
+``validate`` does read (that is why ``PAdES-B-LT`` embeds it: so revocation can be decided offline
+years from now) but reads as evidence to check the chain against, under ``hard-fail``, rooted in the
+configured trust store. ``validate`` never raises: a shredded, unsigned or forged PDF comes back as
+a failing :class:`SealValidation` with a problem string saying exactly what was wrong.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.misc import PdfError
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import signers
+from pyhanko.sign.ades.report import AdESFailure, AdESIndeterminate
 from pyhanko.sign.diff_analysis import ModificationLevel
 from pyhanko.sign.fields import MDPPerm, SigSeedSubFilter, enumerate_sig_fields
 from pyhanko.sign.validation import (
@@ -41,6 +45,8 @@ from pyhanko.sign.validation import (
     read_certification_data,
     validate_pdf_signature,
 )
+from pyhanko.sign.validation.dss import DocumentSecurityStore
+from pyhanko.sign.validation.errors import NoDSSFoundError, ValidationInfoReadingError
 from pyhanko_certvalidator import ValidationContext
 
 from esign.config import Settings
@@ -81,6 +87,26 @@ _FUTURE_TIMESTAMP_TOLERANCE: Final = timedelta(minutes=5)
 
 #: Profiles that must embed revocation information.
 _LONG_TERM_PROFILES: Final[frozenset[str]] = frozenset({"PAdES-B-LT", "PAdES-B-LTA"})
+
+#: AdES sub-indications that mean a certificate in the chain was withdrawn. ``REVOKED_NO_POE`` and
+#: ``REVOKED_CA_NO_POE`` are "revoked, and we cannot prove the signature predates the revocation",
+#: which for a seal is the same answer: do not believe it.
+_REVOKED_INDICATIONS: Final[frozenset[object]] = frozenset(
+    {
+        AdESFailure.REVOKED,
+        AdESIndeterminate.REVOKED_NO_POE,
+        AdESIndeterminate.REVOKED_CA_NO_POE,
+    }
+)
+
+#: Sub-indications that mean revocation could not be decided from what the document carries.
+_REVOCATION_UNKNOWN_INDICATIONS: Final[frozenset[object]] = frozenset(
+    {
+        AdESIndeterminate.TRY_LATER,
+        AdESIndeterminate.REVOCATION_OUT_OF_BOUNDS_NO_POE,
+        AdESIndeterminate.OUT_OF_BOUNDS_NOT_REVOKED,
+    }
+)
 
 #: Problems that mean "this document is not locked down", which is what ``covers_whole_document``
 #: asserts. See the note where it is set.
@@ -210,7 +236,8 @@ class PadesSealer:
 
         signature = signatures[0]
         claimed_time = _signature_timestamp(signature)
-        context = self._validating_context(trust_roots, claimed_time)
+        context, context_problems = self._validating_context(reader, trust_roots, claimed_time)
+        problems.extend(context_problems)
 
         try:
             status = validate_pdf_signature(
@@ -223,6 +250,8 @@ class PadesSealer:
             # belongs to the document rather than to the signature.
             return _failed(Problem.MALFORMED_PDF, *problems)
 
+        revocation = _revocation_problems(status)
+        problems.extend(revocation)
         problems.extend(self._certification_problems(reader, signature))
         intact = bool(status.intact and status.valid)
         if not status.intact:
@@ -234,7 +263,9 @@ class PadesSealer:
         problems.extend(coverage_problems)
 
         trusted = bool(status.trusted)
-        if intact and not trusted:
+        if intact and not trusted and not revocation:
+            # A revoked certificate is untrusted too, but "revoked" is the reason; saying both
+            # would blur the one story that matters into the generic one.
             problems.append(Problem.UNTRUSTED_CHAIN)
 
         timestamp_valid, signing_time, timestamp_problems = self._timestamp(status)
@@ -304,23 +335,48 @@ class PadesSealer:
             return tuple(material.chain[-1:]) if material.chain else ()
 
     def _validating_context(
-        self, trust_roots: tuple[asn1_x509.Certificate, ...], claimed_time: datetime | None
-    ) -> ValidationContext:
-        """Point-in-time validation context.
+        self,
+        reader: PdfFileReader,
+        trust_roots: tuple[asn1_x509.Certificate, ...],
+        claimed_time: datetime | None,
+    ) -> tuple[ValidationContext, list[str]]:
+        """Point-in-time validation context, built from the document's own revocation data.
 
         A seal has to keep validating for the whole retention period, long after the signing
         certificate expires, so the chain is checked at the time the RFC 3161 authority attests
         rather than at today's date. That time is taken from the document, so it is capped: a
         token claiming a time beyond our own clock is rejected outright below.
+
+        The revocation data is the reason ``PAdES-B-LT`` embeds a document security store in the
+        first place: so that "was this certificate revoked when it signed?" can be answered offline
+        years later, with no CRL or OCSP endpoint still standing. ``validate_pdf_signature`` does
+        *not* read the DSS by itself -- so a bare soft-fail context meant the embedded data was
+        never consulted by anything: not by ``Sealer.validate`` right after sealing, not by
+        ``esign verify``, not by ``GET /verification``. A seal made with a certificate revoked
+        before its timestamp validated clean. So the store is loaded and the context is built from
+        it, under ``hard-fail``: "we could not tell" is not a pass.
+
+        A document with no store is soft-fail -- but only when a long-term profile was not the
+        expectation. ``PAdES-B-T`` is the dev and test profile and carries no revocation data by
+        design; a deployment configured for ``B-LT`` that is handed a document without a store gets
+        ``revocation_unknown``, not a shrug.
         """
         now = self._clock.now()
         moment = claimed_time if claimed_time is not None and claimed_time <= now else now
-        return ValidationContext(
-            trust_roots=list(trust_roots),
-            allow_fetching=False,
-            revocation_mode="soft-fail",
-            moment=moment,
-        )
+        kwargs: dict[str, object] = {
+            "trust_roots": list(trust_roots),
+            # Never: a validator that reaches the network answers a different question every time
+            # it runs, and stops answering at all once the endpoints are gone.
+            "allow_fetching": False,
+            "moment": moment,
+        }
+        store = _read_dss(reader)
+        if store is None:
+            if self._settings.seal_profile in _LONG_TERM_PROFILES:
+                log.error("seal.revocation_data_missing", problem=Problem.REVOCATION_UNKNOWN)
+                return ValidationContext(revocation_mode="soft-fail", **kwargs), [Problem.REVOCATION_UNKNOWN]  # type: ignore[arg-type]
+            return ValidationContext(revocation_mode="soft-fail", **kwargs), []  # type: ignore[arg-type]
+        return store.as_validation_context({**kwargs, "revocation_mode": "hard-fail"}), []
 
     def _certification_problems(self, reader: PdfFileReader, signature: EmbeddedPdfSignature) -> list[str]:
         certification = read_certification_data(reader)
@@ -420,6 +476,31 @@ def _post_condition_failure(
     if profile == "PAdES-B-LTA" and not has_document_timestamp:
         return Problem.VALIDATION_ERROR
     return None
+
+
+def _read_dss(reader: PdfFileReader) -> DocumentSecurityStore | None:
+    """The document's own security store, or ``None`` when it has none (or an unreadable one)."""
+    try:
+        return DocumentSecurityStore.read_dss(reader)
+    except (NoDSSFoundError, ValidationInfoReadingError, PdfError, ValueError, KeyError):
+        return None
+
+
+def _revocation_problems(status: PdfSignatureStatus) -> list[str]:
+    """What the validator concluded about revocation, in this module's vocabulary.
+
+    ``trusted`` alone does not say which question failed, and "revoked" and "unknown" are very
+    different stories to tell a court: one says the key was withdrawn before it signed, the other
+    says the evidence needed to decide is not in the file.
+    """
+    if status.revocation_details is not None:
+        return [Problem.CERTIFICATE_REVOKED]
+    indication = status.trust_problem_indic
+    if indication in _REVOKED_INDICATIONS:
+        return [Problem.CERTIFICATE_REVOKED]
+    if indication in _REVOCATION_UNKNOWN_INDICATIONS:
+        return [Problem.REVOCATION_UNKNOWN]
+    return []
 
 
 def _check_reason(reason: str) -> str:

@@ -184,3 +184,33 @@ def test_long_term_profile_without_reachable_revocation_data_refuses_to_seal(
     sealer = build_sealer(settings, FixedClock(FROZEN_NOW))
     with pytest.raises(SealUnavailable):
         sealer.seal(make_pdf(), reason="Envelope completed", envelope_id=uuid4())
+
+
+def test_a_production_key_outside_the_test_environment_refuses_the_in_process_authority(
+    aws: None, dev_pki: Pki, tmp_path: Path
+) -> None:
+    """A deployment with a real KMS key, a real bucket, and a missing or misspelled ``APP_ENV``.
+
+    ``APP_ENV`` defaults to ``dev``, and the refusal used to be keyed on ``prod`` alone -- so that
+    deployment sealed real documents whose RFC 3161 time was asserted by a throwaway dev
+    certificate, with nothing refusing and nothing in ``document.sealed`` able to show it (the event
+    records no TSA identity). The in-process authority is reachable on the local dev key, or under
+    the test environment, and nowhere else.
+    """
+    settings = provision_key(dev_pki, tmp_path, key_spec="RSA_2048").model_copy(update={"app_env": "dev"})
+    sealer = build_sealer(settings, FixedClock(FROZEN_NOW))
+
+    with pytest.raises(SealUnavailable) as caught:
+        sealer.seal(make_pdf(), reason="Envelope completed", envelope_id=uuid4())
+    assert caught.value.code == "tsa_not_configured"
+
+
+def test_the_test_environment_still_stamps_a_kms_seal_offline(aws: None, dev_pki: Pki, tmp_path: Path) -> None:
+    """The offline KMS tests are why the test environment keeps the allowance."""
+    settings = provision_key(dev_pki, tmp_path, key_spec="RSA_2048")
+    assert settings.app_env == "test" and not settings.tsa_url
+
+    result = build_sealer(settings, FixedClock(FROZEN_NOW)).seal(
+        make_pdf(), reason="Envelope completed", envelope_id=uuid4()
+    )
+    assert result.timestamp_time == FROZEN_NOW

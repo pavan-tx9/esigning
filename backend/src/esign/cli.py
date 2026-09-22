@@ -9,7 +9,7 @@
     esign templates import --host HOST_ID [--dir templates/] [--no-publish]
     esign worker [--once]                       seal jobs, expiries, webhooks
     esign verify ENVELOPE_ID [--json]           re-check an envelope; exit 1 if anything failed
-    esign serve [--host H] [--port P]           run the API (and the signing UI when it is built)
+    esign serve [--host H] [--port P] [--reload] run the API (and the signing UI when it is built)
 
 Secrets are printed to stdout exactly once and are never logged. Everything else this command says
 is ids, counts and statuses.
@@ -218,7 +218,29 @@ def _serve(args: argparse.Namespace, _rt: RuntimeFactory) -> int:
 
     # Proxy headers are handled by the app itself, against TRUSTED_PROXY_CIDRS; uvicorn must not
     # rewrite the peer address first or that check would be looking at the wrong thing.
-    uvicorn.run("esign.api:app", host=args.host, port=args.port, proxy_headers=False, server_header=False)
+    #
+    # ``log_config=None`` and ``access_log=False`` keep every log line inside the allowlisted
+    # structured logger. uvicorn's default LOGGING_CONFIG gives ``uvicorn`` and ``uvicorn.access``
+    # their own stdout handlers with ``propagate: False``, so their records never reach the root
+    # handler ``configure_logging`` installs: the access line (raw path and query string, which the
+    # AccessLog middleware deliberately avoids by logging the route template only) and full
+    # ASGI-level tracebacks would go straight out, past ``drop_unlisted_keys``. With no log config
+    # those loggers propagate to the root handler instead, and with the access log off the raw-URL
+    # line is not produced at all -- it could not be sanitised anyway, since it lives inside the
+    # reserved ``event`` key.
+    #
+    # ``--reload`` is why `make dev-api` can come through here rather than calling uvicorn itself:
+    # a development server that reloads still has to log like the real one.
+    uvicorn.run(
+        "esign.api:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        proxy_headers=False,
+        server_header=False,
+        log_config=None,
+        access_log=False,
+    )
     return 0
 
 
@@ -278,6 +300,7 @@ def _parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="run the API")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--reload", action="store_true", help="restart on code changes (development)")
     serve.set_defaults(run=_serve)
     return parser
 

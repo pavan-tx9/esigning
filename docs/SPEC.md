@@ -502,3 +502,77 @@ Third round, from the review of the integrated system:
   `/envelopes/{id}/verification`).
 - **Consent**: `en-US.2026-10` replaces `2026-09` from 1 October. `2026-09` promised a download
   "from this screen", which is false on a kiosk (section 11 hands the tablet back and wipes state).
+
+Fourth round, from the review of the integrated system. No change to `contracts.py` or
+`0001_schema.sql`; these are behaviours the two files already allowed and the code did not enforce:
+
+- **Consent is recorded once, in full**: `accept_consent` is legal for a signer who is already
+  `consented` (another locale, or the disclosure rolled over and the client re-posted after a
+  `consent_version_stale` refusal), and it kept the first `consented_at` while overwriting
+  `consent_text_id`. The row then described one disclosure and the certificate builder's first
+  `consent.accepted` another, so a fully signed envelope raised
+  `IntegrityFailure(certificate_evidence_mismatch)` on every seal attempt -- for ever, because such
+  an envelope cannot be voided and the first event cannot be removed. `only_if_unset` now covers
+  `consent_text_id` too: the row keeps the *first* accepted disclosure, matching `consented_at`,
+  `_first_event` in the certificate and `signer.signed.consent_version`.
+- **`sign` requires the bytes to have been viewed *and* to still be the current revision**: the
+  round-3 guard compared the session's presented hash with `signers.viewed_sha256`, which in a
+  parallel envelope both still named revision 1 after a co-signer committed revision 2 -- so the
+  marks landed on a revision the signer had never been shown, co-signer's field values included.
+  `sign` now also refuses (409 `not_viewed`) when the presented hash is not
+  `envelopes.current_revision_sha256`, under the envelope row lock, which is the case section 13's
+  third round described ("another signer signed while they were reading"). The UI's way out is
+  unchanged. `Verifier._viewed_what_was_signed` compares `document.viewed` against
+  `signer.signed.base_revision_sha256` rather than `presented_sha256`, so a trail written before
+  this is a finding under `signer_rows_match_trail`.
+- **Clinician re-authentication is enforced at both ends**: `validate_definitions` refuses a
+  template whose role allows the `clinician` capacity without `requires_reauth`
+  (`template_definitions_invalid`), and `EnvelopeService.create` sets `requires_reauth` for a
+  clinician signer whatever an already-published version says. The developer guide makes this a
+  requirement; it was convention in `templates/procedure_consent.json`.
+- **The certificate's document-level facts are cross-checked too**: `created_at`, `document_type`,
+  `template_version_id` and the template key and version are compared with the first
+  `envelope.created` (whose `occurred_at` is the creation time), exactly as the per-signer facts are.
+  Verification mirrors the five comparisons as `envelope_row_matches_trail`, and
+  `signer_rows_match_trail` gained `role_key`, `capacity`, `on_behalf_of` and `consent_text_id` --
+  the columns the seal-time check already required to agree.
+- **Sealing validates revocation**: `validate` builds its validation context from the document's own
+  `/DSS` under `revocation_mode="hard-fail"`, so the data a `PAdES-B-LT` seal embeds is actually
+  consulted (`validate_pdf_signature` does not read the DSS by itself, so it never was). New problem
+  strings `certificate_revoked` and `revocation_unknown`; a long-term configuration handed a document
+  with no store reports the latter rather than passing, and `PAdES-B-T` -- the explicit dev and test
+  profile -- keeps soft-fail. Section 5's list of what `validate` must detect gains these two.
+- **`sealed_pages_match_final_revision` compares page resources**: a drawn signature is an image
+  XObject invoked by name and a typed one an embedded font, so a swapped signature image left the
+  content stream byte-identical. Each named image, font and form XObject is digested with every
+  indirect reference resolved, so `finalize`'s renumbering is not a difference and different ink is.
+- **The in-process timestamp authority is unreachable from a real key**: `build_timestamper` refused
+  only when `APP_ENV=prod`, and `APP_ENV` defaults to `dev`, so a KMS deployment that forgot it
+  sealed with a throwaway dev certificate's RFC 3161 time. It now also refuses any non-`local` key
+  backend outside `APP_ENV=test` (`tsa_not_configured`), and `check_production_settings` refuses
+  `APP_ENV=dev` together with `aws_kms` or `s3` at startup.
+- **`check_production_settings` requires `BLOB_S3_BUCKET`** whenever `BLOB_BACKEND=s3`, in any
+  environment: it was a bare `ValueError` from `S3ObjectStore.__init__` at the first blob write, and
+  `esign worker` / `esign verify` catch `ConfigurationError` and `EsignError` only.
+- **Rate limits**: `POST /signing/viewed` is metered under the `present` rule on a key of its own.
+  It is legal repeatedly, and every call re-hashes the revision, re-parses it for its page count and
+  appends `document.viewed`, which has no delete path.
+- **Logging**: `esign serve` passes `log_config=None, access_log=False`. uvicorn's default config
+  gives `uvicorn` and `uvicorn.access` their own handlers with `propagate: False`, so their records
+  never reached the allowlisted root handler, and the access line carries the raw path and query
+  string inside the reserved `event` key.
+
+Fifth round, closing what the fourth left open:
+
+- **Every way the server starts goes through `esign serve`**: `make dev-api` (now
+  `esign serve --port 8000 --reload`, the new flag) and `demo-host/demo.sh` called uvicorn
+  themselves with `--no-access-log`, which drops the raw-URL access line but leaves uvicorn's own
+  error logger on its non-propagating handler, outside `drop_unlisted_keys`. Dropping the log
+  config is the part that matters and it has one home.
+- **The mocked signer API refuses what the real one refuses**: `frontend/src/mocks/db.ts` simulated
+  only the round-3 condition (presented hash != `viewed_sha256`), so the mocked flow and the
+  Playwright specs never saw the refusal that a parallel envelope actually produces -- both hashes
+  name the revision the signer read, and it is the *current* revision that has moved on. The mock
+  now refuses that too, and the case is covered in `App.test.tsx` and in the mocked Playwright run
+  (a co-signer signs while the signer sits on the confirm screen). No UI change was needed:
+  `mustReadAgain` and the return to Review already handle the 409.

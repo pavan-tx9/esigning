@@ -230,3 +230,10 @@ def test_reasons_that_would_misrepresent_the_document_are_refused(sealer: Sealer
     """The reason is rendered by PDF viewers; it does not get to lie about what was signed."""
     with pytest.raises(ValidationFailed):
         sealer.seal(pdf, reason=reason, envelope_id=uuid4())
+
+
+def test_development_on_the_local_key_still_gets_the_in_process_authority(dev_pki: Pki, clock: FixedClock) -> None:
+    """The allowance that remains: ``APP_ENV=dev`` on the dev PKI's own key, offline."""
+    sealer = build_sealer(make_settings(dev_pki, app_env="dev", tsa_url=""), clock)
+    result = sealer.seal(make_pdf(), reason="Envelope completed", envelope_id=uuid4())
+    assert result.timestamp_time == clock.now()

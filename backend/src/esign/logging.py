@@ -211,9 +211,15 @@ def configure_logging(
     every line goes to the current ``sys.stdout`` -- or ``sys.stderr`` with ``stderr=True``, which
     is what the CLI uses so that its own output on stdout stays parseable.
 
-    Records that reach the *stdlib* root logger -- SQLAlchemy, httpx, pypdf, uvicorn -- are
-    formatted through the same processor chain, so the key allowlist covers them too rather than
-    only this module's own callers.
+    Records that reach the *stdlib* root logger -- SQLAlchemy, httpx, pypdf -- are formatted
+    through the same processor chain, so the key allowlist covers them too rather than only this
+    module's own callers. uvicorn is covered only when it is started *without* its default log
+    config: ``uvicorn.LOGGING_CONFIG`` gives ``uvicorn`` and ``uvicorn.access`` their own stdout
+    handlers with ``propagate: False``, and nothing here can reach a record that never arrives. So
+    ``esign serve`` passes ``log_config=None, access_log=False``, and it is the only way the server
+    is started: ``make dev-api`` (with ``--reload``) and ``demo-host/demo.sh`` both go through it
+    rather than calling uvicorn themselves, where ``--no-access-log`` would drop the raw-URL access
+    line but leave uvicorn's error logger writing past the allowlist.
     """
     numeric_level = logging.getLevelNamesMapping().get(level.upper(), logging.INFO)
 

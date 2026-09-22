@@ -22,7 +22,7 @@ from esign.contracts import Sealer, SealValidation
 from esign.sealing import PROBLEMS, Problem, build_sealer
 from tests.conftest import FROZEN_NOW
 from tests.sealing.conftest import Pki, make_pdf, make_settings
-from tests.sealing.helpers import sign_with
+from tests.sealing.helpers import revoke_seal_certificate, sign_with
 
 
 @pytest.fixture
@@ -307,3 +307,62 @@ def test_stripping_the_trailing_newline_is_not_treated_as_tampering(sealer: Seal
 def test_validating_the_same_bytes_twice_gives_the_same_answer(sealer: Sealer, sealed: bytes) -> None:
     first, second = sealer.validate(sealed), sealer.validate(sealed)
     assert first == second
+
+
+# --------------------------------------------------------------------------- revocation
+
+
+def test_a_seal_whose_certificate_was_revoked_before_it_signed_is_refused(
+    sealer: Sealer, dev_pki: Pki, sealed: bytes
+) -> None:
+    """A compromised or superseded seal key. The document is otherwise perfect.
+
+    ``PAdES-B-LT`` embeds revocation information precisely so this question can be answered offline
+    years later. Nothing used to ask it: the validating context carried no CRLs, no OCSP responses
+    and ``soft-fail``, and ``validate_pdf_signature`` does not read the document security store by
+    itself -- so a seal made with a revoked certificate came back ``trusted=True, ok=True``.
+    """
+    revoked = revoke_seal_certificate(dev_pki, sealed, revoked_at=FROZEN_NOW - timedelta(hours=1))
+
+    report = sealer.validate(revoked)
+    assert_failed(report, Problem.CERTIFICATE_REVOKED)
+    # Intact and self-covering: nothing but the revocation data can refuse this document.
+    assert report.intact is True
+    assert report.covers_whole_document is True
+    assert report.trusted is False
+    # "Revoked" is the story, not the generic "untrusted".
+    assert Problem.UNTRUSTED_CHAIN not in report.problems
+
+
+def test_a_long_term_deployment_refuses_a_document_with_no_revocation_data(
+    sealer: Sealer, dev_pki: Pki, pdf: bytes
+) -> None:
+    """Configured for ``PAdES-B-LT``, handed a document with no document security store.
+
+    The signature is intact, trusted and timestamped; what is missing is the evidence needed to say
+    whether the certificate was revoked. For a long-term profile "we could not tell" is a failure,
+    not a pass, because there is no endpoint left to ask years from now.
+    """
+    without_dss = sign_with(dev_pki, pdf)
+    assert b"/DSS" not in without_dss
+
+    report = sealer.validate(without_dss)
+    assert_failed(report, Problem.REVOCATION_UNKNOWN)
+    assert report.intact is True
+    assert report.profile == "PAdES-B-T"
+
+
+def test_a_short_term_deployment_still_accepts_its_own_documents(dev_pki: Pki, clock: FixedClock, pdf: bytes) -> None:
+    """``PAdES-B-T`` is the explicit dev and test profile and carries no revocation data by design.
+
+    SPEC section 5 allows it only as an explicit setting, never as a silent downgrade -- so a
+    deployment that set it gets soft-fail, and one that did not gets ``revocation_unknown`` above.
+    """
+    settings = make_settings(dev_pki, seal_profile="PAdES-B-T")
+    short_term = build_sealer(settings, clock)
+    result = short_term.seal(pdf, reason="Envelope completed", envelope_id=uuid4())
+
+    assert result.profile == "PAdES-B-T"
+    report = short_term.validate(result.sealed_pdf)
+    assert report.problems == ()
+    assert report.ok is True

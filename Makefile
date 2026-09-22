@@ -115,8 +115,11 @@ dev:  ## Run the API and the signing UI together (Ctrl-C stops both)
 	$(MAKE) dev-web & \
 	wait
 
+# Through `esign serve`, not uvicorn directly: it is the one place that drops uvicorn's own log
+# config, whose `uvicorn` and `uvicorn.access` handlers do not propagate to the allowlisted root
+# handler. `--no-access-log` alone silenced the raw-URL line but left the error logger outside it.
 dev-api:  ## API on :8000. Proxy headers are the app's job (TRUSTED_PROXY_CIDRS), not uvicorn's.
-	$(UV) run uvicorn esign.api:app --reload --port 8000 --no-proxy-headers --no-server-header
+	$(UV) run esign serve --port 8000 --reload
 
 dev-web:  ## Signing UI on :5273, proxying /v1 to :8000
 	$(BUN) bun run dev

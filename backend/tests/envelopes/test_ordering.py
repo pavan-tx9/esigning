@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from esign.contracts import Capture, Conflict
-from tests.envelopes.conftest import CTX, HIPAA_PAIR, PROCEDURE_CONSENT, Bench
+from tests.envelopes.conftest import CTX, HIPAA_PAIR, PAGES, PROCEDURE_CONSENT, Bench
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"scribbled signature bytes"
 
@@ -134,8 +134,13 @@ def test_parallel_signers_may_go_in_any_order(bench: Bench, db: Session) -> None
     assert result.status == "completed_pending_seal"
 
 
-def test_a_parallel_signer_sees_a_document_that_moved_under_them(bench: Bench, db: Session) -> None:
-    """The presented hash and the base revision hash diverge, and both are in the trail."""
+def test_a_parallel_signer_whose_document_moved_under_them_must_read_it_again(bench: Bench, db: Session) -> None:
+    """SPEC section 13: the 409 ``not_viewed`` is for "another signer signed while they were reading".
+
+    The witness's signature makes revision 2, which carries the witness's own marks. The patient
+    has only ever been shown revision 1, so their signature must not be stamped onto revision 2:
+    they are refused, re-read the document, and only then sign -- on the bytes they actually saw.
+    """
     host = bench.host(db)
     bench.template(db, host, HIPAA_PAIR)
     bench.consent(db)
@@ -147,9 +152,21 @@ def test_a_parallel_signer_sees_a_document_that_moved_under_them(bench: Bench, d
     bench.ready_to_sign(db, witness)  # both were shown revision 1
 
     bench.service.sign(db, witness, [sig("witness_sig")], CTX)
-    bench.service.sign(db, patient, [sig("patient_sig")], CTX)
+
+    with pytest.raises(Conflict) as seen:
+        bench.service.sign(db, patient, [sig("patient_sig")], CTX)
+    assert seen.value.code == "not_viewed"
+    assert bench.signer_status(db, bench.signer_id(view, "patient")) == "consented"
+
+    # The way out the signing UI owns: fetch the document again, report it read, retry.
+    bench.service.present(db, patient, CTX)
+    bench.service.record_viewed(db, patient, PAGES, CTX)
+    result = bench.service.sign(db, patient, [sig("patient_sig")], CTX)
+    assert result.status == "completed_pending_seal"
 
     signed = [e for e in bench.audit.list(db, "envelope", view.id) if str(e.event_type) == "signer.signed"]
     last = signed[-1]
-    assert last.data["presented_sha256"] == view.presented_sha256.hex()  # type: ignore[union-attr]
-    assert last.data["base_revision_sha256"] != last.data["presented_sha256"]
+    # The patient signed what they read, and it is visibly not revision 1 any more.
+    assert last.data["presented_sha256"] == last.data["base_revision_sha256"]
+    assert last.data["presented_sha256"] != view.presented_sha256.hex()  # type: ignore[union-attr]
+    assert last.data["base_revision_sha256"] == signed[0].document_sha256.hex()  # type: ignore[union-attr]

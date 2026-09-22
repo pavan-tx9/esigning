@@ -92,6 +92,8 @@ The ones a reviewer will look for:
 | `multiple_signatures` | more than one signature; ours is meant to be the only one |
 | `not_a_certification_signature` / `certification_permits_changes` | the wrong kind of signature |
 | `untrusted_chain` | the chain does not reach a configured root |
+| `certificate_revoked` | a certificate in the chain was revoked; the document's own DSS says so |
+| `revocation_unknown` | revocation could not be decided from what the document carries |
 | `timestamp_missing` / `timestamp_invalid` | no trusted time, or one we do not believe |
 | `trust_roots_unavailable` | we could not read the trust roots, so nothing is trusted |
 | `coverage_undetermined` | the change analysis was inconclusive — treated as a failure |
@@ -118,10 +120,14 @@ trust store anyway). That is inherent to PDF signatures, not a gap in this code.
 
 ## Known limits
 
-- Revocation checking during `validate` is `soft-fail`: a B-LT document carries its own revocation
-  data in the DSS, but a B-T document has none to check, and fetching is disabled. Revocation of
-  the seal certificate is therefore an operational control, not something `validate` can prove
-  offline.
+- Revocation checking during `validate` reads the document's own DSS (`DocumentSecurityStore`)
+  and runs `hard-fail` against it: `validate_pdf_signature` does not consult the DSS by itself, so
+  the context has to be built from it. A document with no DSS is `soft-fail` when `SEAL_PROFILE` is
+  `PAdES-B-T` (which carries no revocation data by design) and `revocation_unknown` when a long-term
+  profile is configured. Fetching stays disabled: a validator that reaches the network answers a
+  different question each time it runs, and stops answering once the endpoints are gone. What
+  `validate` still cannot see is a revocation published *after* the DSS was written and never folded
+  into the document -- that remains an operational control.
 - `SealValidation.ok` in `contracts.py` is computed from four booleans and ignores `problems`, so
   problems with no flag of their own (a second signature, an approval signature instead of a
   certification one) are folded into `covers_whole_document`, which is what they really deny: the

@@ -64,6 +64,16 @@ class Problem:
     #: A timestamp is present but does not verify, or its TSA is not trusted.
     TIMESTAMP_INVALID: Final = "timestamp_invalid"
 
+    #: A certificate in the chain was revoked -- and, for a seal, revoked at or before the time the
+    #: timestamp authority attested. A compromised or superseded seal key produces a document that
+    #: is intact, chains to a trusted root, and must still not be believed.
+    CERTIFICATE_REVOKED: Final = "certificate_revoked"
+
+    #: Revocation could not be decided: a long-term document with no document security store, or a
+    #: store that does not cover the chain. The whole point of embedding validation info is that
+    #: this question is answerable offline years later, so "we could not tell" is a failure.
+    REVOCATION_UNKNOWN: Final = "revocation_unknown"
+
     #: The signature dictionary's ``/Location`` is not ``envelope:<id>`` for the envelope this seal
     #: was meant to complete. The binding SPEC section 5 requires is absent or names something else.
     LOCATION_MISMATCH: Final = "location_mismatch"

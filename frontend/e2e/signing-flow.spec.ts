@@ -277,6 +277,66 @@ test("the first of several signers is told the copy comes later; click-to-sign a
   await shot(page, "33-done-waiting-on-others");
 });
 
+/**
+ * A parallel envelope moving on under the signer. The co-signer commits a new revision while this
+ * one is on the confirm screen, so the bytes they read are no longer the bytes the marks would
+ * land on and the service refuses with 409 `not_viewed` (SPEC section 13, fourth round). The UI
+ * owns the way out, because the signer's status is still `consented` and nothing else would send
+ * them back: it drops the document it holds, returns to Review, and the fresh `POST /viewed` that
+ * step already sends is what lets the signature through. The draft survives, so the summary comes
+ * straight back with everything they filled in.
+ */
+test("a co-signer moves the document on: back to review, and the signature then stands", async ({
+  page,
+}) => {
+  const ui = await open(page, "multi");
+  await readEveryPage(ui, 3);
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await agree(ui);
+  await ui.getByRole("radio", { name: /Use my printed name/ }).check();
+  await ui.getByRole("button", { name: "Use this signature" }).click();
+  await ui.getByRole("button", { name: "Add my initials here" }).click();
+  await ui.getByRole("button", { name: "Next" }).click();
+  await ui.getByRole("button", { name: "Skip" }).click();
+  await ui.getByRole("button", { name: "Sign here" }).click();
+  await ui.getByRole("button", { name: "Check your answers" }).click();
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await expect(ui.getByTestId("step-confirm")).toBeVisible();
+
+  // The witness signs. This session still holds the revision it was served and confirmed reading.
+  const frame = page.frames().find((f) => f.url().includes("sign.html"));
+  if (frame === undefined) {
+    throw new Error("the signing UI is not framed");
+  }
+  await frame.evaluate(() => window.__esignMock?.otherSignerSigned("multi"));
+
+  await ui.getByRole("checkbox", { name: /I want to sign/ }).check();
+  await ui.getByRole("button", { name: "Sign document" }).click();
+
+  await expect(ui.getByTestId("review-again")).toBeVisible();
+  await expect(ui.getByTestId("step-review")).toBeVisible();
+  await shot(page, "34-review-again");
+
+  // Reading what it says now is the whole recovery.
+  await readEveryPage(ui, 3);
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await agree(ui);
+  await expect(ui.getByTestId("step-sign-summary")).toBeVisible();
+  await ui.getByRole("button", { name: "Continue" }).click();
+  await ui.getByRole("checkbox", { name: /I want to sign/ }).check();
+  await ui.getByRole("button", { name: "Sign document" }).click();
+  await expect(ui.getByTestId("waiting-on-others")).toBeVisible();
+
+  const record = (await frame.evaluate(() => window.__esignMock?.peek("multi"))) as {
+    signerStatus: string;
+    presentedRevision: number;
+    viewedRevision: number;
+  };
+  expect(record.signerStatus).toBe("signed");
+  expect(record.presentedRevision).toBe(2);
+  expect(record.viewedRevision).toBe(2);
+});
+
 test("a kiosk session ends by asking for the tablet back and forgets everything", async ({
   page,
 }) => {

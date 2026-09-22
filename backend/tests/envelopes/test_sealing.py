@@ -437,6 +437,70 @@ def test_the_certificate_shows_no_reauth_for_a_role_that_does_not_need_one(bench
     assert signer.reauth_method is None
 
 
+def test_a_second_consent_in_another_locale_still_seals(bench: Bench, db: Session) -> None:
+    """Two ordinary signer calls: accept in en-US, switch language, accept again, sign.
+
+    ``accept_consent`` is legal for a signer who is already ``consented`` (SPEC section 9 supports
+    ``?locale=`` and a ``locale`` in the consent body). While the row's ``consent_text_id`` moved on
+    every call and ``consented_at`` kept its first value, the row described one disclosure and the
+    certificate builder's first ``consent.accepted`` another -- and a fully signed envelope could
+    then never be sealed, never be voided, and reported ``ok`` by ``esign verify``.
+    """
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    bench.consent(db)
+    spanish = bench.identity.seed_consent(db, version="2026-09", locale="es-US", body="Divulgacion.")
+    view = bench.create(db, host, PATIENT_CONSENT)
+    signer_id = bench.signer_id(view, "patient")
+    session = bench.session(db, signer_id)
+
+    bench.service.present(db, session, CTX)
+    bench.service.record_viewed(db, session, 3, CTX)
+    bench.service.accept_consent(db, session, "2026-09", CTX)
+    english = db.execute(text("SELECT consent_text_id FROM signers WHERE id = :i"), {"i": signer_id}).scalar_one()
+    bench.clock.advance(30)
+    bench.service.accept_consent(db, session, "2026-09", CTX, locale="es-US")
+    bench.service.sign(db, session, [sig()], CTX)
+
+    # The row still names the disclosure the first consent.accepted recorded.
+    kept = db.execute(text("SELECT consent_text_id FROM signers WHERE id = :i"), {"i": signer_id}).scalar_one()
+    assert kept == english
+    assert kept != spanish.id
+    assert bench.event_types(db, view.id).count("consent.accepted") == 2
+
+    assert bench.service.seal_pending(db, view.id).status == "sealed"
+
+
+def test_a_second_consent_after_a_disclosure_rollover_still_seals(bench: Bench, db: Session) -> None:
+    """SPEC section 13: ``en-US.2026-10`` replaces ``2026-09`` from 1 October.
+
+    The signer consented to the old version; the disclosure rolled over; the client re-posted after
+    a ``consent_version_stale`` recovery. That must not make the envelope permanently unsealable.
+    """
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    bench.consent(db)
+    view = bench.create(db, host, PATIENT_CONSENT)
+    signer_id = bench.signer_id(view, "patient")
+    session = bench.session(db, signer_id)
+
+    bench.service.present(db, session, CTX)
+    bench.service.record_viewed(db, session, 3, CTX)
+    bench.service.accept_consent(db, session, "2026-09", CTX)
+    first = db.execute(text("SELECT consent_text_id FROM signers WHERE id = :i"), {"i": signer_id}).scalar_one()
+
+    rolled = bench.identity.seed_consent(db, version="2026-10", locale=bench.settings.default_locale)
+    bench.clock.advance(60)
+    bench.service.accept_consent(db, session, "2026-10", CTX)
+    bench.service.sign(db, session, [sig()], CTX)
+
+    kept = db.execute(text("SELECT consent_text_id FROM signers WHERE id = :i"), {"i": signer_id}).scalar_one()
+    assert kept == first != rolled.id
+    assert bench.service.seal_pending(db, view.id).status == "sealed"
+    # What the certificate prints is the disclosure the row and the first event agree on.
+    assert bench.documents.last_summary.signers[0].consent_version == "2026-09"
+
+
 def test_a_row_rewritten_between_the_signature_and_the_seal_stops_the_seal(bench: Bench, db: Session) -> None:
     """SPEC section 3 step 7: the certificate is built from the audit trail.
 
@@ -456,3 +520,50 @@ def test_a_row_rewritten_between_the_signature_and_the_seal_stops_the_seal(bench
         bench.service.seal_pending(db, view.id)
     assert seen.value.code == "certificate_evidence_mismatch"
     assert bench.status(db, view.id) == "completed_pending_seal"
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        pytest.param("created_at", "TIMESTAMPTZ '2019-01-01 00:00:00+00'", id="created_at"),
+        pytest.param("document_type", "'hipaa_acknowledgement'", id="document_type"),
+    ],
+)
+def test_a_document_level_row_rewritten_before_the_seal_stops_the_seal(
+    bench: Bench, db: Session, column: str, value: str
+) -> None:
+    """The certificate's own header gets the same cross-check as the per-signer facts.
+
+    "Created", the document type and the template key and version were printed straight from
+    ``envelopes`` and from whatever ``template_versions`` row it pointed at -- all UPDATE-able by
+    the runtime role, in the hours a backing-off seal leaves open, into bytes that can never be
+    corrected. ``envelope.created`` carries all of them.
+    """
+    _host, view = completed(bench, db)
+    db.execute(text(f"UPDATE envelopes SET {column} = {value} WHERE id = :i"), {"i": view.id})
+    db.commit()
+
+    with pytest.raises(IntegrityFailure) as seen:
+        bench.service.seal_pending(db, view.id)
+    assert seen.value.code == "certificate_evidence_mismatch"
+    assert bench.status(db, view.id) == "completed_pending_seal"
+    assert bench.sealer.seal_calls == 0
+
+
+def test_a_repointed_template_version_stops_the_seal(bench: Bench, db: Session) -> None:
+    """``envelopes.template_version_id`` is a mutable pointer at the key and version printed."""
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    bench.consent(db)
+    view = bench.create(db, host, PATIENT_CONSENT)
+    session = bench.session(db, bench.signer_id(view, "patient"))
+    bench.ready_to_sign(db, session)
+    bench.service.sign(db, session, [sig()], CTX)
+    other = bench.template(db, host, HIPAA_PAIR)
+
+    db.execute(text("UPDATE envelopes SET template_version_id = :t WHERE id = :i"), {"t": other, "i": view.id})
+    db.commit()
+
+    with pytest.raises(IntegrityFailure) as seen:
+        bench.service.seal_pending(db, view.id)
+    assert seen.value.code == "certificate_evidence_mismatch"

@@ -92,9 +92,11 @@ fi
 
 # ------------------------------------------------------------------ 4. the API
 step "starting the API on ${API_PORT}"
+# `esign serve` rather than uvicorn directly: it drops uvicorn's log config, so its own loggers
+# propagate to the allowlisted structured handler instead of writing straight to stdout.
 (
   cd backend
-  exec uv run uvicorn esign.api:app --host 127.0.0.1 --port "$API_PORT" --no-proxy-headers --no-server-header
+  exec uv run esign serve --host 127.0.0.1 --port "$API_PORT"
 ) >"$LOG_DIR/api.log" 2>&1 &
 pids+=($!)
 wait_for "$API_URL/healthz" 60 "the API"

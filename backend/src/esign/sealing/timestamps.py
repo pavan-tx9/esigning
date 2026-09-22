@@ -3,9 +3,11 @@
 Production points ``TSA_URL`` at a real RFC 3161 authority. Development and tests have no such
 thing reachable, so the dev PKI's TSA certificate drives an in-process authority instead.
 
-The rule that matters: the in-process authority is only ever reachable from a non-production
-environment running on the local dev key. A production deployment with no TSA configured does not
-quietly seal without a trusted time -- it refuses, and the envelope stays pending.
+The rule that matters, and it is enforced below rather than merely stated: the in-process authority
+is only ever reachable from a non-production environment running on the local dev key, or from the
+test environment (where the offline KMS tests exercise the KMS path). A production deployment with
+no TSA configured does not quietly seal without a trusted time -- it refuses, and the envelope
+stays pending. Neither does a deployment holding a real key that forgot to set ``APP_ENV``.
 """
 
 from __future__ import annotations
@@ -37,8 +39,20 @@ def build_timestamper(settings: Settings, clock: Clock, material: SigningMateria
             code="tsa_not_configured",
         )
 
+    if material.backend != "local" and settings.app_env != "test":
+        # ``APP_ENV`` defaults to ``dev``, so keying the refusal above on ``prod`` alone meant a
+        # deployment with a real KMS key, a real bucket and a missing or misspelled ``APP_ENV``
+        # sealed real documents whose RFC 3161 time was asserted by a throwaway dev certificate --
+        # and ``document.sealed`` records no TSA identity, so the trail could not show it. The
+        # in-process authority is reachable only on the local dev key, or under the test
+        # environment, which is where the offline KMS tests run.
+        raise SealUnavailable(
+            "TSA_URL is required when the seal key is not the local dev PKI",
+            code="tsa_not_configured",
+        )
+
     # Outside production, the dev PKI's authority stands in -- including when the key itself lives
-    # in KMS, which is how the KMS path is exercised without a network.
+    # in KMS under APP_ENV=test, which is how the KMS path is exercised without a network.
     pki = material.dev_pki
     if pki is None:
         try:

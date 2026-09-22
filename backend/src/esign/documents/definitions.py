@@ -119,6 +119,13 @@ def validate_definitions(
         for capacity in role.allowed_capacities:
             if capacity not in _CAPACITIES:
                 problems.append(f"{what}: unknown capacity {capacity!r}")
+        if "clinician" in role.allowed_capacities and not role.requires_reauth:
+            # The developer guide makes this a requirement, not a preference: "Re-authenticate
+            # clinicians at the moment of signing", and its Definition of Done repeats it. A
+            # published template that allows the clinician capacity without re-authentication would
+            # produce clinician signatures with no ``auth.reauthenticated`` anywhere in the trail
+            # and a certificate printing that as normal, so it is refused here.
+            problems.append(f"{what}: a role that allows the clinician capacity must set requires_reauth: true")
         if not isinstance(role.order_index, int) or role.order_index < 0:
             problems.append(f"{what}: order_index must be a non-negative integer")
 

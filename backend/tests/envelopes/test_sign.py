@@ -590,3 +590,55 @@ WITH_VALUES = TemplateSpec(
         field("patient_note", "patient", field_type="text"),
     ),
 )
+
+
+#: A template version that slipped past ``validate_definitions``: the clinician capacity is allowed
+#: and ``requires_reauth`` is false. Published before that check existed, or inserted around it.
+LAX_CLINICIAN = TemplateSpec(
+    key="lax_clinician",
+    document_type="procedure_consent",
+    roles=(role("clinician", "Clinician", ("clinician",), requires_reauth=False),),
+    fields=(field("clinician_sig", "clinician"),),
+)
+
+
+def test_a_clinician_reauthenticates_even_when_the_template_forgot_to_say_so(bench: Bench, db: Session) -> None:
+    """The developer guide requires re-authentication at the moment a clinician signs.
+
+    ``requires_reauth`` defaults to false and was copied straight from the role, so a template
+    allowing the clinician capacity without it produced clinician signatures with no
+    ``auth.reauthenticated`` event and a certificate printing ``reauth_method: None`` as though that
+    were normal. ``POST /v1/templates`` now refuses such a template; this is the second gate, for a
+    version that is already published.
+    """
+    host = bench.host(db)
+    bench.template(db, host, LAX_CLINICIAN)
+    bench.consent(db)
+    view = bench.create(db, host, LAX_CLINICIAN)
+
+    signer = next(s for s in view.signers if s.role_key == "clinician")
+    assert signer.requires_reauth is True
+    session = bench.session(db, signer.id)
+    bench.ready_to_sign(db, session)
+    # And the UI is told, so it can hand off to the host page rather than meeting a 403.
+    assert bench.service.signing_view(db, session).signer.requires_reauth is True
+
+    with pytest.raises(Forbidden) as seen:
+        bench.service.sign(db, session, [sig("clinician_sig")], CTX)
+    assert seen.value.code == "reauth_required"
+
+    bench.reauth(db, session, "sso")
+    result = bench.service.sign(db, session, [sig("clinician_sig")], CTX)
+    assert result.status == "completed_pending_seal"
+    signed = [e for e in bench.audit.list(db, "envelope", result.id) if str(e.event_type) == "signer.signed"][-1]
+    assert signed.data["reauth_used"] is True
+    assert signed.data["reauth_method"] == "sso"
+
+
+def test_a_non_clinician_signer_is_not_given_a_reauth_requirement(bench: Bench, db: Session) -> None:
+    """The gate is the capacity, not the role's name: a witness on a lax role still does not."""
+    host = bench.host(db)
+    bench.template(db, host, HIPAA_PAIR)
+    bench.consent(db)
+    view = bench.create(db, host, HIPAA_PAIR)
+    assert [s.requires_reauth for s in view.signers] == [False, False]

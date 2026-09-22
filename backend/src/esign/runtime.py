@@ -70,6 +70,19 @@ def check_production_settings(settings: Settings) -> None:
     with the dev key while the API container beside it refused to start.
     """
     parse_trusted_proxies(settings.trusted_proxy_cidrs)  # a typo here silently changes every recorded IP
+    if settings.blob_backend == "s3" and not settings.blob_s3_bucket:
+        # Not gated on the environment: the s3 backend has no usable meaning without a bucket in
+        # *any* environment. Left to the backend it surfaces as a bare ValueError at the first
+        # blob write -- from ``esign worker`` or ``esign verify``, which catch ConfigurationError
+        # and EsignError only, so it reached the operator as a traceback instead of a refusal.
+        raise ConfigurationError("refusing to start: BLOB_S3_BUCKET is required when BLOB_BACKEND is s3")
+    if settings.app_env == "dev" and (settings.seal_key_backend == "aws_kms" or settings.blob_backend == "s3"):
+        # A production key or a production bucket with the *default* environment is a deployment
+        # that forgot ``APP_ENV``, and every production rule below -- a real TSA above all -- is
+        # keyed on it. Caught here, at startup, rather than at the first seal.
+        raise ConfigurationError(
+            "refusing to start: APP_ENV=dev with a production key or blob backend; set APP_ENV=prod"
+        )
     if settings.app_env != "prod":
         return
     problems: list[str] = []
