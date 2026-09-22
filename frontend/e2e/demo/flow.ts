@@ -137,10 +137,16 @@ export async function confirmAndSign(frame: FrameLocator): Promise<void> {
   await frame.getByRole("button", { name: "Sign document" }).click();
 }
 
-/** The host page's side of re-authentication: the UI asks, the EHR takes a password. */
+/**
+ * The host page's side of re-authentication: the UI asks, the EHR takes a password.
+ *
+ * The demo runs the service with a re-authentication span, so a confirmation this clinician made
+ * for another document a few minutes ago may still cover this one; the button is then "Confirm
+ * again", and pressing it exercises exactly the same hand-off.
+ */
 export async function reauthenticate(page: Page, frame: FrameLocator): Promise<void> {
   await expect(frame.getByTestId("step-confirm")).toBeVisible();
-  await frame.getByRole("button", { name: "Confirm it's me" }).click();
+  await frame.getByRole("button", { name: /^(Confirm it's me|Confirm again)$/ }).click();
   await expect(frame.getByTestId("reauth-waiting")).toBeVisible();
   await expect(page.locator("#reauth")).toBeVisible();
   await page.getByLabel("Password").fill(PASSWORD);
