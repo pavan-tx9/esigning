@@ -10,7 +10,7 @@ decision at all: it needs counsel, compliance or a purchasing decision, and no a
 close it. Every ⚠️ and 🔵 is collected again in sections 6 and 7 so nobody has to hunt.
 
 Test paths are relative to `backend/` unless they start with `frontend/`. `make check` runs all of
-them: 1810 backend tests, 116 frontend tests, 18 demo-host tests at the time of writing.
+them: 1,957 backend tests, 136 frontend tests and 23 demo-host tests at the time of writing, plus the two Playwright suites (14 specs against the mocks, 12 against the real stack through the demo host) that `make check` does not run.
 
 This document describes the code as it is, not as the spec intends it to be. Where the two differ,
 the entry says so.

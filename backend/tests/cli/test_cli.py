@@ -40,7 +40,12 @@ def test_hosts_consent_and_templates_set_up_a_working_host(world: World, capsys:
 
     headers = {"Authorization": f"Bearer {api_key}"}
     listed = world.client.get("/v1/templates", headers=headers).json()["templates"]
-    assert sorted(t["key"] for t in listed) == ["hipaa_acknowledgement", "patient_consent", "procedure_consent"]
+    assert sorted(t["key"] for t in listed) == [
+        "clinical_order",
+        "hipaa_acknowledgement",
+        "patient_consent",
+        "procedure_consent",
+    ]
 
     # Importing again adds a new published version rather than touching the immutable one.
     assert main(["templates", "import", "--host", host_id], runtime=world.rt) == 0
