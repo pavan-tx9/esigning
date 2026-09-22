@@ -77,6 +77,14 @@ electronically.
   exact bytes, so they can be held against the upload hash in `document.supplied` and against the
   sealed copy in the chart. The renderer is deterministic -- `invariant=1` and no random number
   generator -- because the `Idempotency-Key` on that route hashes the document too.
+
+  Reports are signed from this page, each with its own re-authentication, and deliberately do not
+  join the signing queue above, which the addendum's demo paragraph mentions. The queue exists to
+  show one identity confirmation covering a run of short, near-identical order sign-offs
+  (Addendum 1 C); a twenty-five page report is the document that has to be *read*, and putting it
+  behind a confirmation made for something else would be demonstrating the weakening rather than
+  the containment. Nothing in the service stops it: a host that wants reports in a queue gets the
+  same behaviour by listing them there.
 - **People** (`/people`, staff). The one thing a host may do about a saved signature: remove it
   (`POST /v1/users/{id}/adopted-signature/revoke`). There is no host call to create or read one, so
   staff cannot make a doctor's signature and this page cannot say whether anybody has one.

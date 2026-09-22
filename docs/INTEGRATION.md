@@ -96,6 +96,85 @@ Things worth knowing here:
 - A signer whose capacity is `clinician` always gets `requires_reauth: true`, whatever the
   published template says.
 
+## 1b. Create the envelope from a document you generated
+
+Section 15 of the spec. Some documents cannot come from a template: a report the EHR renders for
+one patient, twenty or thirty pages of their own record, different every time, with a signature
+block at the end. The same route takes those as **multipart** instead of JSON — the PDF in
+`document`, and in `body` the JSON a template envelope would carry minus `template_key`,
+`template_version` and `prefill`, plus the roles the document is signed by and how to find the
+fields.
+
+```sh
+curl -s -X POST $API/v1/envelopes -H "$AUTH" \
+  -H 'Idempotency-Key: report-88120' \
+  -F 'document=@annual-summary.pdf;type=application/pdf' \
+  -F 'body={
+    "document_type": "clinical_report",
+    "patient_ref": "pat-90412",
+    "host_document_ref": "report-88120",
+    "signing_order": "sequential",
+    "signers": [{
+      "role_key": "clinician",
+      "host_user_id": "dr-0431",
+      "display_name": "Dr Priya Raghunathan",
+      "capacity": "clinician"
+    }],
+    "signer_roles": [{
+      "key": "clinician",
+      "label": "Attending physician",
+      "allowed_capacities": ["clinician"],
+      "requires_reauth": true,
+      "order_index": 0
+    }],
+    "fields": {"mode": "named"}
+  }'
+```
+
+The reply is an `EnvelopeView` like the one above, with `source: "host_document"`,
+`template_key` and `template_version` both `null`. Everything after this point — sessions, the
+iframe, viewed-every-page, consent, re-authentication, signing, the seal, webhooks, verification —
+is identical to a template envelope, so sections 2 onwards apply unchanged.
+
+What the service does with the upload, in order: the same hygiene rules a template must pass (no
+encryption, no existing signatures, no JavaScript, XFA, embedded files or launch actions) under
+`MAX_SUPPLIED_DOCUMENT_BYTES` (25 MiB) and `MAX_SUPPLIED_DOCUMENT_PAGES` (200); then the fields;
+then every widget and annotation is flattened away and those bytes become revision 1. The upload
+is stored too, and `document.supplied` records both hashes — so "we showed the signer what you
+sent us" is checkable rather than asserted, and the certificate of completion prints both.
+
+Two ways to say where the signatures go:
+
+- **`{"mode": "named"}`** (the default). The service reads the PDF's own AcroForm widgets and
+  claims the ones named `<role_key>_signature`, `<role_key>_initials`, `<role_key>_date`, or
+  `<role_key>__<field_id>` with an optional type suffix. A report generator that already places a
+  signature block only has to name the widget. Positions come from the widget, `/Rotate` and a
+  non-zero `MediaBox` origin included. **Every role must resolve to at least one `_signature`
+  field**; otherwise the request is refused with `fields_unresolved`, naming the roles that did
+  not resolve and nothing from inside the file. Widgets no role claims are dropped, and none of
+  them survives into revision 1.
+- **`{"mode": "explicit", "fields": [...]}`** — `FieldDef`s with their own rects, for a generator
+  that does not emit an AcroForm. `page` may count from the end (`-1` is the last page), which is
+  what makes a variable page count harmless; it is resolved to a positive page before anything is
+  stored, and a rect outside the page is refused.
+
+Things worth knowing here:
+
+- **Approved document types apply unchanged.** Compliance decides what may be signed
+  electronically, whoever rendered the PDF: a type outside `APPROVED_DOCUMENT_TYPES` is
+  `document_type_not_approved`, the same as for a template.
+- **`Idempotency-Key` covers the document bytes.** A retry has to send the same PDF — keep the
+  rendered bytes rather than re-rendering, unless your renderer is deterministic. The same key
+  with different bytes is a 409 `idempotency_key_reused`, exactly as a changed body is.
+- **`host_document_ref` reaches the audit trail on this path** (it is in `document.supplied`), so
+  it must be opaque like every other host-chosen identifier: `report-88120`, not
+  `annual-summary-alvarez-1962`.
+- **Nothing is stored until every refusal has had its chance.** A document refused for hygiene,
+  for an unresolved role or for its type leaves no blob and no envelope row behind.
+- Field ids are derived from the widget names your generator chose (lowercased, `[a-z0-9_]`), so
+  they come back in the signer-facing payload; the labels a signer reads are built from the role
+  labels in this request, never from inside the file.
+
 ## 2. Open a signing session
 
 Immediately before showing the UI, and once per signer. The body is the host's **attestation** of
