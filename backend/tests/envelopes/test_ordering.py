@@ -40,7 +40,7 @@ def test_each_signer_opens_as_the_one_before_finishes(bench: Bench, db: Session)
 
     patient_session = bench.session(db, patient)
     bench.ready_to_sign(db, patient_session)
-    bench.service.sign(db, patient_session, [sig("patient_sig"), Capture("patient_ack", "click", checked=True)], CTX)
+    bench.service.sign(db, patient_session, [sig("patient_sig"), Capture("patient_ack", checked=True)], CTX)
 
     bench.service.assert_signer_may_start(db, host, view.id, witness)
     with pytest.raises(Conflict):
@@ -73,7 +73,7 @@ def test_a_sequential_envelope_seals_only_after_the_last_signer(bench: Bench, db
     view = bench.create(db, host, PROCEDURE_CONSENT, signing_order="sequential")
 
     for role_key, captures in (
-        ("patient", [sig("patient_sig"), Capture("patient_ack", "click", checked=True)]),
+        ("patient", [sig("patient_sig"), Capture("patient_ack", checked=True)]),
         ("witness", [sig("witness_sig")]),
     ):
         session = bench.session(db, bench.signer_id(view, role_key))

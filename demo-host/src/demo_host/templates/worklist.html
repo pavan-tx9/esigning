@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Worklist · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>Documents to sign</h1>
+    <p class="lead">
+      {% if rows %}
+        These are waiting for you. Opening one starts a signing session and hands the signing
+        service a short-lived token; the token never appears in a link.
+      {% else %}
+        Nothing is waiting for your signature.
+      {% endif %}
+    </p>
+    {% if problem_code %}
+      <p class="notice error" role="alert" data-testid="worklist-problem">
+        That did not work: <code>{{ problem_code }}</code>.
+        {% if problem_code == 'conflict' %}It is not your turn yet, or the document has moved on.{% endif %}
+      </p>
+    {% endif %}
+    {% if unreachable %}
+      <p class="notice warn" role="alert">
+        The signing service did not answer (<code>{{ unreachable }}</code>), so the statuses below may
+        be out of date.
+      </p>
+    {% endif %}
+  </section>
+
+  {% for row in rows %}
+    <section class="card task" data-testid="task" data-template="{{ row.task.template_key }}" data-status="{{ row.my_status }}">
+      <h2>{{ row.task.title }}</h2>
+      <dl class="facts">
+        <div><dt>For</dt><dd>{{ row.patient.name }}</dd></div>
+        <div><dt>Your part</dt><dd>{{ row.signer.role_label }}{% if row.signer.capacity != 'self' %} ({{ row.signer.capacity }}){% endif %}</dd></div>
+        <div><dt>Your status</dt><dd><span class="pill pill-{{ row.my_status }}">{{ row.my_status }}</span></dd></div>
+        <div><dt>Document</dt><dd>{{ row.task.envelope_status|replace('_', ' ') }}</dd></div>
+      </dl>
+      <p class="fine">{{ row.task.note }}</p>
+      {% if row.task.signers|length > 1 %}
+        <ol class="signers">
+          {% for signer in row.task.signers %}
+            <li data-role="{{ signer.role_key }}">
+              {{ signer.role_label }}
+              <span class="pill pill-{{ row.task.signer_status.get(signer.role_key, 'pending') }}">
+                {{ row.task.signer_status.get(signer.role_key, 'pending') }}
+              </span>
+            </li>
+          {% endfor %}
+        </ol>
+      {% endif %}
+      <div class="actions">
+        {% if row.my_status == 'signed' %}
+          <p class="done" data-testid="task-done">You have signed this.</p>
+          {% if row.document %}
+            <a class="button" href="/chart/document/{{ row.document.id }}">See it in the chart</a>
+          {% endif %}
+        {% elif row.my_status == 'declined' %}
+          <p class="done">You chose to sign this on paper. The clinic has been told.</p>
+        {% elif row.task.envelope_status in ['voided', 'expired'] %}
+          <p class="done">This document is no longer open for signature.</p>
+        {% elif row.waiting_for %}
+          <p class="done" data-testid="task-waiting">Waiting for the {{ row.waiting_for|lower }} to sign first.</p>
+        {% else %}
+          <form method="post" action="/tasks/{{ row.task.id }}/open">
+            <button type="submit" data-testid="open-task">Read and sign</button>
+          </form>
+        {% endif %}
+      </div>
+    </section>
+  {% endfor %}
+
+  {% if user.role in ['clinician', 'staff'] %}
+    <section class="card">
+      <h2>Charts</h2>
+      <ul class="plain">
+        {% for patient in patients %}
+          <li><a href="/chart/{{ patient.id }}">{{ patient.name }}</a> · born {{ patient.date_of_birth }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

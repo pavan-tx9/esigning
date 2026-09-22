@@ -40,7 +40,16 @@ SIGNABLE_FIELD_TYPES: Final[frozenset[str]] = frozenset({"signature", "initials"
 
 def parse_field_defs(raw: Any) -> tuple[FieldDef, ...]:
     items = _require_list(raw, "fields")
-    return tuple(_field_def(item, index) for index, item in enumerate(items))
+    fields = tuple(_field_def(item, index) for index, item in enumerate(items))
+    ids = [f.id for f in fields]
+    if len(set(ids)) != len(ids):
+        # The service resolves a capture's target by field id. Two fields sharing one id would
+        # make "whose field is this?" ambiguous, and the answer decides whether a signature is
+        # applied to somebody else's box. The documents module rejects this when the template is
+        # published; refusing it again on the way out means a template that slipped through
+        # cannot be signed against at all.
+        raise ValidationFailed("template declares a duplicate field id", code="template_definitions_invalid")
+    return fields
 
 
 def parse_prefill_fields(raw: Any) -> tuple[PrefillFieldDef, ...]:

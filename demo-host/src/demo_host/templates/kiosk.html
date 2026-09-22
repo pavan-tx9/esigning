@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Clinic tablet · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>Clinic tablet</h1>
+    <p class="lead">
+      Start a signing session for a patient who is here in person, then hand the tablet over. You
+      have to say how you checked who they are: that answer is recorded with the signature and
+      printed on the certificate of completion.
+    </p>
+    {% if problem_code %}
+      <p class="notice error" role="alert">That did not work: <code>{{ problem_code }}</code>.</p>
+    {% endif %}
+  </section>
+
+  {% for row in rows %}
+    <section class="card task" data-testid="kiosk-task" data-template="{{ row.task.template_key }}">
+      <h2>{{ row.task.title }}</h2>
+      <dl class="facts">
+        <div><dt>Patient</dt><dd>{{ row.patient.name }}</dd></div>
+        <div><dt>Signs as</dt><dd>{{ row.signs.display_name }}</dd></div>
+        <div><dt>Status</dt><dd><span class="pill pill-{{ row.status }}">{{ row.status }}</span></dd></div>
+      </dl>
+      {% if row.status == 'signed' %}
+        <p class="done">Already signed.</p>
+      {% else %}
+        <form method="post" action="/kiosk/start" class="kiosk-start">
+          <input type="hidden" name="task_id" value="{{ row.task.id }}" />
+          <fieldset>
+            <legend>How did you check who they are?</legend>
+            {% for check in checks %}
+              <label class="radio">
+                <input type="radio" name="identity_check" value="{{ check }}" {% if loop.first %}checked{% endif %} />
+                {{ identity_check_labels[check] }}
+              </label>
+            {% endfor %}
+          </fieldset>
+          <button type="submit" data-testid="kiosk-start">Hand the tablet over</button>
+        </form>
+      {% endif %}
+    </section>
+  {% endfor %}
+</div>
+{% endblock %}

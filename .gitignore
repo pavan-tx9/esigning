@@ -12,6 +12,8 @@ dist/
 .dev-pki/
 .blobstore/
 .codex-out/
+# `make demo`: the host registration it printed once, and the logs of what it started.
+.demo/
 .DS_Store
 coverage/
 playwright-report/

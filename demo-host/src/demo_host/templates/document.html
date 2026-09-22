@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}{{ document.title }} · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>{{ document.title }}</h1>
+    <p class="lead">{{ patient.name }} · filed {{ document.filed_at.strftime('%Y-%m-%d %H:%M UTC') }}</p>
+    <dl class="facts">
+      <div><dt>Sealed document</dt><dd><code class="hash">{{ document.sealed_sha256 }}</code></dd></div>
+      <div><dt>Template</dt><dd>{{ document.template_key }}</dd></div>
+      <div><dt>Size</dt><dd>{{ '{:,}'.format(document.pdf|length) }} bytes</dd></div>
+    </dl>
+    <div class="actions">
+      <a class="button" href="/chart/document/{{ document.id }}/pdf" data-testid="download-sealed">Download the sealed PDF</a>
+      <form method="post" action="/chart/document/{{ document.id }}/verify">
+        <button type="submit" class="secondary" data-testid="verify">Verify it now</button>
+      </form>
+    </div>
+  </section>
+
+  {% if failure %}
+    <section class="card">
+      <p class="notice error" role="alert">The signing service could not be asked: <code>{{ failure }}</code>.</p>
+    </section>
+  {% endif %}
+
+  {% if report %}
+    <section class="card" data-testid="verification">
+      <h2>Verification</h2>
+      <p class="notice {{ 'ok' if report.complete else 'error' }}" data-testid="verification-result">
+        {% if report.complete %}
+          Verified. The seal, every stored hash and the whole audit chain check out.
+        {% elif report.ok %}
+          Consistent so far, but not complete: this envelope is
+          {{ report.envelope_status|replace('_', ' ') }}.
+        {% else %}
+          Failed. {{ report.problems|length }} problem(s) were found.
+        {% endif %}
+      </p>
+      {% if report.seal %}
+        <dl class="facts">
+          <div><dt>Seal profile</dt><dd>{{ report.seal.profile }}</dd></div>
+          <div><dt>Bytes intact</dt><dd>{{ 'yes' if report.seal.intact else 'no' }}</dd></div>
+          <div><dt>Covers the whole document</dt><dd>{{ 'yes' if report.seal.covers_whole_document else 'no' }}</dd></div>
+          <div><dt>Chain trusted</dt><dd>{{ 'yes' if report.seal.trusted else 'no' }}</dd></div>
+          <div><dt>Timestamp valid</dt><dd>{{ 'yes' if report.seal.timestamp_valid else 'no' }}</dd></div>
+          <div><dt>Signed at</dt><dd>{{ report.seal.signing_time }}</dd></div>
+        </dl>
+      {% endif %}
+      <table>
+        <thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead>
+        <tbody>
+          {% for check in report.checks %}
+            <tr><td>{{ check.name }}</td><td><span class="pill pill-{{ check.status }}">{{ check.status }}</span></td><td><code class="hash">{{ check.detail }}</code></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="fine">
+        Audit chain: {{ report.audit.event_count }} events, head
+        <code class="hash">{{ report.audit.head_hash }}</code>. Blobs re-hashed: {{ report.blobs_checked }}.
+      </p>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

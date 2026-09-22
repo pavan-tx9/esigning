@@ -133,7 +133,7 @@ def test_the_certificate_summary_is_built_from_the_record(bench: Bench, db: Sess
     view = bench.create(db, host, PROCEDURE_CONSENT, signing_order="sequential")
 
     for role_key, captures in (
-        ("patient", [sig(), Capture("patient_ack", "click", checked=True)]),
+        ("patient", [sig(), Capture("patient_ack", checked=True)]),
         ("witness", [sig("witness_sig")]),
     ):
         session = bench.session(db, bench.signer_id(view, role_key))

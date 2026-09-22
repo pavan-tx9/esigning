@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Chart · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>{{ patient.name }}</h1>
+    <p class="lead">Born {{ patient.date_of_birth }} · record {{ patient.mrn }}</p>
+    <p class="fine">
+      Signed documents arrive here by themselves: the signing service sends a webhook when an
+      envelope is sealed, this records system verifies the signature on that webhook, fetches the
+      sealed PDF over the API and files it.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Signed documents</h2>
+    {% if documents %}
+      <ul class="plain documents">
+        {% for document in documents %}
+          <li data-testid="chart-document">
+            <a href="/chart/document/{{ document.id }}">{{ document.title }}</a>
+            <span class="fine">filed {{ document.filed_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p data-testid="chart-empty">Nothing has been signed and sealed yet.</p>
+    {% endif %}
+  </section>
+
+  {% if pending %}
+    <section class="card">
+      <h2>Out for signature</h2>
+      <ul class="plain">
+        {% for task in pending %}
+          <li>{{ task.title }} — {{ task.envelope_status|replace('_', ' ') }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+  {% endif %}
+</div>
+{% endblock %}

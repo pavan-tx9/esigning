@@ -63,7 +63,11 @@ describe("the session schema is SPEC 9, exactly", () => {
         },
       ],
       consent: { version: "2026-09", locale: "en-US", body: "..." },
-      session: { expires_at: "2026-09-21T10:30:00Z", kiosk: false },
+      session: {
+        id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
+        expires_at: "2026-09-21T10:30:00Z",
+        kiosk: false,
+      },
       decline_reasons: [{ code: "prefers_paper", label: "I would rather sign on paper" }],
     };
     expect(sessionSchema.safeParse(specExample).success).toBe(true);

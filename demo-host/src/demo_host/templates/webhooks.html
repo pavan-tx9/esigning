@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Webhooks · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>Webhooks received</h1>
+    <p class="lead">
+      The signing service posts to <code>/webhooks/esign</code> whenever an envelope completes,
+      seals, is declined, is voided or expires. Each delivery carries
+      <code>X-Esign-Signature: t=…,v1=…</code>, which this records system checks against the shared
+      secret before believing a word of it — and refuses if the timestamp is more than five minutes
+      old, so a captured delivery cannot be replayed.
+    </p>
+    <p class="fine">
+      Payloads carry ids, statuses and hashes. There is no name and no record number in one; the
+      sealed PDF itself is fetched afterwards over the authenticated API.
+    </p>
+  </section>
+
+  <section class="card">
+    {% if records %}
+      <table data-testid="webhook-log">
+        <thead><tr><th>Received</th><th>Event</th><th>Signature</th><th>Envelope</th><th>Note</th></tr></thead>
+        <tbody>
+          {% for record in records %}
+            <tr data-testid="webhook-row" data-event="{{ record.event }}" data-verified="{{ 'true' if record.verified else 'false' }}">
+              <td>{{ record.received_at.strftime('%H:%M:%S') }}</td>
+              <td><code>{{ record.event }}</code></td>
+              <td><span class="pill pill-{{ 'passed' if record.verified else 'failed' }}">{{ 'verified' if record.verified else 'rejected' }}</span></td>
+              <td><code class="hash">{{ record.envelope_id }}</code></td>
+              <td class="fine">{{ record.note }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p data-testid="webhook-empty">Nothing has arrived yet.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -325,7 +325,12 @@ describe("re-authentication", () => {
     expect(mockDb.peek("clinician")?.signRequests).toHaveLength(0);
 
     await click("Confirm it's me");
-    expect(host.posted.at(-1)).toEqual({ type: "esign:reauth_required", session_id: null });
+    // The host is told *which* session to re-authenticate: its backend needs the id for the
+    // server-to-server call, and it can refuse a message about a session it did not start.
+    expect(host.posted.at(-1)).toEqual({
+      type: "esign:reauth_required",
+      session_id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
+    });
     expect(screen.getByTestId("reauth-waiting")).toHaveTextContent("Waiting for you to confirm");
 
     // The host page claims it is done, but its backend never attested: not believed.

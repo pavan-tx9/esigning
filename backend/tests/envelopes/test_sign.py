@@ -235,7 +235,7 @@ def advance_to_clinician(bench: Bench, db: Session, view: object) -> SessionInfo
     bench.service.sign(
         db,
         patient,
-        [sig(), Capture(field_id="patient_ack", kind="click", checked=True)],
+        [sig(), Capture(field_id="patient_ack", checked=True)],
         CTX,
     )
     witness = bench.session(db, bench.signer_id(view, "witness"))  # type: ignore[arg-type]
@@ -411,8 +411,8 @@ def test_checkbox_and_text_fields_carry_their_values(bench: Bench, db: Session) 
         session,
         [
             sig(),
-            Capture(field_id="patient_ack", kind="click", checked=True),
-            Capture(field_id="patient_note", kind="typed", text_value="Room 3"),
+            Capture(field_id="patient_ack", checked=True),
+            Capture(field_id="patient_note", text_value="Room 3"),
         ],
         CTX,
     )
@@ -448,7 +448,7 @@ def test_a_checkbox_without_a_value_is_refused(bench: Bench, db: Session) -> Non
             [
                 sig(),
                 Capture(field_id="patient_ack", kind="click"),
-                Capture(field_id="patient_note", kind="typed", text_value="x"),
+                Capture(field_id="patient_note", text_value="x"),
             ],
             CTX,
         )

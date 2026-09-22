@@ -106,6 +106,13 @@ SessionScope = Callable[[], AbstractContextManager[Session]]
 
 _SEAL_REASON = "Certified complete by the e-signing service"
 
+#: Bounds on the two client-supplied strings that reach the sealed document. They match the API's
+#: body limits (``esign.api.schemas.CaptureBody``) deliberately: the service is also driven by the
+#: worker, the CLI and the tests, and the value ends up stamped into bytes that are kept for years,
+#: so the rule lives with the code that stores it rather than only at the HTTP edge.
+_MAX_TYPED_TEXT: Final[int] = 200
+_MAX_TEXT_VALUE: Final[int] = 2000
+
 
 @dataclass(frozen=True)
 class _Loaded:
@@ -876,9 +883,29 @@ class EnvelopeServiceImpl:
 
     def _certificate_summary(self, db: Session, loaded: _Loaded, final_revision_sha: bytes) -> CertificateSummary:
         envelope = loaded.envelope
-        events = self._audit.list(db, "envelope", envelope.id)
-        if not events:
+
+        # The certificate quotes the trail's length and head hash as evidence, and the seal makes
+        # that quotation permanent: there is no delete path and no second seal. So the chain is
+        # re-verified here, before anything is certified. A broken chain is an IntegrityFailure,
+        # which leaves the envelope completed_pending_seal with seal.failed recorded -- pending,
+        # recorded and loud (SPEC section 3), rather than sealed around a false claim.
+        chain = self._audit.verify(db, "envelope", envelope.id)
+        if not chain.ok:
+            log.error(
+                "seal.audit_chain_broken",
+                envelope_id=envelope.id,
+                audit_event_count=chain.event_count,
+                problems=list(chain.problems),
+            )
+            raise IntegrityFailure("the envelope's audit chain does not verify", code="audit_chain_broken")
+        if chain.event_count == 0 or chain.head_hash is None:
             raise IntegrityFailure("the envelope has no audit trail", code="missing_audit_trail")
+
+        if envelope.completed_at is None:
+            # Every path into completed_pending_seal writes completed_at in the same transaction,
+            # so this cannot happen -- and if it does, the honest answer is to refuse rather than
+            # to put the current time on the certificate as though it were the completion time.
+            raise IntegrityFailure("the envelope has no completion time", code="missing_completed_at")
 
         signers = tuple(
             self._certificate_signer(db, loaded, row)
@@ -895,10 +922,10 @@ class EnvelopeServiceImpl:
             presented_sha256=_require_revision(envelope.presented_sha256),
             final_revision_sha256=final_revision_sha,
             created_at=envelope.created_at,
-            completed_at=envelope.completed_at or self._clock.now(),
+            completed_at=envelope.completed_at,
             signers=signers,
-            audit_event_count=len(events),
-            audit_head_hash=events[-1].event_hash,
+            audit_event_count=chain.event_count,
+            audit_head_hash=chain.head_hash,
         )
 
     def _certificate_signer(self, db: Session, loaded: _Loaded, row: repo.SignerRow) -> CertificateSigner:
@@ -972,6 +999,11 @@ class EnvelopeServiceImpl:
         missing = [f.id for f in mine if f.required and f.type != "date_signed" and f.id not in seen]
         if missing:
             raise ValidationFailed("a required field has no capture", code="missing_required_field")
+        if not accepted:
+            # A signature with no marks is not evidence of anything: the bytes that come out are
+            # the bytes that went in, and `signer.signed` would claim a signature the document
+            # does not carry. Reachable whenever every one of this signer's fields is optional.
+            raise ValidationFailed("a signature needs at least one mark", code="no_captures")
         return tuple(accepted)
 
     def _check_one(self, field: FieldDef, capture: Capture) -> Capture:
@@ -989,7 +1021,11 @@ class EnvelopeServiceImpl:
             if capture.kind == "typed":
                 if not capture.typed_text or not capture.typed_text.strip() or capture.image_png is not None:
                     raise ValidationFailed("a typed capture needs text", code="capture_shape_invalid")
-                return Capture(field_id=field.id, kind="typed", typed_text=capture.typed_text.strip())
+                return Capture(
+                    field_id=field.id,
+                    kind="typed",
+                    typed_text=_require_text(capture.typed_text, "capture_shape_invalid", limit=_MAX_TYPED_TEXT),
+                )
             if capture.kind == "click":
                 if capture.image_png is not None or capture.typed_text is not None:
                     raise ValidationFailed("a click capture carries no payload", code="capture_shape_invalid")
@@ -999,12 +1035,21 @@ class EnvelopeServiceImpl:
         if field.type == "checkbox":
             if capture.checked is None:
                 raise ValidationFailed("a checkbox field needs a checked value", code="capture_shape_invalid")
+            if capture.text_value is not None:
+                raise ValidationFailed("a checkbox field takes a checked value", code="capture_shape_invalid")
+            _refuse_signature_payload(capture)
             return Capture(field_id=field.id, checked=capture.checked)
 
         if field.type == "text":
             if capture.text_value is None or not capture.text_value.strip():
                 raise ValidationFailed("a text field needs a value", code="capture_shape_invalid")
-            return Capture(field_id=field.id, text_value=capture.text_value)
+            if capture.checked is not None:
+                raise ValidationFailed("a text field takes a text value", code="capture_shape_invalid")
+            _refuse_signature_payload(capture)
+            return Capture(
+                field_id=field.id,
+                text_value=_require_text(capture.text_value, "capture_shape_invalid", limit=_MAX_TEXT_VALUE),
+            )
 
         raise ValidationFailed("unsupported field type", code="capture_shape_invalid")
 
@@ -1309,6 +1354,22 @@ def _check_on_behalf_of(signer: NewSigner, patient_ref: str) -> None:
         # The schema says on_behalf_of is the envelope's patient_ref. A different value would
         # attribute the signature to somebody who is not on this document.
         raise ValidationFailed("a guardian or proxy acts for this envelope's patient", code="on_behalf_of_mismatch")
+
+
+def _refuse_signature_payload(capture: Capture) -> None:
+    """A checkbox or text capture carries no signature payload -- and, crucially, no ``kind``.
+
+    ``Capture.kind`` is documented as "signature and initials fields only; None for checkbox/text",
+    and the ``signer.signed`` event records ``kind or <the template's field type>``. Accepting a
+    client-supplied ``kind`` here would therefore let the browser decide how the trail says a
+    checkbox was filled ("click" instead of "checkbox"). SPEC section 4: nothing in an audit row
+    comes from client JSON except through validated, typed fields. So the shape is refused rather
+    than ignored, and the trail's capture kind always comes from the template.
+    """
+    if capture.kind is not None:
+        raise ValidationFailed("this field takes no signature kind", code="capture_shape_invalid")
+    if capture.image_png is not None or capture.typed_text is not None:
+        raise ValidationFailed("this field takes no signature payload", code="capture_shape_invalid")
 
 
 def _require_text(value: str, code: str, *, limit: int) -> str:

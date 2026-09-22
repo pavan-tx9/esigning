@@ -72,11 +72,11 @@ export const sessionSchema = z.object({
   fields: z.array(fieldSchema),
   consent: z.object({ version: z.string().min(1), locale: z.string(), body: z.string().min(1) }),
   session: z.object({
+    // The host page is told which session to re-authenticate (`esign:reauth_required`), so this
+    // is required, as SPEC section 9 has it. A response without it is a broken response.
+    id: z.uuid(),
     expires_at: timestamp,
     kiosk: z.boolean(),
-    // Not in the SPEC 9 example, but `esign:reauth_required {session_id}` needs it from
-    // somewhere. Accepted when the server sends it; the flow works without it.
-    id: z.uuid().optional(),
   }),
   decline_reasons: z.array(z.object({ code: z.string().min(1), label: z.string().min(1) })),
 });

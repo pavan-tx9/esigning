@@ -3,12 +3,15 @@
 SHELL := /bin/bash
 BACKEND := backend
 FRONTEND := frontend
+DEMO_HOST := demo-host
 UV := uv --directory $(BACKEND)
+UV_DEMO := uv --directory $(DEMO_HOST)
 BUN := cd $(FRONTEND) &&
 
 .DEFAULT_GOAL := help
 .PHONY: help up down logs psql migrate migrate-status install check check-backend check-frontend \
-        test test-backend test-frontend e2e fmt lint dev dev-api dev-web clean-db
+        check-demo-host test test-backend test-frontend test-demo-host e2e e2e-demo demo fmt lint \
+        dev dev-api dev-web clean-db
 
 help:  ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -40,8 +43,9 @@ clean-db:  ## Destroy the database volume and start again
 	$(MAKE) migrate
 
 # ---------------------------------------------------------------- setup
-install:  ## Install backend and frontend dependencies
+install:  ## Install backend, frontend and demo-host dependencies
 	$(UV) sync
+	$(UV_DEMO) sync
 	$(BUN) bun install
 
 # ---------------------------------------------------------------- migrations
@@ -52,7 +56,7 @@ migrate-status:  ## Show applied and pending migrations
 	$(UV) run python -m esign.migrate --status
 
 # ---------------------------------------------------------------- checks
-check: check-backend check-frontend  ## Everything: ruff, mypy, pytest, and the frontend checks
+check: check-backend check-frontend check-demo-host  ## Everything: ruff, mypy, pytest, and the frontend checks
 
 check-backend:
 	$(UV) run ruff format --check .
@@ -65,7 +69,13 @@ check-frontend:
 	$(BUN) bun run check
 	$(BUN) bun run test
 
-test: test-backend test-frontend  ## Tests only
+check-demo-host:
+	$(UV_DEMO) run ruff format --check .
+	$(UV_DEMO) run ruff check .
+	$(UV_DEMO) run mypy
+	$(UV_DEMO) run pytest
+
+test: test-backend test-frontend test-demo-host  ## Tests only
 
 test-backend:
 	$(UV) run pytest
@@ -73,17 +83,30 @@ test-backend:
 test-frontend:
 	$(BUN) bun run test
 
+test-demo-host:
+	$(UV_DEMO) run pytest
+
 lint:  ## Lint without fixing
 	$(UV) run ruff check .
+	$(UV_DEMO) run ruff check .
 	$(BUN) bun run lint
 
-e2e:  ## Playwright end-to-end specs (starts the dev server itself)
+e2e:  ## Playwright specs against the mocked API (starts the dev server itself)
 	$(BUN) bun run e2e
+
+e2e-demo:  ## Playwright specs against the real stack through the demo host
+	$(BUN) bunx playwright test -c playwright.demo.config.ts
 
 fmt:  ## Format and autofix
 	$(UV) run ruff format .
 	$(UV) run ruff check --fix .
+	$(UV_DEMO) run ruff format .
+	$(UV_DEMO) run ruff check --fix .
 	$(BUN) bun run check:fix
+
+# ---------------------------------------------------------------- the demo
+demo:  ## Everything a human needs to click through: database, API, worker, UI and the stand-in EHR
+	@bash $(DEMO_HOST)/demo.sh
 
 # ---------------------------------------------------------------- dev servers
 dev:  ## Run the API and the signing UI together (Ctrl-C stops both)

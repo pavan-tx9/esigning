@@ -1,11 +1,15 @@
 import { defineConfig, devices } from "@playwright/test";
 
 /**
- * End-to-end runs drive the real signing UI against the real API. The integration step adds the
- * specs and the demo host; this config is the scaffold they land in.
+ * The signing UI in a real browser, against the MSW mocks, through the dev harness that plays the
+ * host page. Fast, and needs nothing but this project.
+ *
+ * `e2e/demo/` is the other half -- the same UI against the real API through the stand-in EHR --
+ * and is run by `playwright.demo.config.ts` (`make e2e-demo`), which brings that stack up itself.
  */
 export default defineConfig({
   testDir: "./e2e",
+  testIgnore: ["demo/**"],
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,

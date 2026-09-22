@@ -34,7 +34,7 @@ export type InboundMessage = z.infer<typeof initSchema> | z.infer<typeof reauthD
 
 export type OutboundMessage =
   | { type: "esign:ready" }
-  | { type: "esign:reauth_required"; session_id: string | null }
+  | { type: "esign:reauth_required"; session_id: string }
   | { type: "esign:signed" }
   | { type: "esign:sealed" }
   | { type: "esign:declined" }

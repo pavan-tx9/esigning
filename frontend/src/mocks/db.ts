@@ -33,21 +33,86 @@ export type Scenario = keyof typeof SCENARIOS;
 
 export const tokenFor = (scenario: Scenario) => `est_mock_${scenario}`;
 
+/**
+ * The disclosure the real service ships (`backend/src/esign/identity/consent/en-US.2026-09.txt`),
+ * headings, bullets, line wrapping and all. A mock with four tidy paragraphs was hiding the fact
+ * that the stored text is structured and had to be laid out rather than printed.
+ */
 export const CONSENT = {
   version: "2026-09",
   locale: "en-US",
-  body: [
-    "You are being asked to sign this document electronically instead of on paper. Your electronic signature has the same legal effect as a handwritten one.",
-    "You do not have to agree. You can ask for a paper copy to read and sign instead, at no cost, by telling a member of staff. You can also withdraw this agreement at any time before you sign by choosing to sign on paper.",
-    "To read and keep your signed copy you need a device that can open PDF files. After signing, you can save a copy from this page, and the clinic can give you a printed copy on request.",
-    "This agreement applies only to this document.",
-  ].join("\n\n"),
+  body: `# Agreement to sign electronically
+
+Before you sign, please read this. It explains what you are agreeing to, and how to sign on paper
+instead if you would rather.
+
+## What you are agreeing to
+
+You are agreeing to receive this document electronically and to sign it with an electronic
+signature. Your electronic signature has the same legal effect as a signature in ink.
+
+This agreement covers only the document in front of you now. If you are asked to sign something
+else later, you will be asked again.
+
+## You can sign on paper instead
+
+You do not have to sign electronically. At any point before you sign, you can choose to sign on
+paper instead. Select "I would rather sign on paper", or tell a member of staff, and this signing
+session will end. No one will treat you differently for asking, and your care is not affected.
+
+## Withdrawing your agreement
+
+You can withdraw this agreement at any time before you sign, by choosing to sign on paper or by
+closing this window without signing. Withdrawing costs nothing.
+
+Once you have signed, the signed document is part of your record and cannot be withdrawn. If you
+believe you signed something in error, tell your care team: they can correct the record by issuing
+a replacement document.
+
+## Getting a copy
+
+When everyone has signed, you can download a copy of the signed document from this screen. The
+copy includes a certificate showing who signed, when, and how their identity was established.
+
+You can also ask for a paper copy at any time, at no charge, by contacting the clinic or health
+system that asked you to sign. Your copy stays available through your patient record.
+
+## What you need to sign electronically
+
+To read and sign this document, you need:
+
+- a device with an up-to-date web browser and internet access,
+- the ability to display and read a PDF document,
+- a screen and either a touchscreen, a mouse or a keyboard, so you can draw or type your
+  signature, and
+- somewhere to save or print a copy, if you would like to keep one yourself.
+
+If your device cannot do one of these things, ask staff for a paper copy instead.
+
+## Keeping your details current
+
+If your contact details change, update them with the clinic or health system in the usual way.
+This service does not hold your contact details separately, and does not send you email.
+
+## Questions
+
+If anything here is unclear, ask a member of staff before you sign. You can stop at any point.
+`,
 };
 
+/**
+ * Exactly the list the service sends (`contracts.DECLINE_REASON_CODES` with the labels from
+ * `api/schemas.py`). The mock used to invent codes of its own, which meant the UI was never tried
+ * against the real ones.
+ */
 export const DECLINE_REASONS = [
   { code: "prefers_paper", label: "I would rather sign on paper" },
-  { code: "has_questions", label: "I have questions I want answered first" },
-  { code: "not_my_document", label: "This document isn't meant for me" },
+  { code: "needs_more_time", label: "I need more time to read this" },
+  { code: "disagrees_with_terms", label: "I do not agree with what it says" },
+  { code: "needs_interpreter", label: "I need an interpreter" },
+  { code: "incorrect_information", label: "Some of the information is wrong" },
+  { code: "not_the_right_signer", label: "I am not the right person to sign this" },
+  { code: "wants_to_ask_a_question", label: "I want to ask a question first" },
   { code: "other", label: "Another reason" },
 ];
 
@@ -214,7 +279,11 @@ export function sessionBody(record: MockRecord) {
     other_signers: others,
     fields: fieldsFor(record).map(({ role: _role, ...field }) => field),
     consent: CONSENT,
-    session: { expires_at: iso(record.sessionExpiresAt), kiosk: record.scenario === "kiosk" },
+    session: {
+      id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
+      expires_at: iso(record.sessionExpiresAt),
+      kiosk: record.scenario === "kiosk",
+    },
     decline_reasons: DECLINE_REASONS,
   };
 }

@@ -1,7 +1,35 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { Button, CheckRow, Notice, Sheet, StepScreen } from "@/components/ui";
+import { type DisclosureBlock, parseDisclosure } from "@/lib/disclosure";
 import { isNetworkError, postConsent, type SigningSession, signingKeys } from "@/lib/signing-api";
+
+const blockKey = (block: DisclosureBlock) =>
+  (block.kind === "list" ? block.items.join(" ") : block.text).slice(0, 48);
+
+/**
+ * One block of the stored disclosure. The text is shown exactly as it is stored; only the marker
+ * that said what kind of block it is has been taken off.
+ */
+function Block({ block }: { block: DisclosureBlock }) {
+  if (block.kind === "heading") {
+    return block.level === 2 ? (
+      <h3 className="pt-2 font-semibold text-ink-900 text-lg">{block.text}</h3>
+    ) : (
+      <h4 className="pt-1 font-semibold text-ink-900">{block.text}</h4>
+    );
+  }
+  if (block.kind === "list") {
+    return (
+      <ul className="ml-5 list-disc space-y-1">
+        {block.items.map((item) => (
+          <li key={item.slice(0, 48)}>{item}</li>
+        ))}
+      </ul>
+    );
+  }
+  return <p>{block.text}</p>;
+}
 
 interface ConsentStepProps {
   session: SigningSession;
@@ -23,10 +51,7 @@ export function ConsentStep({ session, onContinue, onPreferPaper }: ConsentStepP
     },
   });
 
-  const paragraphs = session.consent.body
-    .split(/\n\s*\n/)
-    .map((paragraph) => paragraph.trim())
-    .filter((paragraph) => paragraph !== "");
+  const blocks = parseDisclosure(session.consent.body);
 
   return (
     <StepScreen
@@ -41,11 +66,13 @@ export function ConsentStep({ session, onContinue, onPreferPaper }: ConsentStepP
     >
       <Sheet>
         <h2 className="text-ink-900 text-xl">Electronic signature disclosure</h2>
-        <div lang={session.consent.locale} className="mt-3 space-y-3 text-ink-700 leading-relaxed">
-          {paragraphs.map((paragraph) => (
-            <p key={paragraph.slice(0, 48)} className="whitespace-pre-line">
-              {paragraph}
-            </p>
+        <div
+          lang={session.consent.locale}
+          data-testid="disclosure"
+          className="mt-3 space-y-3 text-ink-700 leading-relaxed"
+        >
+          {blocks.map((block, index) => (
+            <Block key={`${block.kind}:${index}:${blockKey(block)}`} block={block} />
           ))}
         </div>
         <p className="mt-4 text-ink-500 text-sm">Version {session.consent.version}</p>

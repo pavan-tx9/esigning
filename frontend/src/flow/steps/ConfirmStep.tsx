@@ -129,7 +129,7 @@ export function ConfirmStep({
   const startReauth = () => {
     sign.reset();
     setReauth({ status: "waiting", since: Date.now() });
-    host.post({ type: "esign:reauth_required", session_id: session.session.id ?? null });
+    host.post({ type: "esign:reauth_required", session_id: session.session.id });
   };
 
   const submit = () => {

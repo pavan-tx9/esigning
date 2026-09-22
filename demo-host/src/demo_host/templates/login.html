@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>Sign in</h1>
+    <p class="lead">
+      Pick somebody from the list below and use the demo password. Everyone here has a worklist of
+      documents waiting to be signed.
+    </p>
+    {% if failed %}
+      <p class="notice error" role="alert">That username and password did not match. The password is
+      <code>{{ config.password }}</code>.</p>
+    {% endif %}
+    <form method="post" action="/login" class="signin">
+      <label for="username">Username</label>
+      <input id="username" name="username" list="usernames" autocomplete="username" required autofocus />
+      <datalist id="usernames">
+        {% for person in users %}<option value="{{ person.username }}"></option>{% endfor %}
+      </datalist>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" value="{{ config.password }}" required />
+      <button type="submit">Sign in</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Who you can be</h2>
+    <table>
+      <thead><tr><th>Username</th><th>Name</th><th>Role</th><th>Notes</th></tr></thead>
+      <tbody>
+        {% for person in users %}
+          <tr>
+            <td><code>{{ person.username }}</code></td>
+            <td>{{ person.display_name }}</td>
+            <td>{{ person.role }}</td>
+            <td>
+              {{ person.job_title }}
+              {% if person.role == 'clinician' %}Signs in a professional capacity, so the signing UI
+              will ask this records system to confirm who they are again before the signature is taken.{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="fine">The password for all of them is <code>{{ config.password }}</code>. A real records
+    system would not have one of these.</p>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>{% block title %}Demo EHR{% endblock %}</title>
+    <link rel="stylesheet" href="/static/demo.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <header class="bar">
+      <a class="brand" href="{{ '/worklist' if signed_in else '/' }}">
+        <span class="mark" aria-hidden="true">EHR</span>
+        <span>Riverside Clinic <em>demo records system</em></span>
+      </a>
+      {% if signed_in %}
+        <nav aria-label="Main">
+          <a href="/worklist">Worklist</a>
+          {% if user.patient_id %}<a href="/chart/{{ user.patient_id }}">Chart</a>{% endif %}
+          {% if user.role == 'staff' %}<a href="/kiosk">Clinic tablet</a>{% endif %}
+          <a href="/webhooks">Webhooks</a>
+          <form method="post" action="/logout"><button type="submit" class="link">Sign out</button></form>
+        </nav>
+        <p class="who">{{ user.display_name }}{% if user.job_title %} · {{ user.job_title }}{% endif %}</p>
+      {% endif %}
+    </header>
+    <main>{% block main %}{% endblock %}</main>
+    <footer>
+      <p>
+        This is a stand-in for an EHR, built to exercise the signing service end to end. The people,
+        the charts and the clinic are invented. Nothing here is a product.
+      </p>
+    </footer>
+  </body>
+</html>

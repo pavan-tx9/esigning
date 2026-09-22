@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title }} · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack"
+     id="esign"
+     data-frame-src="{{ frame_src }}"
+     data-origin="{{ esign_origin }}"
+     data-token-url="/sign/{{ task.id }}/token"
+     data-reauth-url="/sign/{{ task.id }}/reauth"
+     data-status-url="/sign/{{ task.id }}/status"
+     data-kiosk="{{ 'true' if kiosk else 'false' }}">
+
+  <section class="card">
+    <h1>{{ task.title }}</h1>
+    <p class="lead">
+      {% if kiosk %}
+        Clinic tablet. {{ patient.name }} is signing in front of {{ user.display_name }}; identity
+        checked by {{ kiosk_check|lower }}. The signature is attributed to the patient, never to the
+        member of staff holding the tablet.
+      {% else %}
+        You are signing as {{ user.display_name }} — {{ signer.role_label|lower }}{% if signer.capacity != 'self' %}, in the capacity of {{ signer.capacity }}{% endif %}.
+      {% endif %}
+    </p>
+    <p class="fine">
+      The panel below is the signing service, embedded from {{ esign_origin }}. It is a separate
+      application: this page cannot read inside it, and it cannot read this page. They exchange
+      four or five messages and nothing else.
+    </p>
+  </section>
+
+  <div class="frame-shell">
+    <iframe
+      id="frame"
+      title="Sign {{ task.title }}"
+      src="{{ frame_src }}"
+      allow="clipboard-write"
+      referrerpolicy="no-referrer"></iframe>
+  </div>
+
+  <!-- Step 5: the signing service cannot re-authenticate anybody. It asks us to. -->
+  <section class="card reauth" id="reauth" hidden>
+    <h2>Confirm it's you</h2>
+    <p>
+      You are signing in a professional capacity, so the records system is asking for your password
+      again before the signature is taken.
+    </p>
+    <form id="reauth-form" class="signin">
+      <label for="reauth-password">Password</label>
+      <input id="reauth-password" name="password" type="password" autocomplete="current-password" />
+      <div class="actions">
+        <button type="submit" data-testid="reauth-confirm">Confirm</button>
+        <button type="button" class="secondary" id="reauth-cancel">Not now</button>
+      </div>
+      <p class="notice error" id="reauth-error" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <section class="card outcome" id="outcome" hidden>
+    <h2 id="outcome-title"></h2>
+    <p id="outcome-detail"></p>
+    <div class="actions" id="outcome-actions"></div>
+    {% if kiosk %}
+      <form method="post" action="/kiosk/finish">
+        <input type="hidden" name="task_id" value="{{ task.id }}" />
+        <button type="submit" data-testid="kiosk-finish">The tablet is back with me</button>
+      </form>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Messages between this page and the signing service</h2>
+    <p class="fine">Every message that crossed the iframe boundary, in order. This panel is here so
+    a person can watch the protocol; a real records system would not show it.</p>
+    <ol id="log" class="log" aria-live="polite"></ol>
+  </section>
+</div>
+<script src="/static/embed.js" defer></script>
+{% endblock %}

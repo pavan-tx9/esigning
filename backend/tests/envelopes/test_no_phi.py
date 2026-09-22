@@ -65,7 +65,7 @@ def drive_everything(bench: Bench, db: Session) -> Any:
         prefill={"visit_date": PREFILL_VALUE},
     )
     for role_key, captures in (
-        ("patient", [Capture("patient_sig", "drawn", image_png=PNG), Capture("patient_ack", "click", checked=True)]),
+        ("patient", [Capture("patient_sig", "drawn", image_png=PNG), Capture("patient_ack", checked=True)]),
         ("witness", [Capture("witness_sig", "drawn", image_png=PNG)]),
         ("clinician", [Capture("clinician_sig", "drawn", image_png=PNG)]),
     ):
