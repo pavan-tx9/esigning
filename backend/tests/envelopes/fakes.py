@@ -32,6 +32,10 @@ from esign.audit.events import validate_event_data
 from esign.clock import Clock
 from esign.contracts import (
     Actor,
+    AdoptedRevokeReason,
+    AdoptedSignature,
+    AdoptedSignatureKind,
+    ArchiveCoverSummary,
     AuditEvent,
     AuthContext,
     AuthMethod,
@@ -48,6 +52,7 @@ from esign.contracts import (
     KioskContext,
     NotFound,
     PrefillFieldDef,
+    ReauthEvidence,
     RequestContext,
     SealResult,
     SealUnavailable,
@@ -382,6 +387,11 @@ class FakeDocumentService:
         self.last_summary = summary
         return b"%PDF-certificate " + summary.envelope_id.bytes + summary.audit_head_hash
 
+    def build_archive_cover(self, summary: ArchiveCoverSummary) -> bytes:
+        # TODO(addendum-1 A, paper archives): a deterministic pseudo cover page.
+        _ = summary
+        raise NotImplementedError("Addendum 1 A (paper archives): FakeDocumentService.build_archive_cover")
+
     def page_count(self, pdf: bytes) -> int:
         return self.pages + (1 if b"% certificate" in pdf else 0)
 
@@ -518,9 +528,14 @@ class FakeIdentityService:
         kiosk: KioskContext | None,
         ctx: RequestContext,
     ) -> tuple[str, SessionInfo]:
-        envelope_id = (
-            db.execute(text("SELECT envelope_id FROM signers WHERE id = :id"), {"id": signer_id}).one().envelope_id
-        )
+        signer_row = db.execute(
+            text(
+                "SELECT s.envelope_id AS envelope_id, s.host_user_id AS host_user_id, e.host_id AS host_id "
+                "FROM signers s JOIN envelopes e ON e.id = s.envelope_id WHERE s.id = :id"
+            ),
+            {"id": signer_id},
+        ).one()
+        envelope_id = signer_row.envelope_id
         session_id = new_id()
         expires_at = self._clock.now() + timedelta(seconds=self._settings.session_ttl_seconds)
         self.revoke_sessions(db, signer_id)
@@ -544,6 +559,7 @@ class FakeIdentityService:
                 "expires": expires_at,
             },
         )
+        host_id = signer_row.host_id
         info = SessionInfo(
             id=session_id,
             signer_id=signer_id,
@@ -551,6 +567,8 @@ class FakeIdentityService:
             auth=auth,
             kiosk=kiosk,
             expires_at=expires_at,
+            host_id=host_id if isinstance(host_id, UUID) else UUID(str(host_id)),
+            host_user_id=str(signer_row.host_user_id),
         )
         self._sessions[session_id] = _SessionRecord(info=info)
         return f"est_{session_id}", info
@@ -594,10 +612,10 @@ class FakeIdentityService:
         )
         return next(record.info for record in self._sessions.values() if record.info.id == session_id)
 
-    def fresh_reauth(self, db: Session, session_id: UUID) -> AuthContext | None:
+    def fresh_reauth(self, db: Session, session_id: UUID) -> ReauthEvidence | None:
         row = db.execute(
             text(
-                "SELECT method, auth_time, attested_at FROM reauth_attestations "
+                "SELECT id, method, auth_time, attested_at FROM reauth_attestations "
                 "WHERE session_id = :id ORDER BY attested_at DESC LIMIT 1"
             ),
             {"id": session_id},
@@ -607,7 +625,38 @@ class FakeIdentityService:
         age = (self._clock.now() - row.attested_at.astimezone(UTC)).total_seconds()
         if age > self._settings.reauth_max_age_seconds:
             return None
-        return AuthContext(method=cast(AuthMethod, str(row.method)), auth_time=row.auth_time.astimezone(UTC))
+        return ReauthEvidence(
+            attestation_id=row.id if isinstance(row.id, UUID) else UUID(str(row.id)),
+            method=cast(AuthMethod, str(row.method)),
+            auth_time=row.auth_time.astimezone(UTC),
+            scope="session",
+        )
+
+    # -- adopted signatures (Addendum 1 B) ----------------------------------
+    def get_adopted_signature(self, db: Session, *, host_id: UUID, host_user_id: str) -> AdoptedSignature | None:
+        # TODO(addendum-1 B, adopted signatures): real rows in adopted_signatures, like the sessions.
+        _ = (db, host_id, host_user_id)
+        raise NotImplementedError("Addendum 1 B (adopted signatures): FakeIdentityService.get_adopted_signature")
+
+    def adopt_signature(
+        self,
+        db: Session,
+        session_id: UUID,
+        *,
+        kind: AdoptedSignatureKind,
+        image_sha256: bytes | None = None,
+        typed_text: str | None = None,
+    ) -> AdoptedSignature:
+        # TODO(addendum-1 B, adopted signatures)
+        _ = (db, session_id, kind, image_sha256, typed_text)
+        raise NotImplementedError("Addendum 1 B (adopted signatures): FakeIdentityService.adopt_signature")
+
+    def revoke_adopted_signature(
+        self, db: Session, *, host_id: UUID, host_user_id: str, reason: AdoptedRevokeReason
+    ) -> AdoptedSignature | None:
+        # TODO(addendum-1 B, adopted signatures)
+        _ = (db, host_id, host_user_id, reason)
+        raise NotImplementedError("Addendum 1 B (adopted signatures): FakeIdentityService.revoke_adopted_signature")
 
 
 # --------------------------------------------------------------------------- log capture

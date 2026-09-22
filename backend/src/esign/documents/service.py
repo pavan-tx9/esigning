@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from esign.config import Settings
 from esign.contracts import (
+    ArchiveCoverSummary,
     Capture,
     CertificateSummary,
     Clock,
@@ -106,6 +107,11 @@ class PdfDocumentService:
             size_bytes=len(out),
         )
         return out
+
+    def build_archive_cover(self, summary: ArchiveCoverSummary) -> bytes:
+        # TODO(addendum-1 A, paper archives): one page placed before the scan; see the contract.
+        _ = summary
+        raise NotImplementedError("Addendum 1 A (paper archives): DocumentService.build_archive_cover")
 
     def page_count(self, pdf: bytes) -> int:
         """Pages in a PDF this service produced (a prepared, stamped or finalized revision)."""

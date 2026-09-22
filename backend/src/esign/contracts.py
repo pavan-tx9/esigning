@@ -5,6 +5,10 @@ consumes these types and nothing else from a sibling module. Do not change a sig
 without updating docs/SPEC.md; module agents must not edit this file at all -- if a contract
 is wrong or missing something, say so in your report.
 
+Addendum 1 (docs/SPEC-ADDENDUM-1.md) added paper archives, adopted signatures and the
+re-authentication span. Its types and methods are marked ``Addendum 1`` below; migration
+``0700_addendum_1.sql`` is their schema.
+
 Conventions:
 - All hashes are raw 32-byte SHA-256 digests (``bytes``), hex only at API and log boundaries.
 - All datetimes are timezone-aware UTC. Time comes from ``Clock``, never from ``datetime.now``.
@@ -16,7 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Final, Literal, Protocol
 from uuid import UUID
@@ -177,8 +181,21 @@ class TemplatePdfInfo:
 
 # --------------------------------------------------------------------------- documents (esign.documents)
 
-CaptureKind = Literal["drawn", "typed", "click"]
+#: ``adopted`` (Addendum 1 B) applies a signature the signer saved in an earlier session. The
+#: client sends the saved signature's id and nothing else; the envelope service resolves the stored
+#: image or text and records the capture as ``adopted`` with that id, so the trail says which saved
+#: signature was applied rather than a ``drawn``/``typed`` the client could have chosen.
+CaptureKind = Literal["drawn", "typed", "click", "adopted"]
 SealProfile = Literal["PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA"]
+
+#: Addendum 1 A. ``electronic`` is everything the base spec describes; ``paper_archive`` is a scan
+#: of a document signed in ink, filed by the host with an attestation and sealed like any other.
+EnvelopeKind = Literal["electronic", "paper_archive"]
+
+#: Addendum 1 C. ``session``: the attestation was made for the session the signature happened in.
+#: ``span``: it was borrowed from another session of the same user on the same host, within
+#: ``REAUTH_SPAN_SECONDS`` of its ``auth_time``.
+ReauthScope = Literal["session", "span"]
 
 
 @dataclass(frozen=True)
@@ -194,14 +211,22 @@ class Capture:
     would let the client choose what the audit trail says. The constructor refuses the mixture, so
     the mistake cannot be written; whether a given field takes a given shape is the envelope
     service's decision, made against the template.
+
+    Addendum 1 B: an ``adopted`` capture carries ``adopted_signature_id`` and, on the wire, nothing
+    else. The envelope service checks the saved signature belongs to this signer's
+    ``(host_id, host_user_id)``, is not revoked, and is not being used from a kiosk session, then
+    fills ``image_png`` or ``typed_text`` from the stored row before stamping. A client-supplied
+    payload next to ``adopted_signature_id`` is refused at the API edge; here only the pairing is
+    enforced, because the constructor cannot tell who filled the payload.
     """
 
     field_id: str
     kind: CaptureKind | None = None  # signature and initials fields only; None for checkbox/text
-    image_png: bytes | None = None  # sanitized PNG, drawn only
-    typed_text: str | None = None  # typed only
+    image_png: bytes | None = None  # sanitized PNG, drawn or adopted(drawn)
+    typed_text: str | None = None  # typed or adopted(typed)
     checked: bool | None = None  # checkbox fields
     text_value: str | None = None  # text fields
+    adopted_signature_id: UUID | None = None  # adopted only, and required for it
 
     def __post_init__(self) -> None:
         has_signature_payload = self.kind is not None or self.image_png is not None or self.typed_text is not None
@@ -212,6 +237,8 @@ class Capture:
             raise ValueError("a signature payload needs a kind")
         if self.checked is not None and self.text_value is not None:
             raise ValueError("a capture carries a checked value or a text value, not both")
+        if (self.kind == "adopted") != (self.adopted_signature_id is not None):
+            raise ValueError("an adopted capture names the saved signature, and only an adopted capture does")
 
     @property
     def is_signature(self) -> bool:
@@ -245,17 +272,65 @@ class CertificateSigner:
     user_agent: str | None
     kiosk_staff_user_id: str | None = None
     kiosk_identity_check: str | None = None
+    # Addendum 1 C. Both come from ``signer.signed`` (``reauth_scope``, and ``reauth_at`` is the
+    # attestation's ``auth_time``); ``None`` for a role that does not re-authenticate. The
+    # certificate prints "re-authenticated at <reauth_at> for this document" for ``session`` and
+    # "... in an earlier session, N seconds before signing" for ``span``.
+    reauth_scope: ReauthScope | None = None
+    reauth_at: datetime | None = None
+    # Addendum 1 B. Set when the signer applied a saved signature: ``signer.signed`` carries the
+    # id, ``adopted_at`` is that row's ``created_at``, so the certificate can say "signed with a
+    # saved signature adopted on <date>".
+    adopted_signature_id: UUID | None = None
+    adopted_at: datetime | None = None
+
+
+#: Addendum 1 A. What the attesting staff member says about the scan. ``true_copy`` is the only
+#: statement there is: "this scan is a complete and accurate copy of the paper document".
+AttestationStatement = Literal["true_copy"]
+OriginalDisposition = Literal["retained", "returned_to_signer", "destroyed_per_policy"]
+
+
+@dataclass(frozen=True)
+class PaperSigner:
+    """Who signed the paper, as the host states it. Printed on the cover page and the certificate;
+    stored in ``envelopes.attestation``; never in audit data (``archive.attested`` records the
+    count only)."""
+
+    display_name: str
+    capacity: Capacity
+
+
+@dataclass(frozen=True)
+class Attestation:
+    """Addendum 1 A: the host's attestation for a paper archive. The staff member is identified
+    by an opaque ``staff_user_id`` (``is_opaque_id``), which is what reaches the audit trail; the
+    display name is for the cover page and certificate only."""
+
+    staff_user_id: str
+    staff_display_name: str
+    statement: AttestationStatement
+    original_disposition: OriginalDisposition
+    paper_signers: tuple[PaperSigner, ...]
 
 
 @dataclass(frozen=True)
 class CertificateSummary:
     """Input for the certificate of completion. Deliberately minimal: no patient identifiers
-    beyond signer display names, no chart data."""
+    beyond signer display names, no chart data.
+
+    Addendum 1 A: for a ``paper_archive`` there is no template (``template_key`` and
+    ``template_version`` are ``None``), ``signers`` is empty and ``attestation`` is set; the
+    certificate prints the attestation in place of the signer table, ``created_at`` is when the
+    scan was filed and ``completed_at`` is when it was attested (``envelopes.attested_at``).
+    ``presented_sha256`` and ``final_revision_sha256`` are both the scan's hash. Everything an
+    archive certificate says beyond this (paper signing date, disposition) is on the cover page,
+    which is inside the same sealed bytes."""
 
     envelope_id: UUID
     document_type: str
-    template_key: str
-    template_version: int
+    template_key: str | None
+    template_version: int | None
     seal_profile: SealProfile  # the *configured* profile; the one achieved is in document.sealed
     presented_sha256: bytes
     final_revision_sha256: bytes  # last signer-applied revision, before the certificate is appended
@@ -264,6 +339,21 @@ class CertificateSummary:
     signers: tuple[CertificateSigner, ...]
     audit_event_count: int
     audit_head_hash: bytes  # event_hash of the last event included
+    kind: EnvelopeKind = "electronic"
+    attestation: Attestation | None = None  # paper_archive only, and required for it
+
+
+@dataclass(frozen=True)
+class ArchiveCoverSummary:
+    """Addendum 1 A: input for the cover page that precedes a scan inside the sealed bytes."""
+
+    envelope_id: UUID
+    document_type: str
+    paper_signed_on: date
+    attestation: Attestation
+    attested_at: datetime
+    scan_sha256: bytes
+    scan_page_count: int
 
 
 class DocumentService(Protocol):
@@ -295,13 +385,30 @@ class DocumentService(Protocol):
         subset for this signer. Raises ValidationFailed if a required field has no capture or a
         capture targets a field that is not this signer's."""
 
-    def build_certificate(self, summary: CertificateSummary) -> bytes: ...
+    def build_certificate(self, summary: CertificateSummary) -> bytes:
+        """The certificate of completion (SPEC section 6). For ``summary.kind == "paper_archive"``
+        the archive variant: no signer table, the attestation (staff member, statement,
+        disposition, the paper signers by name and capacity) in its place, and the sentence that
+        the seal proves the scan is unchanged since filing, not that the ink is genuine."""
+
+    def build_archive_cover(self, summary: ArchiveCoverSummary) -> bytes:
+        """Addendum 1 A: exactly one page, to be placed *before* the scan. It states, in plain
+        words: "Scanned copy of a document signed on paper", the document type, the paper signing
+        date, who attested and when (``attestation.staff_display_name``, ``attested_at``), the
+        disposition of the original, the paper signers, the scan's SHA-256 as lowercase hex, the
+        envelope id, and that the seal proves the scan has not changed since it was filed and who
+        filed it -- not that the ink signature is genuine. Embedded fonts, no form fields, no
+        scripts, like every other page this service produces. The envelope service composes the
+        archive with ``finalize``: ``finalize(cover, scan)`` puts the cover first, and
+        ``finalize(that, certificate)`` produces the bytes to be sealed."""
 
     def page_count(self, pdf: bytes) -> int:
         """Pages in a PDF this service produced. Raises ValidationFailed if it cannot be read."""
 
     def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
-        """Append the certificate pages and return the exact bytes to be sealed."""
+        """Append the certificate pages and return the exact bytes to be sealed. The second
+        argument is any PDF this service accepted (``build_archive_cover`` says how an archive
+        is composed from the cover, the scan and the certificate with two calls)."""
 
 
 # --------------------------------------------------------------------------- sealing (esign.sealing)
@@ -351,8 +458,11 @@ class Sealer(Protocol):
 
 # --------------------------------------------------------------------------- storage (esign.storage)
 
+#: ``scan_pdf`` (Addendum 1 A) is the host's scan of a paper-signed document, as received and
+#: after ``inspect_template_pdf``'s hygiene check; it is a paper archive's revision 1 (kind ``scan``).
 BlobKind = Literal[
-    "template_pdf", "presented_pdf", "revision_pdf", "final_unsealed_pdf", "sealed_pdf", "signature_image"
+    "template_pdf", "presented_pdf", "revision_pdf", "final_unsealed_pdf", "sealed_pdf", "signature_image",
+    "scan_pdf",
 ]
 
 
@@ -405,6 +515,16 @@ class EventType(StrEnum):
     ENVELOPE_EXPIRED = "envelope.expired"
     ENVELOPE_SUPERSEDED = "envelope.superseded"
     VERIFICATION_PERFORMED = "verification.performed"
+    # Addendum 1 A: the scan was filed (data: document_type, page_count, scan hash) and attested
+    # (data: staff_user_id, statement, original_disposition, paper_signer_count; never a name).
+    # Then the existing document.finalized / document.sealed / document.stored follow.
+    ARCHIVE_CREATED = "archive.created"
+    ARCHIVE_ATTESTED = "archive.attested"
+    # Addendum 1 B: on the envelope stream of the session the signature was saved in (data:
+    # adopted_signature_id, kind, the image or typed-text digest), and on the system stream when
+    # one is revoked (data: adopted_signature_id, host_id, host_user_id, reason).
+    SIGNATURE_ADOPTED = "signature.adopted"
+    SIGNATURE_ADOPTION_REVOKED = "signature.adoption_revoked"
 
 
 ActorRole = Literal["patient", "clinician", "staff", "host", "system"]
@@ -515,6 +635,11 @@ class SessionInfo:
     auth: AuthContext
     kiosk: KioskContext | None
     expires_at: datetime
+    # Addendum 1: whose session this is, as the host identifies them. The saved-signature routes
+    # and the re-authentication span are keyed on this pair, and it must come from the session's
+    # signer row, never from the request.
+    host_id: UUID
+    host_user_id: str
 
 
 @dataclass(frozen=True)
@@ -524,6 +649,47 @@ class ConsentText:
     locale: str
     body: str
     body_sha256: bytes
+
+
+@dataclass(frozen=True)
+class ReauthEvidence:
+    """Addendum 1 C: the attestation a signature is recorded under. ``attestation_id`` is the
+    ``reauth_attestations`` row; ``scope`` says whether it was made for this session or borrowed
+    from another session of the same user on the same host within the span. ``signer.signed``
+    records all of it, plus the attestation's age at the moment of signing."""
+
+    attestation_id: UUID
+    method: AuthMethod
+    auth_time: datetime
+    scope: ReauthScope
+
+
+AdoptedSignatureKind = Literal["drawn", "typed"]
+AdoptedRevokeReason = Literal["replaced", "user", "host"]
+
+
+@dataclass(frozen=True)
+class AdoptedSignature:
+    """Addendum 1 B: a signature a signer saved for their next session. ``image_sha256`` names a
+    ``signature_image`` blob for ``drawn``; ``typed_text`` is the text for ``typed``. Rows are
+    never deleted; a replaced or removed one is revoked with a reason and stays, because a
+    ``signature_captures`` row may still point at it."""
+
+    id: UUID
+    host_id: UUID
+    host_user_id: str
+    kind: AdoptedSignatureKind
+    image_sha256: bytes | None
+    typed_text: str | None
+    created_in_envelope_id: UUID
+    created_by_session_id: UUID
+    created_at: datetime
+    revoked_at: datetime | None = None
+    revoke_reason: AdoptedRevokeReason | None = None
+
+    @property
+    def is_live(self) -> bool:
+        return self.revoked_at is None
 
 
 class IdentityService(Protocol):
@@ -553,8 +719,62 @@ class IdentityService(Protocol):
         NotFound (``session_not_found``), never Forbidden. Returns the session so the caller can
         append ``auth.reauthenticated`` to the right stream."""
 
-    def fresh_reauth(self, db: Session, session_id: UUID) -> AuthContext | None:
-        """The most recent attestation if it is within REAUTH_MAX_AGE_SECONDS, else None."""
+    def fresh_reauth(self, db: Session, session_id: UUID) -> ReauthEvidence | None:
+        """The attestation that covers a signature in this session right now, or ``None``.
+
+        Resolution order (Addendum 1 C): the most recent usable attestation made *for this
+        session* (``scope="session"``); otherwise, only when ``REAUTH_SPAN_SECONDS`` is greater
+        than zero, the most recent one for the same ``(host_id, host_user_id)`` on any of that
+        user's sessions whose ``auth_time`` is within the span (``scope="span"``). A different
+        user or a different host never matches, and a row written before ``0700`` (no
+        ``host_id``) is never borrowed.
+
+        Usable means, in every scope: ``auth_time`` within ``REAUTH_MAX_AGE_SECONDS`` of now and
+        not in the future, the session it was made for not revoked or expired, and the session
+        being asked about live. With the span off (the default) the answer is exactly what it was
+        before the addendum: this session's own attestation or nothing."""
+
+    def get_adopted_signature(self, db: Session, *, host_id: UUID, host_user_id: str) -> AdoptedSignature | None:
+        """Addendum 1 B: the one live (unrevoked) saved signature for this user on this host, or
+        ``None``. A pure lookup: the caller is responsible for asking only about the user it is
+        acting for -- the API resolves the pair from ``SessionInfo`` for a signer and from the
+        path plus the authenticated host for a host, and the envelope service from the signer
+        row. The image blob it names is served only to a session with the same pair."""
+
+    def adopt_signature(
+        self,
+        db: Session,
+        session_id: UUID,
+        *,
+        kind: AdoptedSignatureKind,
+        image_sha256: bytes | None = None,
+        typed_text: str | None = None,
+    ) -> AdoptedSignature:
+        """Addendum 1 B: save the signature adopted in this session for the session's own
+        ``(host_id, host_user_id)``. Only the signer, from inside their own session: there is no
+        host path to this. Enforces that the session exists and is live (Unauthorized otherwise),
+        that it is not a kiosk session (Forbidden ``adoption_not_allowed``: a patient on a shared
+        tablet must not leave a signature behind), that the session's signer has signed
+        (Conflict ``signature_not_applied``: the row is created after the signature succeeds, in
+        the same transaction), and that ``kind`` matches its payload -- ``drawn`` with an
+        ``image_sha256`` naming an existing ``signature_image`` blob the sign path already stored,
+        ``typed`` with ``typed_text`` within ``MAX_TYPED_SIGNATURE_CHARS`` (ValidationFailed
+        ``invalid_adopted_signature``). An existing live row for the user is revoked with reason
+        ``replaced`` in the same transaction, so at most one is ever live. Writes no audit event:
+        the API layer appends ``signature.adopted`` to the envelope stream (and
+        ``signature.adoption_revoked`` to the system stream for the replaced row) in the same
+        transaction, as it does for the session events (SPEC section 3)."""
+
+    def revoke_adopted_signature(
+        self, db: Session, *, host_id: UUID, host_user_id: str, reason: AdoptedRevokeReason
+    ) -> AdoptedSignature | None:
+        """Addendum 1 B: revoke the user's live saved signature, setting ``revoked_at`` and
+        ``revoke_reason`` once (the trigger allows no other change to the row). Returns the row as
+        revoked, or ``None`` when the user had none -- idempotent, and another host's user is
+        indistinguishable from a user with no saved signature. ``reason`` is ``user`` from the
+        signer's own session, ``host`` from the host API; ``replaced`` is reserved for
+        ``adopt_signature``. Writes no audit event: the API layer appends
+        ``signature.adoption_revoked`` to the system stream in the same transaction."""
 
     def current_consent(self, db: Session, locale: str) -> ConsentText: ...
 
@@ -624,6 +844,19 @@ class NewEnvelope:
 
 
 @dataclass(frozen=True)
+class NewArchive:
+    """Addendum 1 A: a scan of a paper-signed document, filed by the host. The scan bytes travel
+    beside this (``EnvelopeService.create_archive``), not inside it."""
+
+    patient_ref: str  # opaque (is_opaque_id), like NewEnvelope.patient_ref
+    document_type: str  # must be an approved document type
+    host_document_ref: str | None
+    paper_signed_on: date  # the date on the paper; not a fact about a person, never in audit data
+    attestation: Attestation
+    supersedes_envelope_id: UUID | None = None
+
+
+@dataclass(frozen=True)
 class SignerView:
     id: UUID
     role_key: str
@@ -637,12 +870,17 @@ class SignerView:
 
 @dataclass(frozen=True)
 class EnvelopeView:
+    """Addendum 1 A: for ``kind == "paper_archive"`` there is no template and no signer, so
+    ``template_key``, ``template_version`` and ``signing_order`` are ``None`` and ``signers`` is
+    empty; ``paper_signed_on`` and ``attested_at`` are set. For ``electronic`` the two are ``None``
+    and the rest is as before."""
+
     id: UUID
     status: EnvelopeStatus
     document_type: str
-    template_key: str
-    template_version: int
-    signing_order: str
+    template_key: str | None
+    template_version: int | None
+    signing_order: str | None
     signers: tuple[SignerView, ...]
     presented_sha256: bytes | None
     sealed_sha256: bytes | None
@@ -652,6 +890,9 @@ class EnvelopeView:
     current_revision_sha256: bytes | None = None
     created_at: datetime | None = None
     host_id: UUID | None = None
+    kind: EnvelopeKind = "electronic"
+    paper_signed_on: date | None = None
+    attested_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -676,9 +917,11 @@ class SigningView:
     expires_at: datetime
     signer: SignerView
     on_behalf_of_label: str | None
-    reauth_valid_until: datetime | None
+    reauth_valid_until: datetime | None  # from fresh_reauth: covers a span attestation too
     other_signers: tuple[tuple[str, SignerStatus], ...]  # (role_label, status); never a name
     fields: tuple[SigningFieldView, ...]  # this signer's fields only
+    #: Addendum 1 C: which attestation ``reauth_valid_until`` rests on; ``None`` when there is none.
+    reauth_scope: ReauthScope | None = None
 
 
 WebhookEvent = Literal[
@@ -699,6 +942,29 @@ class EnvelopeService(Protocol):
     transaction. Illegal transitions raise Conflict and change nothing."""
 
     def create(self, db: Session, host: Host, spec: NewEnvelope, ctx: RequestContext) -> EnvelopeView: ...
+
+    def create_archive(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> EnvelopeView:
+        """Addendum 1 A: file a scan of a paper-signed document as a ``paper_archive`` envelope.
+
+        Enforces: ``document_type`` approved (ValidationFailed ``document_type_not_approved``),
+        ``patient_ref`` and ``attestation.staff_user_id`` opaque (``host_user_id_invalid``),
+        ``paper_signed_on`` not after today (``paper_signed_on_in_future``), at least one paper
+        signer, and the scan passing the template hygiene rules under ``MAX_SCAN_BYTES`` /
+        ``MAX_SCAN_PAGES`` (``inspect_template_pdf``: no encryption, scripts, XFA, embedded files
+        or existing signatures; image-only pages are expected). ``supersedes_envelope_id`` follows
+        the same rules as ``create`` (a sealed envelope of this host, of either kind, not already
+        superseded; ``envelope.superseded`` on the old stream).
+
+        In one transaction: stores the scan write-once (blob ``scan_pdf``, revision 1 of kind
+        ``scan``, retention by ``document_type``), inserts the envelope with ``kind =
+        paper_archive``, no template, no signers, ``presented_sha256`` and
+        ``current_revision_sha256`` both the scan's hash, ``attested_at = now``; appends
+        ``archive.created`` (actor: the host) then ``archive.attested`` (actor: the staff member,
+        role ``staff``); moves it ``created -> completed_pending_seal`` and enqueues the seal job,
+        attempting it once inline like the last signature does. ``seal_pending`` then builds the
+        cover (``build_archive_cover``), the archive certificate, finalizes cover + scan +
+        certificate and seals as for any envelope. Returns the view with ``kind =
+        "paper_archive"``."""
 
     def get(self, db: Session, host: Host, envelope_id: UUID) -> EnvelopeView: ...
 
@@ -723,14 +989,32 @@ class EnvelopeService(Protocol):
     def sign(self, db: Session, session: SessionInfo, captures: list[Capture], ctx: RequestContext) -> EnvelopeView:
         """Requires viewed + consented, and a fresh re-authentication when the role demands it.
         Applies marks to the current revision, stores the new revision, and when this was the last
-        signer moves the envelope to completed_pending_seal and enqueues the seal job."""
+        signer moves the envelope to completed_pending_seal and enqueues the seal job.
+
+        Addendum 1 C: the re-authentication is whatever ``fresh_reauth`` returns, and
+        ``signer.signed`` records its ``reauth_attestation_id``, ``reauth_scope`` and
+        ``reauth_age_seconds`` (now minus ``auth_time``, at the moment of signing) beside
+        ``reauth_method``; a role that does not re-authenticate records none of them.
+
+        Addendum 1 B: an ``adopted`` capture is resolved through ``get_adopted_signature`` for the
+        signer's own ``(host_id, host_user_id)``; it is refused (Forbidden
+        ``adopted_signature_unavailable``) when the id is not that user's live saved signature,
+        and always from a kiosk session. The stored image or text is stamped, the
+        ``signature_captures`` row is written
+        with ``kind = adopted`` and ``adopted_signature_id``, the trail's ``CaptureRef`` carries the
+        image or text digest, and ``signer.signed.adopted_signature_id`` names the row."""
 
     def decline(self, db: Session, session: SessionInfo, reason_code: str, ctx: RequestContext) -> EnvelopeView: ...
 
     def void(self, db: Session, host: Host, envelope_id: UUID, reason_code: str, ctx: RequestContext) -> EnvelopeView:
         """Only while ``created`` or ``in_progress``. An envelope that is complete and waiting for
         its seal cannot be voided: it stays pending until the seal succeeds (fail closed). A sealed envelope is corrected by creating a new envelope with
-        ``supersedes_envelope_id``; the sealed document itself is never touched."""
+        ``supersedes_envelope_id``; the sealed document itself is never touched.
+
+        Addendum 1 A: a ``paper_archive`` may be voided while ``created`` or
+        ``completed_pending_seal`` -- nobody signed anything electronically and the seal has not
+        happened -- but never once ``sealed``. A seal job for a voided archive finds the envelope
+        not pending and does nothing."""
 
     def expire_due(self, db: Session) -> int: ...
 

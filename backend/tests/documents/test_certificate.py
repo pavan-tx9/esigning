@@ -126,6 +126,11 @@ def test_nothing_but_the_summary_reaches_the_page(documents: DocumentService) ->
         "signers",
         "audit_event_count",
         "audit_head_hash",
+        # Addendum 1 A: the archive variant. `attestation` names the staff member and the paper
+        # signers, which is the same class of data as a signer's display name: it is on the page
+        # and nowhere else.
+        "kind",
+        "attestation",
     }
 
 

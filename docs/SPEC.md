@@ -9,11 +9,13 @@ an architecture.
 show who signed, what they saw, that they meant to sign, and that nothing changed afterwards. When
 two designs are otherwise equal, pick the one that produces better evidence.
 
-The contract lives in two files that module authors must not edit. They were revised once, at
-integration, from the module hand-off reports; every such revision is listed in section 13:
+The contract lives in three files that module authors must not edit. They were revised once, at
+integration, from the module hand-off reports, and again for Addendum 1 (section 14); every such
+revision is listed in section 13:
 
 - `backend/src/esign/contracts.py`: every cross-module type and interface
 - `backend/migrations/0001_schema.sql`: the full schema
+- `backend/migrations/0700_addendum_1.sql`: the schema for Addendum 1 (section 14)
 
 ## 1. Scope
 
@@ -47,7 +49,7 @@ Directory ownership (an agent edits only its own paths):
 
 | Path | Owner |
 |---|---|
-| `backend/src/esign/contracts.py`, `backend/migrations/0001_schema.sql`, `docs/SPEC.md` | architecture, read-only for everyone else |
+| `backend/src/esign/contracts.py`, `backend/migrations/0001_schema.sql`, `backend/migrations/0700_addendum_1.sql`, `docs/SPEC.md` | architecture, read-only for everyone else |
 | `backend/pyproject.toml`, `backend/src/esign/{config,db,clock,ids,logging}.py`, `backend/tests/conftest.py`, `docker-compose.yml`, `Makefile`, `frontend/` scaffold | foundation |
 | `backend/src/esign/audit/`, `backend/src/esign/storage/`, their tests | evidence module |
 | `backend/src/esign/sealing/`, tests | sealing module |
@@ -68,6 +70,8 @@ Plain SQL files in `backend/migrations/`, applied in filename order by `esign mi
 a `schema_migrations` table. `0001` is the schema; `0002_roles.sql` (foundation) creates the roles
 and grants. A module that truly needs a change adds a file in its range (evidence 0100s, sealing
 0200s, documents 0300s, identity 0400s, envelopes 0500s, integration 0600s) and reports it.
+`0700_addendum_1.sql` (architecture) is the schema for section 14; the addendum's features add
+nothing to it and build against it as it stands.
 
 ### Database roles
 - `esign_owner` runs migrations.
@@ -80,6 +84,11 @@ and grants. A module that truly needs a change adds a file in its range (evidenc
   `DELETE` is granted nowhere else because the application issues it nowhere else, and `signers`,
   `signing_sessions` and `signature_captures` are the rows the certificate of completion is built
   from: `0602` revokes it and stops `ALTER DEFAULT PRIVILEGES` handing it to new tables.
+  `adopted_signatures` (`0700`, section 14 B) is the one table with a narrower rule than either
+  list: `SELECT, INSERT, UPDATE`, where the trigger `adopted_signatures_guard` permits exactly one
+  UPDATE per row -- setting `revoked_at` and `revoke_reason` together, once, changing nothing
+  else -- and refuses DELETE and TRUNCATE like the append-only tables. Rows are revoked, never
+  removed, because a `signature_captures` row may point at one.
 
 ## 3. The pipeline
 
@@ -103,11 +112,23 @@ the state change.
    stored. There is always a visible decline/paper path.
 5. **Re-authenticate** (roles with `requires_reauth`): the UI asks the host page to re-authenticate
    the user; the host backend then calls `POST /v1/sessions/{id}/reauth`. Signing requires an
-   attestation younger than `REAUTH_MAX_AGE_SECONDS` (default 120).
-6. **Capture and sign**: the UI sends signature inputs only (PNG, typed text, or click), with an
+   attestation younger than `REAUTH_MAX_AGE_SECONDS` (default 120). By default the attestation
+   covers the one session it was made for. With `REAUTH_SPAN_SECONDS` above zero (section 14 C;
+   default 0, at most 900) an attestation for a user also covers that user's other sessions on the
+   same host for that long after its `auth_time`, and `signer.signed` records which attestation was
+   used, whether it was made in this session or borrowed (`reauth_scope: session | span`), and its
+   age at the moment of signing. `fresh_reauth` resolves this session's own attestation first and
+   a span one only when there is none.
+6. **Capture and sign**: the UI sends signature inputs only (PNG, typed text, click, or -- section
+   14 B -- the id of a signature the signer saved in an earlier session), with an
    `Idempotency-Key`. The server sanitises images, stamps the marks and a caption onto the current
    revision under the envelope row lock, stores the new revision, records `signer.signed` with both
-   the presented hash and the new revision hash.
+   the presented hash and the new revision hash. An `adopted` capture is resolved server-side to the
+   saved image or text, which must be the signer's own live saved signature, never from a kiosk
+   session; the capture row records `kind = adopted` and the saved signature's id. With
+   `save_adopted_signature`, the drawn or typed signature just applied is saved for the signer's
+   `(host_id, host_user_id)` in the same transaction (`signature.adopted`), replacing and revoking
+   any earlier one (`signature.adoption_revoked`); never from a kiosk session.
 7. **Finalize and seal**: when the last signer signs, the envelope becomes
    `completed_pending_seal` and a seal job is enqueued (and attempted once inline). The job builds
    the certificate of completion from the audit trail, appends it, applies one PAdES certification
@@ -147,6 +168,37 @@ the old stream. Signer states: `pending -> viewed -> consented -> signed`, or `d
 decline ends the envelope. Sequential order gates session creation on all earlier signers having
 signed; parallel order allows any order, serialised by the envelope row lock.
 
+### Paper archives (section 14 A)
+An envelope has a `kind`: `electronic` (everything above) or `paper_archive`, a scan of a document
+signed in ink that the host files with an attestation so it gets the same write-once storage,
+seal, timestamp, audit trail and verification. A paper archive has no template, no signers and no
+sessions (`template_version_id` and `signing_order` are null, and a CHECK ties every paper column
+to the kind). Its pipeline is steps 1, 7, 8 and 9 with the scan in place of the rendered document:
+
+1. **File**: `POST /v1/archives` with the scan and the attestation. The scan passes the template
+   hygiene rules under `MAX_SCAN_BYTES` / `MAX_SCAN_PAGES` and is stored write-once as revision 1
+   of kind `scan` (blob kind `scan_pdf`); `archive.created` (actor: the host) and
+   `archive.attested` (actor: the attesting staff member) are appended, and the envelope goes
+   `created -> completed_pending_seal` with a seal job, all in one transaction.
+2. **Seal**: the job builds a one-page cover (`build_archive_cover`: "Scanned copy of a document
+   signed on paper", document type, paper signing date, who attested and when, disposition of the
+   original, the scan's SHA-256, the envelope id, and what the seal does and does not prove),
+   places it *before* the scan, appends the archive variant of the certificate (the attestation in
+   place of the signer table) and seals the whole thing exactly as for an electronic envelope.
+
+```
+created -> completed_pending_seal -> sealed
+created|completed_pending_seal -> voided
+```
+Unlike an electronic envelope, an archive may be voided while `completed_pending_seal`: nobody
+signed anything electronically, the scan is still the host's, and the seal has not happened. Once
+sealed it is corrected like any other envelope, by a new envelope (of either kind) that supersedes
+it. It never enters `in_progress`, `declined` or `expired`.
+
+**What the seal proves, and what it does not.** That the scan has not changed since the moment it
+was filed, and who filed and attested to it. Not that the ink signature is genuine: that rests on
+the paper original and the attesting staff member, and the cover page and the certificate say so.
+
 ## 4. Audit trail
 
 - One chain per stream (`envelope`, `template`, `system`). `sequence` starts at 1 and has no gaps.
@@ -171,6 +223,22 @@ signed; parallel order allows any order, serialised by the envelope row lock.
 - If `Clock` is behind the head of a stream, `append` refuses with `IntegrityFailure`
   (`audit_clock_regression`) rather than writing an out-of-order event or clamping the time.
 - IP and user agent are taken from the request server-side, honouring `TRUSTED_PROXY_CIDRS`.
+- Section 14 adds four event types. `archive.created` (document type, page count, size, scan hash,
+  what it supersedes; the row's `document_sha256` is the scan hash too) and `archive.attested`
+  (the attesting `staff_user_id`, the statement, the disposition of the original, and the *count*
+  of paper signers -- their names are PHI and go on the cover page and the certificate, never
+  here; the paper signing date is a date and stays out for the same reason every other date-shaped
+  value does) are on the archive's envelope stream. `signature.adopted` is on the envelope stream
+  of the session the signature was saved in (the saved signature's id and kind, and the digest of
+  its image or text, tying the saved ink to the chain like a `CaptureRef`).
+  `signature.adoption_revoked` is on the `system` stream (host, opaque user id, the id, and the
+  reason).
+- `signer.signed` gained `reauth_attestation_id`, `reauth_scope` and `reauth_age_seconds`, set
+  together whenever `reauth_used`, and `adopted_signature_id` when an `adopted` capture was
+  applied. Capture kinds in the trail are `drawn | typed | click | adopted | checkbox | text`.
+  Every declared field is always written (absent ones as `null`), so `audit/README.md`'s worked
+  vector was regenerated, and a `signer.signed` written before `0700` is reported by `verify` as
+  `data keys do not match` -- the same consequence round three's `CaptureRef` change had.
 
 ## 5. Sealing
 
@@ -238,6 +306,29 @@ signed; parallel order allows any order, serialised by the envelope row lock.
   after `SESSION_TTL_SECONDS` (default 1800), and creating a new one revokes the previous one.
   Unknown, expired and revoked tokens are indistinguishable to the caller.
 - `auth_time` older than `AUTH_MAX_AGE_SECONDS` (default 12 hours) or in the future is rejected.
+- `SessionInfo` carries whose session it is -- `host_id` and `host_user_id`, read from the signer
+  and envelope rows, never from the request. The saved-signature rules and the re-authentication
+  span are keyed on that pair.
+- Re-authentication (section 14 C): `reauth_attestations` rows carry `host_id` and
+  `host_user_id`, copied from the session's signer at insert (`0700`; rows from before it have
+  neither and are never borrowed). `fresh_reauth` returns `ReauthEvidence(attestation_id, method,
+  auth_time, scope)`: the most recent usable attestation made for this session (`scope =
+  session`), else -- only when `REAUTH_SPAN_SECONDS > 0` -- the most recent one for the same
+  `(host_id, host_user_id)` on any of that user's sessions with `auth_time` within the span
+  (`scope = span`). In either scope the attestation must be within `REAUTH_MAX_AGE_SECONDS`, not
+  in the future, and the session it was made for and the session asking must both be live. A
+  different user or host never matches. The span is off by default and capped at 900 seconds by
+  `Settings` validation.
+- Adopted signatures (section 14 B): `adopted_signatures` holds at most one live row per
+  `(host_id, host_user_id)` (partial unique index); `kind` is `drawn` (a `signature_image` blob)
+  or `typed`. Only the signer creates one, from inside their own live, non-kiosk session, after
+  their signature in that session succeeded (`adopt_signature`); replacing one revokes the old row
+  with reason `replaced` in the same transaction. There is no host path to create one: staff
+  cannot create a doctor's signature. Either side can revoke (`revoke_adopted_signature`, reason
+  `user` or `host`), which is the only UPDATE the row ever takes. A kiosk session never offers or
+  saves one. The identity module writes no audit events; the API layer appends
+  `signature.adopted` / `signature.adoption_revoked` in the same transaction, as it does for the
+  session events.
 - Kiosk sessions record the staff member and the identity check method. The signature is
   attributed to the patient (or guardian), never to the staff member.
 - Consent texts are versioned, immutable, and seeded by migration-independent `esign consent add`.
@@ -259,10 +350,12 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 | `POST /v1/templates/{key}/versions/{n}/retire` | retire |
 | `GET /v1/templates`, `GET /v1/templates/{key}` | list, detail |
 | `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names) |
-| `GET /v1/envelopes/{id}` | `EnvelopeView` |
+| `POST /v1/archives` | section 14 A: file a scan of a paper-signed document. Multipart: `scan` (a PDF; converting images is the host's job) + `body` (JSON text: `{patient_ref, document_type, host_document_ref?, paper_signed_on, attestation: {staff_user_id, staff_display_name, statement: "true_copy", original_disposition, paper_signers: [{display_name, capacity}]}, supersedes_envelope_id?}`, i.e. `NewArchive`). Supports `Idempotency-Key`. Returns an `EnvelopeView` with `kind: "paper_archive"`. The request-size limit for this route is `MAX_SCAN_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES` |
+| `GET /v1/envelopes/{id}` | `EnvelopeView`. Gained `kind`; for a paper archive `template_key`, `template_version` and `signing_order` are `null`, `signers` is empty, and `paper_signed_on` and `attested_at` are set. `/document`, `/audit`, `/verification` and `/void` apply to both kinds |
 | `POST /v1/envelopes/{id}/void` | `{reason_code}` from the fixed list `contracts.VOID_REASON_CODES` (a host-invented code would be free text with underscores, and it reaches the audit trail) |
 | `POST /v1/envelopes/{id}/signers/{sid}/sessions` | `{auth: {method, auth_time}, kiosk?: {staff_user_id, identity_check}}` -> `{token, session_id, expires_at}` |
-| `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` -> `{session_id, reauth_valid_until}`; another host's session is `not_found` |
+| `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` -> `{session_id, reauth_valid_until}`; another host's session is `not_found`. With the span on (section 14 C) the host still calls this once, on the first document |
+| `POST /v1/users/{host_user_id}/adopted-signature/revoke` | section 14 B: `{reason?}` (free text is not stored; the trail records `reason: host`). Revokes the user's live saved signature; 200 whether or not there was one, so another host's user is indistinguishable from a user with none |
 | `GET /v1/envelopes/{id}/document` | sealed PDF, or 409 `not_sealed` |
 | `GET /v1/envelopes/{id}/audit` | audit events |
 | `GET /v1/envelopes/{id}/verification` | run and return a verification report. Always 200 for an envelope that exists: a failed verification is a finding (`ok: false`, `problems`), not a transport error |
@@ -277,7 +370,8 @@ Requests outside the scope of section 1 (`POST /v1/envelopes/bulk`, `.../email-l
 | `GET /v1/signing/document` | current revision PDF; records `document.presented` |
 | `POST /v1/signing/viewed` | `{pages_viewed: int}` must equal the page count |
 | `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?}` (`locale` as shown in the session payload; default locale when omitted) |
-| `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...]}` + `Idempotency-Key` |
+| `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...], save_adopted_signature?: bool}` + `Idempotency-Key`. `save_adopted_signature: true` (section 14 B) saves the drawn or typed signature just applied, after the signature succeeds and in the same transaction; refused (422) with no drawn or typed capture, and always from a kiosk session |
+| `POST /v1/signing/adopted-signature/revoke` | section 14 B: the signer removes their own saved signature (`reason: user`). 200 whether or not there was one |
 | `POST /v1/signing/decline` | `{reason_code}` from a fixed list including `prefers_paper` |
 | `GET /v1/signing/copy` | sealed PDF (records `document.downloaded`), or 202 `{status: "sealing"}` while the seal is pending, or 409 `envelope_not_complete` while other signers are outstanding |
 
@@ -295,24 +389,33 @@ refused (422) rather than ignored.
                "title": "Procedure consent", "page_count": 3, "expires_at": "..."},
   "signer": {"id": "...", "display_name": "...", "role_label": "Patient", "capacity": "self",
              "on_behalf_of_label": null, "status": "pending", "requires_reauth": false,
-             "reauth_valid_until": null},
+             "reauth_valid_until": null, "reauth_scope": null},
   "other_signers": [{"role_label": "Witness", "status": "pending"}],
   "fields": [{"id": "patient_sig", "type": "signature", "page": 3,
               "rect": {"x": 72, "y": 120, "w": 220, "h": 48}, "required": true,
               "label": "Patient signature"}],
   "consent": {"version": "2026-09", "locale": "en-US", "body": "..."},
   "session": {"id": "...", "expires_at": "...", "kiosk": false},
+  "adopted_signature": null,
   "decline_reasons": [{"code": "prefers_paper", "label": "I would rather sign on paper"}]
 }
 ```
+`reauth_valid_until` reflects a span attestation too (section 14 C), so the UI can skip the
+hand-off when a valid one exists, and `reauth_scope` (`session | span | null`) says which.
+`adopted_signature` (section 14 B) is `{id, kind, image_png_base64 | typed_text, created_at}` or
+`null`: the signer's own live saved signature, served only to a session with the same
+`(host_id, host_user_id)`, and always `null` on a kiosk session.
+
 Capture shapes: `{"field_id", "kind": "drawn", "image_png_base64"}`, `{"field_id", "kind":
-"typed", "typed_text"}`, `{"field_id", "kind": "click"}`, and for non-signature fields
-`{"field_id", "checked"}` or `{"field_id", "text_value"}`. The two families never mix: a capture
-with a `kind` (or a signature payload) *and* a `checked`/`text_value` is refused with 422 at the
-edge and is not representable as a `contracts.Capture` at all, because the trail records a
-signature's `kind` and a value field's type, and a client must not choose that wording. Signature
-and initials fields accept any of the three kinds (the UI sends initials typed); `typed_text` and
-`text_value` are bounded by `MAX_TYPED_SIGNATURE_CHARS` (200) and `MAX_TEXT_FIELD_CHARS` (2000).
+"typed", "typed_text"}`, `{"field_id", "kind": "click"}`, `{"field_id", "kind": "adopted",
+"adopted_signature_id"}` (section 14 B: the id from the session payload and nothing else -- an
+image or text beside it is refused), and for non-signature fields `{"field_id", "checked"}` or
+`{"field_id", "text_value"}`. The two families never mix: a capture with a `kind` (or a signature
+payload) *and* a `checked`/`text_value` is refused with 422 at the edge and is not representable
+as a `contracts.Capture` at all, because the trail records a signature's `kind` and a value
+field's type, and a client must not choose that wording. Signature and initials fields accept any
+of the four kinds (the UI sends initials typed); `typed_text` and `text_value` are bounded by
+`MAX_TYPED_SIGNATURE_CHARS` (200) and `MAX_TEXT_FIELD_CHARS` (2000).
 
 ### Embedding protocol
 The UI is served at `/sign?host=<host id>` and loaded in an iframe. The host id is not a secret and
@@ -329,8 +432,10 @@ The token lives in memory only: not in the URL, not in storage.
 ### Webhooks
 `envelope.completed`, `envelope.sealed`, `envelope.declined`, `envelope.voided`,
 `envelope.expired`. Payload: ids, status, hashes only (`id` of the delivery, `event`,
-`occurred_at`, `envelope_id`, `status`, template key and version (not the document type), the three hashes, and each
-signer's `id`, `role_key` and `status`; never a name, `patient_ref` or `host_document_ref`). Signed
+`occurred_at`, `envelope_id`, `kind`, `status`, template key and version (not the document type;
+both `null` for a paper archive), the three hashes, and each
+signer's `id`, `role_key` and `status`; never a name, `patient_ref` or `host_document_ref`). A
+paper archive fires `envelope.sealed` and `envelope.voided` only. Signed
 with `X-Esign-Signature: t=<unix>,v1=<hex hmac-sha256 of "t.body">` using the secret printed once
 by `esign hosts create`; a receiver should reject a `t` more than five minutes old
 (`esign.webhooks.verify_signature` is the reference). A delivery row is written in the transaction
@@ -576,3 +681,64 @@ Fifth round, closing what the fourth left open:
   now refuses that too, and the case is covered in `App.test.tsx` and in the mocked Playwright run
   (a co-signer signs while the signer sits on the confirm screen). No UI change was needed:
   `mustReadAgain` and the return to Review already handle the 409.
+
+Addendum 1 (section 14), made once by the architecture step before the three features were
+built, so the builders work against a fixed contract. Everything the addendum lists under
+"Contract and schema changes", plus the few things it did not name that the listed ones need:
+
+- **`contracts.py`**: `EnvelopeKind`, `ReauthScope`, `AttestationStatement`,
+  `OriginalDisposition`, `PaperSigner` (the element type of `Attestation.paper_signers`),
+  `Attestation`, `ArchiveCoverSummary`, `NewArchive`, `ReauthEvidence`, `AdoptedSignatureKind`,
+  `AdoptedRevokeReason`, `AdoptedSignature`. `CaptureKind` gains `adopted` and `Capture` gains
+  `adopted_signature_id`, paired with that kind by the constructor. `BlobKind` gains `scan_pdf`.
+  `EventType` gains `archive.created`, `archive.attested`, `signature.adopted`,
+  `signature.adoption_revoked`. `CertificateSummary` gains `kind` and `attestation`, and its
+  `template_key` / `template_version` are optional (an archive has none). `CertificateSigner`
+  gains `reauth_scope`, `reauth_at`, `adopted_signature_id` and `adopted_at` (the adoption date
+  the certificate prints). `EnvelopeView` gains `kind`, `paper_signed_on`, `attested_at`, and its
+  `template_key`, `template_version` and `signing_order` are optional. `SigningView` gains
+  `reauth_scope`. `SessionInfo` gains `host_id` and `host_user_id`, read from the rows.
+  `IdentityService.fresh_reauth` returns `ReauthEvidence | None` (the one existing signature that
+  changed; both implementations answer `scope = session` until the span is built);
+  `get_adopted_signature`, `adopt_signature`, `revoke_adopted_signature`;
+  `DocumentService.build_archive_cover`; `EnvelopeService.create_archive`. The `sign`, `void`,
+  `build_certificate` and `finalize` docstrings say what the features change about them.
+- **`0700_addendum_1.sql`**: `envelopes.kind`, `paper_signed_on`, `attestation`, `attested_at`,
+  with `template_version_id` and `signing_order` nullable and CHECKs tying every one of them to
+  the kind (`envelopes_kind_template`, `_signing_order`, `_paper`, `_status`,
+  `_attestation_shape`); `blobs.kind` gains `scan_pdf` and `document_revisions.kind` gains `scan`
+  (a paper archive's revision 1); `adopted_signatures` with its partial unique index, its guard
+  trigger and its grants; `signature_captures.kind` gains `adopted` with `adopted_signature_id`
+  and `signature_captures_kind_adopted`; `reauth_attestations.host_id` / `host_user_id` with the
+  both-or-neither CHECK and a partial index by user.
+- **`config.py`**: `max_scan_bytes` (20 MiB), `max_scan_pages` (100), `reauth_span_seconds`
+  (0, validated 0..900). `check_production_settings` refuses nothing new; `.env.example` says
+  why the span is off by default.
+- **Audit allowlist**: the four new data models, `SignerSignedData`'s four new optional fields,
+  and the widened capture and revision kind vocabularies, in `esign/audit/events.py` -- the one
+  definition. `audit/README.md`'s worked vector was regenerated.
+- **Stubs**: every new Protocol method raises `NotImplementedError` in `SqlIdentityService`,
+  `PdfDocumentService`, `EnvelopeServiceImpl` and the envelope tests' fakes, with a `TODO` naming
+  the feature, so the tree stays green until each builder replaces its own.
+
+## 14. Addendum 1: paper archives, adopted signatures, re-authentication span
+
+`docs/SPEC-ADDENDUM-1.md` adds three features to this spec and is normative for them:
+
+- **A. Archiving paper-signed documents**: a host files a scan of a document signed in ink, with
+  an attestation, and it gets the same write-once storage, seal, timestamp, audit trail and
+  verification as an electronic signature (section 3 "Paper archives", sections 4, 9).
+- **B. Adopted signatures**: a signer saves the signature they adopted so it is offered again in
+  their next session; only the signer can create one, either side can revoke it, and a kiosk
+  session never offers or saves one (sections 3 step 6, 4, 8, 9).
+- **C. Re-authentication span**: a host may let one attestation cover a user's other sessions on
+  the same host for `REAUTH_SPAN_SECONDS` (default 0, at most 900) after `auth_time`, with every
+  signature recording which attestation it rests on and whether it was borrowed (sections 3 step 5,
+  4, 8, 9).
+
+Everything in sections 1 to 13 still applies; where the addendum is silent, this document decides.
+The addendum says what each feature weakens and how that is contained. Its contract and schema
+changes were made once, up front (section 13, "Addendum 1"), in `contracts.py`,
+`0700_addendum_1.sql`, `config.py` and this document; the sections above that changed say so
+inline. The addendum's Documents, Frontend, Demo host and Tests headings apply to sections 6, 11
+and 12 without restating them here.

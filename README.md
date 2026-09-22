@@ -519,6 +519,7 @@ in KMS and only its *identifier* is configuration.
 | `SESSION_TTL_SECONDS` | `1800` | |
 | `AUTH_MAX_AGE_SECONDS` | `43200` | how stale the host's `auth_time` may be |
 | `REAUTH_MAX_AGE_SECONDS` | `120` | how fresh a re-authentication must be to cover a signature |
+| `REAUTH_SPAN_SECONDS` | `0` | for how long after its `auth_time` an attestation also covers the same user's other sessions on the same host (a signing queue). `0`: one attestation, one document. At most `900`. Off unless compliance has agreed; every signature records whether it borrowed one |
 | `TRUSTED_PROXY_CIDRS` | *(empty)* | only these peers' `X-Forwarded-For` is believed; everything else uses the peer address. A typo silently changes every recorded IP, so it is parsed at startup |
 | `DEFAULT_LOCALE` | `en-US` | which disclosure is served when none is asked for |
 
@@ -537,6 +538,7 @@ in KMS and only its *identifier* is configuration.
 |---|---|---|
 | `MAX_TEMPLATE_BYTES` | 20 MiB | |
 | `MAX_TEMPLATE_PAGES` | `50` | |
+| `MAX_SCAN_BYTES` / `MAX_SCAN_PAGES` | 20 MiB / `100` | a scan filed with `POST /v1/archives` (image-only pages are large) |
 | `MAX_SIGNATURE_PNG_BYTES` | 1 MiB | |
 | `MAX_SIGNATURE_PNG_PIXELS` | 4,000,000 | |
 | `MAX_SIGNATURE_PNG_DIMENSION` / `MIN_SIGNATURE_PNG_DIMENSION` | `4000` / `8` | a 4000×1 image passes a pixel budget and is not a signature |

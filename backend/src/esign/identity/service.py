@@ -29,6 +29,9 @@ from sqlalchemy.orm import Session
 
 from esign.config import Settings
 from esign.contracts import (
+    AdoptedRevokeReason,
+    AdoptedSignature,
+    AdoptedSignatureKind,
     AuthContext,
     AuthMethod,
     Clock,
@@ -38,6 +41,7 @@ from esign.contracts import (
     IdentityCheck,
     KioskContext,
     NotFound,
+    ReauthEvidence,
     RequestContext,
     SessionInfo,
     Unauthorized,
@@ -70,13 +74,16 @@ _KIOSK_REQUIRED_METHODS: Final = frozenset({"staff_verified"})
 _MAX_STAFF_ID_CHARS: Final = 128
 _MAX_USER_AGENT_CHARS: Final = 512
 
+#: Every session query joins ``signers s`` and ``envelopes e``: ``SessionInfo`` carries whose
+#: session it is (``host_id``, ``host_user_id``), and those come from the rows, never the request.
 _SESSION_COLUMNS: Final = (
     "ss.id AS id, ss.signer_id AS signer_id, ss.token_hash AS token_hash, "
     "ss.auth_method AS auth_method, ss.auth_time AS auth_time, "
     "ss.kiosk_staff_user_id AS kiosk_staff_user_id, ss.kiosk_identity_check AS kiosk_identity_check, "
     "ss.created_at AS created_at, ss.expires_at AS expires_at, ss.revoked_at AS revoked_at, "
-    "s.envelope_id AS envelope_id"
+    "s.envelope_id AS envelope_id, s.host_user_id AS host_user_id, e.host_id AS host_id"
 )
+_SESSION_JOINS: Final = "JOIN signers s ON s.id = ss.signer_id JOIN envelopes e ON e.id = s.envelope_id"
 
 
 def _log() -> Any:
@@ -131,7 +138,15 @@ class SqlIdentityService:
         advisory_xact_lock(db, advisory_lock_key("identity.signer", signer_id))
 
         row = (
-            db.execute(text("SELECT id, envelope_id FROM signers WHERE id = :id"), {"id": signer_id}).mappings().first()
+            db.execute(
+                text(
+                    "SELECT s.id AS id, s.envelope_id AS envelope_id, s.host_user_id AS host_user_id, "
+                    "e.host_id AS host_id FROM signers s JOIN envelopes e ON e.id = s.envelope_id WHERE s.id = :id"
+                ),
+                {"id": signer_id},
+            )
+            .mappings()
+            .first()
         )
         if row is None:
             raise NotFound("signer", code="signer_not_found")
@@ -179,6 +194,8 @@ class SqlIdentityService:
             auth=checked_auth,
             kiosk=checked_kiosk,
             expires_at=expires_at,
+            host_id=req_uuid(row, "host_id"),
+            host_user_id=req_str(row, "host_user_id"),
         )
         return token, info
 
@@ -192,7 +209,7 @@ class SqlIdentityService:
             db.execute(
                 text(
                     f"SELECT {_SESSION_COLUMNS} FROM signing_sessions ss "  # noqa: S608 - fixed column list
-                    "JOIN signers s ON s.id = ss.signer_id WHERE ss.token_hash = :token_hash"
+                    f"{_SESSION_JOINS} WHERE ss.token_hash = :token_hash"
                 ),
                 {"token_hash": presented},
             )
@@ -262,9 +279,8 @@ class SqlIdentityService:
         row = (
             db.execute(
                 text(
-                    f"SELECT {_SESSION_COLUMNS}, e.host_id AS host_id FROM signing_sessions ss "  # noqa: S608 - fixed column list
-                    "JOIN signers s ON s.id = ss.signer_id JOIN envelopes e ON e.id = s.envelope_id "
-                    "WHERE ss.id = :id"
+                    f"SELECT {_SESSION_COLUMNS} FROM signing_sessions ss "  # noqa: S608 - fixed column list
+                    f"{_SESSION_JOINS} WHERE ss.id = :id"
                 ),
                 {"id": session_id},
             )
@@ -277,6 +293,8 @@ class SqlIdentityService:
             raise Conflict("session is not live", code="session_not_live")
         if checked.auth_time < req_time(row, "created_at"):
             raise ValidationFailed("re-authentication predates the session", code="reauth_predates_session")
+        # TODO(addendum-1 C, re-authentication span): also write host_id and host_user_id (both on
+        # ``row``) so the attestation can be found by user; 0700 leaves rows without them unborrowable.
         db.execute(
             text(
                 "INSERT INTO reauth_attestations (id, session_id, method, auth_time, attested_at) "
@@ -293,20 +311,25 @@ class SqlIdentityService:
         _log().info("identity.reauth_attested", session_id=session_id, reauth_method=checked.method)
         return _row_to_session_info(row)
 
-    def fresh_reauth(self, db: Session, session_id: UUID) -> AuthContext | None:
+    def fresh_reauth(self, db: Session, session_id: UUID) -> ReauthEvidence | None:
         """The most recent usable attestation for this session, or ``None``.
 
         The filters are repeated here rather than trusted from write time: ``reauth_attestations``
         is append-only, so a row written by an older or buggier path can never be corrected, only
         ignored. A session that has expired or been revoked has no fresh re-authentication either,
         whatever is stored against it.
+
+        TODO(addendum-1 C, re-authentication span): when ``reauth_span_seconds`` is greater than
+        zero and this session has no attestation of its own, resolve the most recent one for the
+        same ``(host_id, host_user_id)`` within the span and return it with ``scope="span"``
+        (contract: ``IdentityService.fresh_reauth``). Today every answer is ``scope="session"``.
         """
         now = self._now()
         cutoff = now - timedelta(seconds=self._settings.reauth_max_age_seconds)
         row = (
             db.execute(
                 text(
-                    "SELECT ra.method AS method, ra.auth_time AS auth_time "
+                    "SELECT ra.id AS id, ra.method AS method, ra.auth_time AS auth_time "
                     "FROM reauth_attestations ra JOIN signing_sessions ss ON ss.id = ra.session_id "
                     "WHERE ra.session_id = :id "
                     "  AND ss.revoked_at IS NULL "
@@ -327,7 +350,39 @@ class SqlIdentityService:
         method = req_str(row, "method")
         if method not in AUTH_METHODS:
             return None
-        return AuthContext(method=cast(AuthMethod, method), auth_time=req_time(row, "auth_time"))
+        return ReauthEvidence(
+            attestation_id=req_uuid(row, "id"),
+            method=cast(AuthMethod, method),
+            auth_time=req_time(row, "auth_time"),
+            scope="session",
+        )
+
+    # ----------------------------------------------------------------- adopted signatures
+
+    def get_adopted_signature(self, db: Session, *, host_id: UUID, host_user_id: str) -> AdoptedSignature | None:
+        # TODO(addendum-1 B, adopted signatures): the live row for (host_id, host_user_id).
+        _ = (db, host_id, host_user_id)
+        raise NotImplementedError("Addendum 1 B (adopted signatures): IdentityService.get_adopted_signature")
+
+    def adopt_signature(
+        self,
+        db: Session,
+        session_id: UUID,
+        *,
+        kind: AdoptedSignatureKind,
+        image_sha256: bytes | None = None,
+        typed_text: str | None = None,
+    ) -> AdoptedSignature:
+        # TODO(addendum-1 B, adopted signatures): see the contract for everything this must enforce.
+        _ = (db, session_id, kind, image_sha256, typed_text)
+        raise NotImplementedError("Addendum 1 B (adopted signatures): IdentityService.adopt_signature")
+
+    def revoke_adopted_signature(
+        self, db: Session, *, host_id: UUID, host_user_id: str, reason: AdoptedRevokeReason
+    ) -> AdoptedSignature | None:
+        # TODO(addendum-1 B, adopted signatures): revoke the live row once; None when there is none.
+        _ = (db, host_id, host_user_id, reason)
+        raise NotImplementedError("Addendum 1 B (adopted signatures): IdentityService.revoke_adopted_signature")
 
     # ----------------------------------------------------------------- consent
 
@@ -432,6 +487,8 @@ def _row_to_session_info(row: RowMapping) -> SessionInfo:
         auth=AuthContext(method=cast(AuthMethod, req_str(row, "auth_method")), auth_time=req_time(row, "auth_time")),
         kiosk=kiosk,
         expires_at=req_time(row, "expires_at"),
+        host_id=req_uuid(row, "host_id"),
+        host_user_id=req_str(row, "host_user_id"),
     )
 
 

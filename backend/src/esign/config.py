@@ -97,6 +97,12 @@ class Settings(BaseSettings):
     session_ttl_seconds: int = 1800
     auth_max_age_seconds: int = 43200  # 12 hours
     reauth_max_age_seconds: int = 120
+    #: Addendum 1 C. How long, after its ``auth_time``, a re-authentication attestation for a user
+    #: also covers that user's *other* sessions on the same host. ``0`` (the default) means it
+    #: never does: an attestation covers the one session it was made for, which is one document.
+    #: Capped at 900 seconds by validation, and still subordinate to ``reauth_max_age_seconds``
+    #: (an attestation older than that covers nothing, span or no span).
+    reauth_span_seconds: int = Field(default=0, ge=0, le=900)
     #: Proxies whose X-Forwarded-For may be believed. Everything else uses the peer address.
     trusted_proxy_cidrs: tuple[str, ...] = ()
     default_locale: str = "en-US"
@@ -115,6 +121,12 @@ class Settings(BaseSettings):
     # ----------------------------------------------------------------- limits
     max_template_bytes: int = 20 * 1024 * 1024
     max_template_pages: int = 50
+    #: Addendum 1 A. A scan of a paper-signed document (``POST /v1/archives``) is inspected under
+    #: the template hygiene rules with these bounds instead of the template ones: image-only pages
+    #: are larger than rendered text, and a long consent packet has more of them. The archive
+    #: route admits a body up to ``max_scan_bytes`` plus multipart overhead, not ``max_request_bytes``.
+    max_scan_bytes: int = 20 * 1024 * 1024
+    max_scan_pages: int = 100
     max_signature_png_bytes: int = 1024 * 1024
     max_signature_png_pixels: int = 4_000_000
     #: Per-axis bounds. A 4000x1 image passes the byte and pixel limits and is not a signature,

@@ -56,6 +56,7 @@ from esign.contracts import (
     Host,
     IdentityService,
     IntegrityFailure,
+    NewArchive,
     NewEnvelope,
     NewSigner,
     NotFound,
@@ -145,6 +146,13 @@ class EnvelopeServiceImpl:
         self._notifier = notifier
 
     # ----------------------------------------------------------------- creation
+
+    def create_archive(
+        self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext
+    ) -> EnvelopeView:
+        # TODO(addendum-1 A, paper archives): see the contract for everything this must enforce.
+        _ = (db, host, spec, scan, ctx)
+        raise NotImplementedError("Addendum 1 A (paper archives): EnvelopeService.create_archive")
 
     def create(self, db: Session, host: Host, spec: NewEnvelope, ctx: RequestContext) -> EnvelopeView:
         now = self._clock.now()

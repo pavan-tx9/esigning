@@ -173,6 +173,34 @@ _SAMPLES: dict[EventType, Callable[[], dict[str, Any]]] = {
         "blobs_checked": 3,
         "problem_count": 0,
     },
+    # Addendum 1
+    EventType.ARCHIVE_CREATED: lambda: {
+        "host_id": UUID_A,
+        "document_type": "procedure_consent",
+        "page_count": 6,
+        "size_bytes": 1_204_811,
+        "scan_sha256": DIGEST_A,
+        "supersedes_envelope_id": None,
+    },
+    EventType.ARCHIVE_ATTESTED: lambda: {
+        "staff_user_id": "staff-3310",
+        "statement": "true_copy",
+        "original_disposition": "retained",
+        "paper_signer_count": 2,
+    },
+    EventType.SIGNATURE_ADOPTED: lambda: {
+        "signer_id": UUID_A,
+        "adopted_signature_id": UUID_B,
+        "kind": "drawn",
+        "image_sha256": DIGEST_B,
+        "typed_text_sha256": None,
+    },
+    EventType.SIGNATURE_ADOPTION_REVOKED: lambda: {
+        "host_id": UUID_A,
+        "host_user_id": "user-90412",
+        "adopted_signature_id": UUID_B,
+        "reason": "replaced",
+    },
 }
 
 

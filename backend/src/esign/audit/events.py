@@ -31,9 +31,14 @@ from pydantic.functional_validators import AfterValidator
 from esign.audit.canonical import canonical_value
 from esign.contracts import (
     OPAQUE_ID_PATTERN,
+    AdoptedRevokeReason,
+    AdoptedSignatureKind,
+    AttestationStatement,
     BlobKind,
     Capacity,
     EventType,
+    OriginalDisposition,
+    ReauthScope,
     SealProfile,
     ValidationFailed,
     is_opaque_id,
@@ -113,10 +118,12 @@ Seconds = Annotated[int, Field(ge=0, le=31_536_000)]
 AuthMethod = Literal["password", "password+mfa", "sso", "portal_otp", "pin", "staff_verified"]
 IdentityCheck = Literal["photo_id", "dob_and_name", "known_to_staff", "wristband"]
 SigningOrder = Literal["sequential", "parallel"]
-#: How a field was filled: the three signature capture kinds, or the field type for the two
-#: non-signature fields (which carry no capture kind on the wire).
-CaptureKindName = Literal["drawn", "typed", "click", "checkbox", "text"]
-RevisionKind = Literal["presented", "signer_applied", "final_unsealed", "sealed"]
+#: How a field was filled: the four signature capture kinds (``adopted`` is a saved signature
+#: applied again, Addendum 1 B), or the field type for the two non-signature fields (which carry
+#: no capture kind on the wire).
+CaptureKindName = Literal["drawn", "typed", "click", "adopted", "checkbox", "text"]
+#: ``scan`` is a paper archive's revision 1 (Addendum 1 A).
+RevisionKind = Literal["presented", "signer_applied", "final_unsealed", "sealed", "scan"]
 Audience = Literal["signer", "host"]
 KeyBackend = Literal["local", "aws_kms"]
 
@@ -245,6 +252,14 @@ class SignerSignedData(EventData):
     consent_version: VersionLabel
     reauth_used: bool
     reauth_method: AuthMethod | None = None
+    #: Addendum 1 C: *which* attestation covered this signature, whether it was made in this
+    #: session or borrowed from another within the span, and how old it was at signing. All three
+    #: are set together when ``reauth_used``; none otherwise.
+    reauth_attestation_id: UUID | None = None
+    reauth_scope: ReauthScope | None = None
+    reauth_age_seconds: Seconds | None = None
+    #: Addendum 1 B: the saved signature applied by an ``adopted`` capture, when there was one.
+    adopted_signature_id: UUID | None = None
     #: What this signer was shown, what they signed on top of, and what came out. In a parallel
     #: envelope another signer may move the document between the first two; that has to be visible.
     presented_sha256: Sha256
@@ -338,6 +353,52 @@ class VerificationPerformedData(EventData):
     problem_count: Count = 0
 
 
+# --------------------------------------------------------------------------- addendum 1
+
+
+class ArchiveCreatedData(EventData):
+    """Addendum 1 A: a scan of a paper-signed document was filed. ``document_sha256`` on the row
+    is the scan's hash too. No ``paper_signed_on``: it is a date, and this file keeps date-shaped
+    values out of the trail; the cover page inside the sealed bytes states it."""
+
+    host_id: UUID
+    document_type: Slug
+    page_count: Ordinal
+    size_bytes: ByteSize
+    scan_sha256: Sha256
+    supersedes_envelope_id: UUID | None = None
+
+
+class ArchiveAttestedData(EventData):
+    """Addendum 1 A: who attested the scan and what they said. The staff member by opaque id;
+    the paper signers by count only, because their names are PHI."""
+
+    staff_user_id: OpaqueId
+    statement: AttestationStatement
+    original_disposition: OriginalDisposition
+    paper_signer_count: Ordinal
+
+
+class SignatureAdoptedData(EventData):
+    """Addendum 1 B: a signer saved the signature they adopted. The digest ties the saved ink or
+    text to the chain, exactly as :class:`CaptureRef` does for a capture."""
+
+    signer_id: UUID
+    adopted_signature_id: UUID
+    kind: AdoptedSignatureKind
+    image_sha256: Sha256 | None = None
+    typed_text_sha256: Sha256 | None = None
+
+
+class SignatureAdoptionRevokedData(EventData):
+    """Addendum 1 B, on the ``system`` stream: a saved signature stopped being offered."""
+
+    host_id: UUID
+    host_user_id: OpaqueId
+    adopted_signature_id: UUID
+    reason: AdoptedRevokeReason
+
+
 #: Every event type has a declared shape. There is no default and no fallback: a new member of
 #: :class:`EventType` without an entry here fails at import, not in production.
 EVENT_DATA_MODELS: Final[Mapping[EventType, type[EventData]]] = {
@@ -364,6 +425,10 @@ EVENT_DATA_MODELS: Final[Mapping[EventType, type[EventData]]] = {
     EventType.ENVELOPE_EXPIRED: EnvelopeExpiredData,
     EventType.ENVELOPE_SUPERSEDED: EnvelopeSupersededData,
     EventType.VERIFICATION_PERFORMED: VerificationPerformedData,
+    EventType.ARCHIVE_CREATED: ArchiveCreatedData,
+    EventType.ARCHIVE_ATTESTED: ArchiveAttestedData,
+    EventType.SIGNATURE_ADOPTED: SignatureAdoptedData,
+    EventType.SIGNATURE_ADOPTION_REVOKED: SignatureAdoptionRevokedData,
 }
 
 _MISSING = sorted(member.value for member in EventType if member not in EVENT_DATA_MODELS)
@@ -426,4 +491,9 @@ CLOSED_VOCABULARIES: Final[Mapping[str, tuple[str, ...]]] = {
     "capacity": get_args(Capacity),
     "blob_kind": get_args(BlobKind),
     "seal_profile": get_args(SealProfile),
+    "reauth_scope": get_args(ReauthScope),
+    "adopted_signature_kind": get_args(AdoptedSignatureKind),
+    "adopted_revoke_reason": get_args(AdoptedRevokeReason),
+    "attestation_statement": get_args(AttestationStatement),
+    "original_disposition": get_args(OriginalDisposition),
 }
