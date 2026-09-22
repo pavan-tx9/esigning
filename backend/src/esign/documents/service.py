@@ -89,6 +89,25 @@ class PdfDocumentService:
         log.info("documents.scan_inspected", page_count=info.page_count, sha256=info.sha256, size_bytes=len(pdf))
         return info
 
+    def inspect_supplied_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        # TODO(addendum-2, host-supplied documents): the template hygiene rules under
+        # max_supplied_document_bytes / max_supplied_document_pages, with ``supplied_`` codes --
+        # ``inspect_scan_pdf`` above is the shape. Widgets are still legal at this point.
+        _ = pdf
+        raise NotImplementedError("Addendum 2 (host documents): DocumentService.inspect_supplied_pdf")
+
+    def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
+        # TODO(addendum-2, host-supplied documents): map AcroForm widgets to FieldDefs by name;
+        # see the contract for the naming rules, the geometry and ``fields_unresolved``.
+        _ = (pdf, signer_roles)
+        raise NotImplementedError("Addendum 2 (host documents): DocumentService.resolve_named_fields")
+
+    def flatten_supplied(self, pdf: bytes) -> bytes:
+        # TODO(addendum-2, host-supplied documents): widgets and annotations removed, page content
+        # untouched, page count unchanged (else ``supplied_flatten_changed_pages``).
+        _ = pdf
+        raise NotImplementedError("Addendum 2 (host documents): DocumentService.flatten_supplied")
+
     def validate_definitions(
         self,
         info: TemplatePdfInfo,

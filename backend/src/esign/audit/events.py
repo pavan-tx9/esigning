@@ -38,6 +38,7 @@ from esign.contracts import (
     BlobKind,
     Capacity,
     EventType,
+    FieldSourceKind,
     OriginalDisposition,
     ReauthScope,
     SealProfile,
@@ -124,8 +125,9 @@ SigningOrder = Literal["sequential", "parallel"]
 #: applied again, Addendum 1 B), or the field type for the two non-signature fields (which carry
 #: no capture kind on the wire).
 CaptureKindName = Literal["drawn", "typed", "click", "adopted", "checkbox", "text"]
-#: ``scan`` is a paper archive's revision 1 (Addendum 1 A).
-RevisionKind = Literal["presented", "signer_applied", "final_unsealed", "sealed", "scan"]
+#: ``scan`` is a paper archive's revision 1 (Addendum 1 A); ``supplied`` is a host document's
+#: (Addendum 2), the flattened bytes the signer is shown.
+RevisionKind = Literal["presented", "signer_applied", "final_unsealed", "sealed", "scan", "supplied"]
 Audience = Literal["signer", "host"]
 KeyBackend = Literal["local", "aws_kms"]
 
@@ -161,10 +163,16 @@ class TemplateRetiredData(EventData):
 
 
 class EnvelopeCreatedData(EventData):
+    """Addendum 2: the three template fields are optional, and are all ``null`` together on a
+    ``host_document`` envelope -- there is no published version to name, and the
+    ``document.supplied`` event that follows on the same stream says where the document did come
+    from. A template envelope still sets all three, and verification still compares them with the
+    envelope row (SPEC section 13, fourth round)."""
+
     host_id: UUID
-    template_key: KeySlug
-    template_version: Ordinal
-    template_version_id: UUID
+    template_key: KeySlug | None = None
+    template_version: Ordinal | None = None
+    template_version_id: UUID | None = None
     document_type: Slug
     signing_order: SigningOrder
     signer_count: Ordinal
@@ -425,6 +433,33 @@ class SignatureAdoptionRevokedData(EventData):
     reason: AdoptedRevokeReason
 
 
+# --------------------------------------------------------------------------- addendum 2
+
+
+class DocumentSuppliedData(EventData):
+    """Addendum 2: revision 1 came from the host, not from a template.
+
+    This takes the place of :class:`DocumentPreparedData` on a ``host_document`` envelope, and it
+    is deliberately not the same shape. There is no prefill to count. What there is instead is the
+    transformation: ``upload_sha256`` is the file as the host sent it (stored as a ``supplied_pdf``
+    blob), ``presented_sha256`` is the flattened result that becomes revision 1 and the bytes every
+    signer is shown, and the row's own ``document_sha256`` is that same presented hash. Both are
+    here because "we flattened what you sent us" is a claim, and two hashes over two stored blobs
+    are evidence of it.
+
+    ``host_document_ref`` is the host's own reference for the document -- a chart note id, a report
+    id. It is the one place a ``host_document_ref`` reaches the trail, so on this path it must be
+    opaque like every other host-chosen identifier (:data:`OpaqueId`): the reference of a report
+    "about" someone must not become a sentence about them.
+    """
+
+    upload_sha256: Sha256
+    presented_sha256: Sha256
+    page_count: Ordinal
+    field_source: FieldSourceKind
+    host_document_ref: OpaqueId | None = None
+
+
 #: Every event type has a declared shape. There is no default and no fallback: a new member of
 #: :class:`EventType` without an entry here fails at import, not in production.
 EVENT_DATA_MODELS: Final[Mapping[EventType, type[EventData]]] = {
@@ -455,6 +490,7 @@ EVENT_DATA_MODELS: Final[Mapping[EventType, type[EventData]]] = {
     EventType.ARCHIVE_ATTESTED: ArchiveAttestedData,
     EventType.SIGNATURE_ADOPTED: SignatureAdoptedData,
     EventType.SIGNATURE_ADOPTION_REVOKED: SignatureAdoptionRevokedData,
+    EventType.DOCUMENT_SUPPLIED: DocumentSuppliedData,
 }
 
 _MISSING = sorted(member.value for member in EventType if member not in EVENT_DATA_MODELS)
@@ -522,4 +558,5 @@ CLOSED_VOCABULARIES: Final[Mapping[str, tuple[str, ...]]] = {
     "adopted_revoke_reason": get_args(AdoptedRevokeReason),
     "attestation_statement": get_args(AttestationStatement),
     "original_disposition": get_args(OriginalDisposition),
+    "field_source": get_args(FieldSourceKind),
 }

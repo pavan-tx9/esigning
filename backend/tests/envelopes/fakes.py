@@ -59,6 +59,7 @@ from esign.contracts import (
     SealUnavailable,
     SealValidation,
     SessionInfo,
+    SignerRoleDef,
     SignerStamp,
     StreamType,
     TemplatePdfInfo,
@@ -345,6 +346,21 @@ class FakeDocumentService:
 
     def inspect_scan_pdf(self, pdf: bytes) -> TemplatePdfInfo:
         return self.inspect_template_pdf(pdf)
+
+    def inspect_supplied_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        # TODO(addendum-2, host-supplied documents): the supplied bounds, with ``supplied_`` codes.
+        _ = pdf
+        raise NotImplementedError("Addendum 2 (host documents): FakeDocumentService.inspect_supplied_pdf")
+
+    def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
+        # TODO(addendum-2, host-supplied documents): deterministic pseudo widgets, one per role.
+        _ = (pdf, signer_roles)
+        raise NotImplementedError("Addendum 2 (host documents): FakeDocumentService.resolve_named_fields")
+
+    def flatten_supplied(self, pdf: bytes) -> bytes:
+        # TODO(addendum-2, host-supplied documents): the same page count, marked as flattened.
+        _ = pdf
+        raise NotImplementedError("Addendum 2 (host documents): FakeDocumentService.flatten_supplied")
 
     def validate_definitions(
         self,

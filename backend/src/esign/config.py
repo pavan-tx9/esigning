@@ -134,6 +134,13 @@ class Settings(BaseSettings):
     #: route admits a body up to ``max_scan_bytes`` plus multipart overhead, not ``max_request_bytes``.
     max_scan_bytes: int = 20 * 1024 * 1024
     max_scan_pages: int = 100
+    #: Addendum 2. A document the host supplies with ``POST /v1/envelopes`` (multipart) is
+    #: inspected under the template hygiene rules with these bounds instead of the template ones:
+    #: a per-patient report is 20 to 30 pages where a template is one to five, and a long one with
+    #: embedded images is bigger than either. The route admits a body up to
+    #: ``max_supplied_document_bytes`` plus multipart overhead, not ``max_request_bytes``.
+    max_supplied_document_bytes: int = 25 * 1024 * 1024
+    max_supplied_document_pages: int = 200
     max_signature_png_bytes: int = 1024 * 1024
     max_signature_png_pixels: int = 4_000_000
     #: Per-axis bounds. A 4000x1 image passes the byte and pixel limits and is not a signature,

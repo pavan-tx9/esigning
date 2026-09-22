@@ -9,6 +9,11 @@ Addendum 1 (docs/SPEC-ADDENDUM-1.md) added paper archives, adopted signatures an
 re-authentication span. Its types and methods are marked ``Addendum 1`` below; migration
 ``0700_addendum_1.sql`` is their schema.
 
+Addendum 2 (docs/SPEC-ADDENDUM-2.md) added host-supplied documents: a second way to create an
+electronic envelope, where the host's backend supplies the PDF over its API key instead of naming
+a published template version. Its types and methods are marked ``Addendum 2``; migration
+``0800_addendum_2.sql`` is their schema. Everything downstream of revision 1 is unchanged.
+
 Conventions:
 - All hashes are raw 32-byte SHA-256 digests (``bytes``), hex only at API and log boundaries.
 - All datetimes are timezone-aware UTC. Time comes from ``Clock``, never from ``datetime.now``.
@@ -143,13 +148,40 @@ class Rect:
 
 @dataclass(frozen=True)
 class FieldDef:
+    """One field a signer fills, positioned on one page.
+
+    Addendum 2: ``page`` is always a stored, 1-based page number. A host supplying a document may
+    write a *negative* page in an ``ExplicitFields`` request (``-1`` is the last page, so a report
+    whose length varies per patient can still place its signature block), but that is an API
+    spelling only: :func:`resolve_page` turns it into a positive page against the document's own
+    page count before any ``FieldDef`` is stored, printed or served. A stored ``FieldDef`` with a
+    negative page would mean a different field every time the page count changed, which is not
+    evidence.
+    """
+
     id: str  # stable within a template version, [a-z0-9_]+
     type: FieldType
-    page: int  # 1-based
+    page: int  # 1-based, after resolve_page
     rect: Rect
     signer_role: str
     required: bool = True
     label: str = ""  # accessible name shown in the UI; must not contain PHI
+
+
+def resolve_page(page: int, page_count: int) -> int:
+    """Addendum 2: the 1-based page a request's ``page`` names, given the document's page count.
+
+    Positive pages are themselves; a negative page counts from the end (``-1`` is the last page,
+    ``-2`` the one before it). ``0`` is not a page, and neither is anything outside the document:
+    both raise :class:`ValidationFailed` (``field_page_out_of_range``). One definition, because
+    the API edge, the documents module and the envelope service must all read ``-1`` the same way.
+    """
+    if page_count < 1:
+        raise ValidationFailed("the document has no pages", code="field_page_out_of_range")
+    resolved = page if page > 0 else page_count + page + 1
+    if page == 0 or resolved < 1 or resolved > page_count:
+        raise ValidationFailed("field page is outside the document", code="field_page_out_of_range")
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -191,6 +223,20 @@ SealProfile = Literal["PAdES-B-T", "PAdES-B-LT", "PAdES-B-LTA"]
 #: Addendum 1 A. ``electronic`` is everything the base spec describes; ``paper_archive`` is a scan
 #: of a document signed in ink, filed by the host with an attestation and sealed like any other.
 EnvelopeKind = Literal["electronic", "paper_archive"]
+
+#: Addendum 2. Where revision 1 of an *electronic* envelope came from. ``template``: rendered from
+#: a published template version with the host's prefill (the base spec, and the default).
+#: ``host_document``: the host's backend supplied the PDF itself over its API key, and the
+#: envelope carries its own field and role definitions instead of a template version's. A
+#: ``paper_archive`` is always ``template``-valued only because the column has to say something:
+#: ``source`` is meaningful for ``kind = "electronic"`` alone, and a CHECK enforces that.
+EnvelopeSource = Literal["template", "host_document"]
+
+#: Addendum 2. How a host document's ``FieldDef`` list was arrived at, as ``document.supplied``
+#: records it: ``named_fields`` from the PDF's own AcroForm widget names, ``explicit`` from rects
+#: the host sent. (The request spells the first one ``{"mode": "named"}``; the trail spells it
+#: out. ``NamedFields.field_source`` and ``ExplicitFields.field_source`` are the one mapping.)
+FieldSourceKind = Literal["named_fields", "explicit"]
 
 #: Addendum 1 C. ``session``: the attestation was made for the session the signature happened in.
 #: ``span``: it was borrowed from another session of the same user on the same host, within
@@ -341,6 +387,16 @@ class CertificateSummary:
     audit_head_hash: bytes  # event_hash of the last event included
     kind: EnvelopeKind = "electronic"
     attestation: Attestation | None = None  # paper_archive only, and required for it
+    #: Addendum 2: where revision 1 came from. For ``host_document`` there is no template
+    #: (``template_key`` and ``template_version`` are ``None``), and the certificate prints
+    #: "Document supplied by the host" in place of the template line, with ``host_document_ref``
+    #: and the upload's SHA-256 -- both of which the ``document.supplied`` event the certificate
+    #: is built from already carries, so neither is taken from a mutable row.
+    source: EnvelopeSource = "template"
+    #: Addendum 2: the host's own reference for the document it supplied. Opaque
+    #: (``is_opaque_id``) on that path, because it reaches the audit trail there. ``None`` for a
+    #: template envelope and for a paper archive, whose references stay out of the trail.
+    host_document_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +424,48 @@ class DocumentService(Protocol):
         say ``scan`` where the template ones say ``template`` (``scan_too_large``,
         ``scan_too_many_pages``, ``scan_encrypted``, ...), so a host reading them knows they are
         about the file it just sent."""
+
+    def inspect_supplied_pdf(self, pdf: bytes) -> TemplatePdfInfo:
+        """Addendum 2: the rules of ``inspect_template_pdf`` -- no encryption, existing
+        signatures, JavaScript (an AcroForm's field and document actions included), XFA, embedded
+        files or launch actions -- under ``MAX_SUPPLIED_DOCUMENT_BYTES`` /
+        ``MAX_SUPPLIED_DOCUMENT_PAGES`` instead of the template bounds, because a generated report
+        is 20 to 30 pages and a template is one to five. A host document *may* still carry AcroForm
+        widgets at this point: they are how ``resolve_named_fields`` finds the signature block, and
+        ``flatten_supplied`` removes them before the bytes become revision 1. The error codes say
+        ``supplied`` where the template ones say ``template`` (``supplied_too_large``,
+        ``supplied_too_many_pages``, ``supplied_encrypted``, ...), so a host reading them knows
+        they are about the file it just sent, exactly as ``inspect_scan_pdf`` does for a scan."""
+
+    def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
+        """Addendum 2: read the supplied PDF's AcroForm widgets and turn them into ``FieldDef``s.
+
+        A widget is claimed by the role whose key its name starts with: ``<role_key>_signature``,
+        ``<role_key>_initials``, ``<role_key>_date`` (``date_signed``), and more generally
+        ``<role_key>__<field_id>`` with an optional type suffix. The resulting ``FieldDef`` takes
+        its ``page`` (1-based, positive) and ``rect`` from the widget, converted into
+        displayed-page coordinates: ``/Rotate`` honoured and a non-zero ``MediaBox`` /
+        ``CropBox`` origin subtracted, so the geometry means the same thing it does for a template
+        (SPEC section 6).
+
+        Every declared role must resolve to at least one *signature* field, or this raises
+        ValidationFailed (``fields_unresolved``) naming the roles that did not -- never the widget
+        names, which the host chose and which the message would echo. Widgets no role claims are
+        not an error: they are dropped here and removed from the bytes by ``flatten_supplied``.
+        Field ids are unique and stable within the envelope; the result is what
+        ``validate_definitions`` is then run against, like a template's."""
+
+    def flatten_supplied(self, pdf: bytes) -> bytes:
+        """Addendum 2: the bytes that become revision 1 of a host-document envelope.
+
+        Removes every widget and annotation and the AcroForm itself, keeps the page content
+        exactly as it is, and embeds nothing new -- no stamp, no cover, no font that was not
+        already there. What comes out has no form fields, no scripts and nothing an editor could
+        fill in, which is the same guarantee ``prepare`` gives for a template. Raises
+        ValidationFailed (``supplied_flatten_changed_pages``) if the result does not have the same
+        page count as the input: a transformation that loses or adds a page is not a flattening,
+        and the hash of what the signer will be shown has to be the hash of what the host sent,
+        page for page."""
 
     def validate_definitions(
         self,
@@ -468,9 +566,13 @@ class Sealer(Protocol):
 
 #: ``scan_pdf`` (Addendum 1 A) is the host's scan of a paper-signed document, as received and
 #: after ``inspect_template_pdf``'s hygiene check; it is a paper archive's revision 1 (kind ``scan``).
+#: ``supplied_pdf`` (Addendum 2) is the host's document *as uploaded*, before flattening. It is
+#: stored beside the flattened revision 1 (kind ``supplied``) and both hashes go into
+#: ``document.supplied``, so the step from what the host sent to what the signer was shown is
+#: itself evidence rather than an assertion.
 BlobKind = Literal[
     "template_pdf", "presented_pdf", "revision_pdf", "final_unsealed_pdf", "sealed_pdf", "signature_image",
-    "scan_pdf",
+    "scan_pdf", "supplied_pdf",
 ]
 
 
@@ -535,6 +637,13 @@ class EventType(StrEnum):
     # one is revoked (data: adopted_signature_id, host_id, host_user_id, reason).
     SIGNATURE_ADOPTED = "signature.adopted"
     SIGNATURE_ADOPTION_REVOKED = "signature.adoption_revoked"
+    # Addendum 2: revision 1 came from the host rather than from a template. Takes the place of
+    # ``document.prepared`` on a ``host_document`` envelope, and says what ``document.prepared``
+    # cannot: the hash of the upload as received, the hash of the flattened bytes the signer will
+    # be shown, the page count, how the fields were arrived at (``named_fields | explicit``) and
+    # the host's own reference for the document. No prefill exists on this path, so there is no
+    # ``prefill_field_count``.
+    DOCUMENT_SUPPLIED = "document.supplied"
 
 
 ActorRole = Literal["patient", "clinician", "staff", "host", "system"]
@@ -854,6 +963,77 @@ class NewEnvelope:
 
 
 @dataclass(frozen=True)
+class NamedFields:
+    """Addendum 2: "find the fields in the PDF I sent you".
+
+    The server reads the document's AcroForm widgets and maps the ones named after a declared role
+    (``DocumentService.resolve_named_fields``). This is the default, and the shape an EHR's report
+    generator can hit without knowing anything about coordinates: it already places a signature
+    block, so it names the widget ``clinician_signature`` and is done.
+    """
+
+    mode: Literal["named"] = "named"
+
+    @property
+    def field_source(self) -> FieldSourceKind:
+        """What ``document.supplied`` records. One mapping, here, not one per caller."""
+        return "named_fields"
+
+
+@dataclass(frozen=True)
+class ExplicitFields:
+    """Addendum 2: "put the fields exactly here".
+
+    ``fields`` are ``FieldDef``s as the host sent them, so each ``page`` may still be negative
+    (``-1`` is the last page: a report whose length varies per patient puts its signature block on
+    the last page without knowing how long it turned out to be). ``resolve_page`` turns every one
+    of them into a positive page against the document's actual page count *before* the definitions
+    are validated (``validate_definitions``, against the real page sizes) or stored.
+    """
+
+    fields: tuple[FieldDef, ...]
+    mode: Literal["explicit"] = "explicit"
+
+    @property
+    def field_source(self) -> FieldSourceKind:
+        return "explicit"
+
+
+#: Addendum 2: the two ways a host document's fields are decided. Omitted in a request means
+#: ``NamedFields()``.
+FieldSpec = NamedFields | ExplicitFields
+
+
+@dataclass(frozen=True)
+class NewHostDocumentEnvelope:
+    """Addendum 2: an electronic envelope whose document the host supplies (``source =
+    host_document``). ``NewEnvelope`` is unchanged and remains the template path.
+
+    There is no ``template_key``, no ``template_version`` and no ``prefill``: the host generated
+    the document, so there is nothing to merge into it. In their place the request carries the
+    document itself, the roles it is signed by, and where the fields are. ``document_type`` must
+    be on the approved list, exactly as a template's is -- compliance decides what may be signed
+    electronically, whoever rendered the PDF.
+    """
+
+    document: bytes  # the PDF as the host sent it; stored as a ``supplied_pdf`` blob unchanged
+    document_type: str  # must be an approved document type
+    patient_ref: str  # opaque (is_opaque_id), like NewEnvelope.patient_ref
+    #: Opaque here, unlike on a template envelope: ``document.supplied`` records it, and the trail
+    #: refuses to hold a fact about a person (``host_document_ref_invalid``).
+    host_document_ref: str | None
+    signing_order: Literal["sequential", "parallel"]
+    signers: tuple[NewSigner, ...]
+    #: The roles this document is signed by, in the shape a template version would carry them.
+    #: Stored on the envelope (``envelopes.field_definitions``) because there is no template
+    #: version to hold them.
+    signer_roles: tuple[SignerRoleDef, ...]
+    fields: FieldSpec = field(default_factory=NamedFields)
+    expires_at: datetime | None = None
+    supersedes_envelope_id: UUID | None = None
+
+
+@dataclass(frozen=True)
 class NewArchive:
     """Addendum 1 A: a scan of a paper-signed document, filed by the host. The scan bytes travel
     beside this (``EnvelopeService.create_archive``), not inside it."""
@@ -883,7 +1063,13 @@ class EnvelopeView:
     """Addendum 1 A: for ``kind == "paper_archive"`` there is no template and no signer, so
     ``template_key``, ``template_version`` and ``signing_order`` are ``None`` and ``signers`` is
     empty; ``paper_signed_on`` and ``attested_at`` are set. For ``electronic`` the two are ``None``
-    and the rest is as before."""
+    and the rest is as before.
+
+    Addendum 2: ``source`` says where revision 1 of an electronic envelope came from. For
+    ``host_document`` there is no template version either, so ``template_key`` and
+    ``template_version`` are ``None`` while ``signing_order``, ``signers`` and every hash are
+    exactly as for a template envelope -- everything downstream of revision 1 is the same
+    pipeline."""
 
     id: UUID
     status: EnvelopeStatus
@@ -903,6 +1089,10 @@ class EnvelopeView:
     kind: EnvelopeKind = "electronic"
     paper_signed_on: date | None = None
     attested_at: datetime | None = None
+    #: Addendum 2. ``template`` for everything the base spec describes (and for a paper archive,
+    #: which has no document source of this kind); ``host_document`` when the host supplied the
+    #: PDF. The API serves it on every ``EnvelopeView``.
+    source: EnvelopeSource = "template"
 
 
 @dataclass(frozen=True)
@@ -970,6 +1160,50 @@ class EnvelopeService(Protocol):
     transaction. Illegal transitions raise Conflict and change nothing."""
 
     def create(self, db: Session, host: Host, spec: NewEnvelope, ctx: RequestContext) -> EnvelopeView: ...
+
+    def create_from_document(
+        self, db: Session, host: Host, spec: NewHostDocumentEnvelope, ctx: RequestContext
+    ) -> EnvelopeView:
+        """Addendum 2: create an electronic envelope from a document the host supplied.
+
+        Everything ``create`` enforces about *people* is enforced identically, by the same code
+        wherever possible: ``document_type`` approved (``document_type_not_approved``),
+        ``patient_ref`` opaque (``patient_ref_invalid``), each signer's ``host_user_id`` opaque
+        (``host_user_id_invalid``), a ``capacity`` its role allows, ``on_behalf_of`` equal to this
+        envelope's ``patient_ref`` for a guardian or proxy, a clinician signer always
+        ``requires_reauth`` whatever ``signer_roles`` says, every required role present, the
+        signing order legal, the expiry defaulted from ``ENVELOPE_DEFAULT_TTL_DAYS``, and
+        ``supersedes_envelope_id`` a sealed envelope of this host, of either kind, not already
+        superseded. ``host_document_ref`` is additionally opaque here
+        (``host_document_ref_invalid``): on this path it reaches the audit trail.
+
+        What is new is how revision 1 is arrived at, in one transaction:
+
+        1. ``inspect_supplied_pdf`` -- the template hygiene rules under
+           ``MAX_SUPPLIED_DOCUMENT_BYTES`` / ``MAX_SUPPLIED_DOCUMENT_PAGES``.
+        2. the fields: ``NamedFields`` resolves them from the PDF's widgets
+           (``resolve_named_fields``); ``ExplicitFields`` takes the host's rects and passes every
+           ``page`` through ``resolve_page``, so nothing negative is stored. Either way the result
+           goes through ``validate_definitions`` against the real page sizes and the declared
+           roles, so a rect off the page or a role with no signature field is refused before
+           anything is written.
+        3. ``flatten_supplied`` -- widgets and annotations gone, page content untouched, page
+           count unchanged.
+        4. the upload is stored write-once as a ``supplied_pdf`` blob and the flattened bytes as
+           revision 1, kind ``supplied`` (blob ``presented_pdf``), with the revision's
+           ``page_count``; the envelope is inserted with ``source = host_document``,
+           ``template_version_id`` NULL and ``field_definitions`` holding the resolved ``FieldDef``
+           and ``SignerRoleDef`` lists; ``presented_sha256`` and ``current_revision_sha256`` are
+           the flattened hash.
+        5. ``envelope.created`` (with no template key or version) then ``document.supplied`` in
+           place of ``document.prepared``: the upload's hash, the presented hash, the page count,
+           ``field_source`` and ``host_document_ref``.
+
+        From here the envelope is an ordinary electronic envelope: sessions, presentation,
+        viewed-every-page, consent, re-authentication (span included), signing, revisions, the
+        certificate, one seal, storage, verification and webhooks are all unchanged, and the
+        signing UI is served this envelope's own field definitions in place of a template
+        version's. Returns the view with ``source = "host_document"``."""
 
     def create_archive(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> EnvelopeView:
         """Addendum 1 A: file a scan of a paper-signed document as a ``paper_archive`` envelope.

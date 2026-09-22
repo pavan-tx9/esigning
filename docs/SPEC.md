@@ -9,25 +9,35 @@ an architecture.
 show who signed, what they saw, that they meant to sign, and that nothing changed afterwards. When
 two designs are otherwise equal, pick the one that produces better evidence.
 
-The contract lives in three files that module authors must not edit. They were revised once, at
-integration, from the module hand-off reports, and again for Addendum 1 (section 14); every such
-revision is listed in section 13:
+The contract lives in four files that module authors must not edit. They were revised once, at
+integration, from the module hand-off reports, and again for Addendum 1 (section 14) and
+Addendum 2 (section 15); every such revision is listed in section 13:
 
 - `backend/src/esign/contracts.py`: every cross-module type and interface
 - `backend/migrations/0001_schema.sql`: the full schema
 - `backend/migrations/0700_addendum_1.sql`: the schema for Addendum 1 (section 14)
+- `backend/migrations/0800_addendum_2.sql`: the schema for Addendum 2 (section 15)
 
 ## 1. Scope
 
 In: authenticated signers (portal patients, in-clinic tablet, clinicians), PDF templates the host
-controls, single and multi-signer envelopes, consent, re-authentication, cryptographic sealing,
-hash-chained audit trail, write-once storage, signer copy, verification tool, webhooks to the host,
-an embeddable signing UI, and a demo host that exercises everything end to end.
+controls, documents the host's backend supplies over its API key (section 15), single and
+multi-signer envelopes, consent, re-authentication, cryptographic sealing, hash-chained audit
+trail, write-once storage, signer copy, verification tool, webhooks to the host, an embeddable
+signing UI, and a demo host that exercises everything end to end.
 
 Out, and must stay out: email-link signing for people without an account, a drag-and-drop template
-builder, bulk send, arbitrary uploaded PDFs at signing time, controlled-substance prescriptions,
+builder, bulk send, PDFs uploaded by signers or end users, controlled-substance prescriptions,
 notarisation, non-US signature regimes. If a request needs one of these, the API refuses with a
 clear error code rather than approximating it.
+
+The exclusion is about *who* supplies the document, not about uploading as such. A file the
+signer's browser hands in at signing time is refused: it is untrusted, it is not what the audit
+trail says was presented, and nothing about it is evidence. A document the host's backend supplies
+server to server, authenticated by the API key that already creates envelopes and attests
+identity, is the same trust boundary as a template the host published -- and it is the common
+clinical case, a report generated per patient with a signature block at the end. Section 15 adds
+that path and nothing else.
 
 ## 2. Architecture
 
@@ -49,7 +59,7 @@ Directory ownership (an agent edits only its own paths):
 
 | Path | Owner |
 |---|---|
-| `backend/src/esign/contracts.py`, `backend/migrations/0001_schema.sql`, `backend/migrations/0700_addendum_1.sql`, `docs/SPEC.md` | architecture, read-only for everyone else |
+| `backend/src/esign/contracts.py`, `backend/migrations/0001_schema.sql`, `backend/migrations/0700_addendum_1.sql`, `backend/migrations/0800_addendum_2.sql`, `docs/SPEC.md` | architecture, read-only for everyone else |
 | `backend/pyproject.toml`, `backend/src/esign/{config,db,clock,ids,logging}.py`, `backend/tests/conftest.py`, `docker-compose.yml`, `Makefile`, `frontend/` scaffold | foundation |
 | `backend/src/esign/audit/`, `backend/src/esign/storage/`, their tests | evidence module |
 | `backend/src/esign/sealing/`, tests | sealing module |
@@ -70,8 +80,9 @@ Plain SQL files in `backend/migrations/`, applied in filename order by `esign mi
 a `schema_migrations` table. `0001` is the schema; `0002_roles.sql` (foundation) creates the roles
 and grants. A module that truly needs a change adds a file in its range (evidence 0100s, sealing
 0200s, documents 0300s, identity 0400s, envelopes 0500s, integration 0600s) and reports it.
-`0700_addendum_1.sql` (architecture) is the schema for section 14; the addendum's features add
-nothing to it and build against it as it stands.
+`0700_addendum_1.sql` (architecture) is the schema for section 14 and `0800_addendum_2.sql` the
+schema for section 15; both were written before their features were, and the features add nothing
+to them -- they build against them as they stand.
 
 ### Database roles
 - `esign_owner` runs migrations.
@@ -97,7 +108,17 @@ the state change.
 
 1. **Prepare**: host calls `POST /v1/envelopes` with template, signers and prefill data. The
    service renders the PDF server-side, flattens it, stores it as revision 1 (`presented`), records
-   its hash. Prefill data is used once and never stored outside the PDF.
+   its hash (`document.prepared`). Prefill data is used once and never stored outside the PDF.
+   An envelope has a `source` (section 15): `template`, which is this, or `host_document`, where
+   the same route takes a multipart request carrying the PDF the host's backend generated, its
+   signer roles and where the fields go. The service then checks the upload's hygiene under
+   `MAX_SUPPLIED_DOCUMENT_BYTES` / `MAX_SUPPLIED_DOCUMENT_PAGES`, resolves the fields (from the
+   PDF's own widget names, or from rects the host sent, whose `page` may count from the end),
+   flattens every widget and annotation away, stores the upload as a `supplied_pdf` blob *and* the
+   flattened bytes as revision 1 (kind `supplied`), and records `document.supplied` with both
+   hashes in place of `document.prepared`. There is no prefill on that path, and there is no
+   template version: the resolved field and role definitions live on the envelope. Steps 2 to 9
+   are identical for both sources.
 2. **Session**: host calls `POST /v1/envelopes/{id}/signers/{sid}/sessions`, attesting how and when
    the user authenticated (and the kiosk context for in-clinic tablets). It gets back an opaque
    token, which it hands to the embedded UI via `postMessage`. The token never appears in a URL.
@@ -245,6 +266,15 @@ the paper original and the attesting staff member, and the cover page and the ce
   `signature.adoption_revoked` is on the `system` stream, with the *host id* as the stream id, so
   one host's revocations form one chain (host, opaque user id, the id, and the reason). Any other
   `system`-stream event a host causes should use the same stream id.
+- Section 15 adds one event type. `document.supplied` takes the place of `document.prepared` on a
+  `host_document` envelope and carries the upload's hash, the presented (flattened) hash, the page
+  count, `field_source` (`named_fields | explicit`) and `host_document_ref`. Two hashes rather
+  than one because "we flattened what you sent" is a claim, and two stored blobs are evidence of
+  it. `host_document_ref` is the only place that reference reaches the trail, so on that path it
+  must be opaque like every other host-chosen identifier. `envelope.created`'s `template_key`,
+  `template_version` and `template_version_id` became optional, and are all null together on a
+  `host_document` envelope: there is no published version to name, and the `document.supplied`
+  that follows says where the document did come from.
 - `signer.signed` gained `reauth_attestation_id`, `reauth_scope` and `reauth_age_seconds`, set
   together whenever `reauth_used`, and `adopted_signature_id` when an `adopted` capture was
   applied. Capture kinds in the trail are `drawn | typed | click | adopted | checkbox | text`.
@@ -365,9 +395,9 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 | `POST /v1/templates/{key}/versions/{n}/publish` | publish (immutable from here) |
 | `POST /v1/templates/{key}/versions/{n}/retire` | retire |
 | `GET /v1/templates`, `GET /v1/templates/{key}` | list, detail |
-| `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names) |
+| `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names). Section 15: the same route also accepts a **multipart** request -- `document` (the PDF the host generated) plus `body` (JSON: `NewEnvelope` minus `template_key`/`template_version`/`prefill`, plus `document_type`, `signer_roles` (a `SignerRoleDef` list) and `fields`: `{"mode": "named"}`, the default, or `{"mode": "explicit", "fields": [FieldDef...]}` where `page` may count from the end (`-1` is the last page)), i.e. `NewHostDocumentEnvelope`. The request-size limit for a multipart request on this route is `MAX_SUPPLIED_DOCUMENT_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES`; the `Idempotency-Key` request hash covers the document bytes. Returns an `EnvelopeView` with `source: "host_document"` |
 | `POST /v1/archives` | section 14 A: file a scan of a paper-signed document. Multipart: `scan` (a PDF; converting images is the host's job) + `body` (JSON text: `{patient_ref, document_type, host_document_ref?, paper_signed_on, attestation: {staff_user_id, staff_display_name, statement: "true_copy", original_disposition, paper_signers: [{display_name, capacity}]}, supersedes_envelope_id?}`, i.e. `NewArchive`). Supports `Idempotency-Key`. Returns an `EnvelopeView` with `kind: "paper_archive"`. The request-size limit for this route is `MAX_SCAN_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES` |
-| `GET /v1/envelopes/{id}` | `EnvelopeView`. Gained `kind`; for a paper archive `template_key`, `template_version` and `signing_order` are `null`, `signers` is empty, and `paper_signed_on` and `attested_at` are set. `/document`, `/audit`, `/verification` and `/void` apply to both kinds |
+| `GET /v1/envelopes/{id}` | `EnvelopeView`. Gained `kind`; for a paper archive `template_key`, `template_version` and `signing_order` are `null`, `signers` is empty, and `paper_signed_on` and `attested_at` are set. Gained `source` (section 15): for a host document `template_key` and `template_version` are `null` and everything else is as for a template envelope. `/document`, `/audit`, `/verification` and `/void` apply to every kind and source |
 | `POST /v1/envelopes/{id}/void` | `{reason_code}` from the fixed list `contracts.VOID_REASON_CODES` (a host-invented code would be free text with underscores, and it reaches the audit trail) |
 | `POST /v1/envelopes/{id}/signers/{sid}/sessions` | `{auth: {method, auth_time}, kiosk?: {staff_user_id, identity_check}}` -> `{token, session_id, expires_at}` |
 | `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` -> `{session_id, reauth_valid_until}`; another host's session is `not_found`. With the span on (section 14 C) the host still calls this once, on the first document |
@@ -377,7 +407,10 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 | `GET /v1/envelopes/{id}/verification` | run and return a verification report. Always 200 for an envelope that exists: a failed verification is a finding (`ok: false`, `problems`), not a transport error |
 
 Requests outside the scope of section 1 (`POST /v1/envelopes/bulk`, `.../email-links`,
-`.../documents`) are refused with `422 out_of_scope`. There is no `DELETE`, `PUT` or `PATCH` route.
+`.../documents`) are refused with `422 out_of_scope`. `.../documents` stays refused after
+section 15: a host document is supplied as a multipart `POST /v1/envelopes`, and a route that
+sounds like "upload a PDF" is exactly what a signer-side upload would reach for. There is no
+`DELETE`, `PUT` or `PATCH` route.
 
 ### Signer API (`Authorization: Bearer est_...`)
 | Method and path | Purpose |
@@ -451,8 +484,10 @@ The token lives in memory only: not in the URL, not in storage.
 `envelope.completed`, `envelope.sealed`, `envelope.declined`, `envelope.voided`,
 `envelope.expired`. Payload: ids, status, hashes only (`id` of the delivery, `event`,
 `occurred_at`, `envelope_id`, `kind`, `status`, template key and version (not the document type;
-both `null` for a paper archive), the three hashes, and each
-signer's `id`, `role_key` and `status`; never a name, `patient_ref` or `host_document_ref`). A
+both `null` for a paper archive, and both `null` for a host-supplied document too, which has no
+template version), the three hashes, and each
+signer's `id`, `role_key` and `status`; never a name, `patient_ref` or `host_document_ref` --
+including on a host-document envelope, where the host already knows which report it sent). A
 paper archive fires `envelope.sealed` and `envelope.voided` only. Signed
 with `X-Esign-Signature: t=<unix>,v1=<hex hmac-sha256 of "t.body">` using the secret printed once
 by `esign hosts create`; a receiver should reject a `t` more than five minutes old
@@ -796,6 +831,48 @@ contract. Made once, by the integration owner, with the reasons recorded here:
   tests now writes `host_id` / `host_user_id` on attestations and resolves a span, so the envelope
   service can be tested with a queue against the fake as well as the real identity module.
 
+Addendum 2 (section 15), made once by the architecture step before the feature was built, so the
+builders work against a fixed contract. Everything the addendum lists under "Contract and schema
+changes", plus the few things it did not name that the listed ones need:
+
+- **`contracts.py`**: `EnvelopeSource`, `FieldSourceKind`, `NamedFields`, `ExplicitFields` (with
+  a `field_source` property each, so the mapping from the request's `mode` to the trail's
+  `field_source` has one definition), `FieldSpec` and `NewHostDocumentEnvelope`. `NewEnvelope` is
+  untouched: the template path is unchanged, and the two creation shapes stay separate rather than
+  one shape with half its fields conditionally null. `resolve_page(page, page_count)`, the one
+  definition of what `-1` means, because the API edge, the documents module and the envelope
+  service must all read it the same way; `FieldDef.page` stays a positive, 1-based, *stored*
+  number and its docstring says the negative spelling exists only at the boundary.
+  `DocumentService.resolve_named_fields` and `flatten_supplied`; `EnvelopeService.create_from_document`;
+  `BlobKind` gains `supplied_pdf`; `EventType` gains `document.supplied`; `EnvelopeView.source`;
+  `CertificateSummary.source` and `host_document_ref`.
+- **Not named by the addendum, needed by what is**: `DocumentService.inspect_supplied_pdf`. The
+  supplied bounds differ from the template ones, `inspect_template_pdf` reads its bounds from the
+  settings the service was built with, and the reconciliation after Addendum 1 records what
+  happens otherwise -- a second document service built from a copy of `Settings` with two values
+  swapped. One service, one more method, `supplied_` codes, exactly as `inspect_scan_pdf` does for
+  a scan.
+- **`0800_addendum_2.sql`**: `envelopes.source` and `envelopes.field_definitions`, with
+  `envelopes_source_check`, `envelopes_source_kind` (`source` is meaningful for `kind =
+  electronic` alone), `envelopes_source_field_definitions` and `envelopes_field_definitions_shape`;
+  `envelopes_kind_template` from `0700` is replaced by `envelopes_source_template`, so exactly the
+  electronic envelopes that say `template` name a template version. `blobs.kind` gains
+  `supplied_pdf` and `document_revisions.kind` gains `supplied`.
+  `document_revisions.page_count` is recorded when a revision is written: nullable and never
+  backfilled, because the table is append-only and its trigger refuses UPDATE, so rows from before
+  `0800` keep `null` and are counted the old way. Grants are unchanged -- no new table, and the app
+  role's existing rights say what they allow.
+- **`config.py`**: `max_supplied_document_bytes` (25 MiB), `max_supplied_document_pages` (200).
+  `check_production_settings` refuses nothing new.
+- **Audit allowlist**: `DocumentSuppliedData` (`upload_sha256`, `presented_sha256`, `page_count`,
+  `field_source`, `host_document_ref`, the last of them an `OpaqueId`), `RevisionKind` gains
+  `supplied`, and `EnvelopeCreatedData`'s three template fields became optional so a host-document
+  envelope can record its own creation. `signer.signed` is untouched, so `audit/README.md`'s
+  worked vector still stands.
+- **Stubs**: every new Protocol method raises `NotImplementedError` with a `TODO` naming the
+  feature, in `PdfDocumentService`, `EnvelopeServiceImpl` and the envelope tests'
+  `FakeDocumentService`, so the tree stays green until each builder replaces its own.
+
 ## 14. Addendum 1: paper archives, adopted signatures, re-authentication span
 
 `docs/SPEC-ADDENDUM-1.md` adds three features to this spec and is normative for them:
@@ -817,3 +894,53 @@ changes were made once, up front (section 13, "Addendum 1"), in `contracts.py`,
 `0700_addendum_1.sql`, `config.py` and this document; the sections above that changed say so
 inline. The addendum's Documents, Frontend, Demo host and Tests headings apply to sections 6, 11
 and 12 without restating them here.
+
+## 15. Addendum 2: host-supplied documents
+
+`docs/SPEC-ADDENDUM-2.md` adds a second way to create an *electronic* envelope and is normative
+for it: the host's backend supplies the document itself, over the API key it already uses to
+create envelopes and attest identity, instead of naming a published template version. The case it
+exists for is the common clinical one -- a report the EHR generates per patient, 20 to 30 pages,
+different every time, with a signature block at the end for the clinician (and sometimes a second
+for a co-signer). A template cannot express that document, and section 1's exclusion was never
+aimed at it.
+
+- **Source**: `envelopes.source` is `template` (everything sections 1 to 14 describe) or
+  `host_document`. For `host_document` there is no template version; the resolved `FieldDef` and
+  `SignerRoleDef` lists live in `envelopes.field_definitions`, and the signing UI is served them
+  in place of a template version's. `source` applies to `kind = electronic` only (a scan arrives
+  through `POST /v1/archives` with an attestation), and a CHECK says so.
+- **Revision 1**: the upload passes the template hygiene rules -- no encryption, existing
+  signatures, JavaScript, XFA, embedded files or launch actions -- under
+  `MAX_SUPPLIED_DOCUMENT_BYTES` (25 MiB) and `MAX_SUPPLIED_DOCUMENT_PAGES` (200). Its fields are
+  resolved either from the PDF's own AcroForm widget names (`<role_key>_signature`,
+  `_initials`, `_date`, or `<role_key>__<field_id>`) or from explicit rects the host sent, whose
+  `page` may count from the end (`-1` is the last page, because the page count varies per
+  patient) and is resolved to a positive page before anything is stored. Every declared role must
+  resolve to at least one signature field. Then every widget and annotation is flattened away,
+  the upload is stored as a `supplied_pdf` blob, and the flattened bytes become revision 1 of kind
+  `supplied`.
+- **Evidence**: `document.supplied` replaces `document.prepared` and records both hashes, the
+  page count, how the fields were arrived at, and the host's reference for the document, so the
+  step from what the host sent to what the signer was shown is evidence rather than an assertion.
+  The certificate of completion prints "Document supplied by the host" in place of the template
+  line, with that reference and the upload's hash (`CertificateSummary.source`,
+  `host_document_ref`).
+- **Unchanged**: everything downstream of revision 1 -- presentation, viewed-every-page, consent,
+  re-authentication and the span, signing, revisions, the certificate, the single seal, storage,
+  verification, webhooks, the signing UI, and Addendum 1's adopted signatures. Approved document
+  types apply exactly as they do to a template: compliance decides what may be signed
+  electronically, whoever rendered the PDF.
+
+**What this weakens.** Nothing in the evidence chain: the document is hashed and recorded before
+anyone sees it, and every later step is identical. What changes is *provenance* -- the content came
+from the host rather than from a version somebody published and retired deliberately -- and the
+trail and the certificate say so rather than leaving it to be inferred. What stays excluded is a
+PDF from a signer or an end user at signing time (section 1): that is a different trust boundary,
+and no amount of hashing makes an untrusted upload into evidence of what a clinic meant to present.
+
+Everything in sections 1 to 14 still applies; where the addendum is silent, this document decides.
+Its contract and schema changes were made once, up front (section 13, "Addendum 2"), in
+`contracts.py`, `0800_addendum_2.sql`, `config.py` and this document; the sections above that
+changed say so inline. The addendum's Documents module, Demo host and Tests headings apply to
+sections 6, 11 and 12 without restating them here.

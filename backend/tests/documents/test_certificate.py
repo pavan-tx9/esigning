@@ -131,6 +131,11 @@ def test_nothing_but_the_summary_reaches_the_page(documents: DocumentService) ->
         # and nowhere else.
         "kind",
         "attestation",
+        # Addendum 2: where revision 1 came from. `host_document_ref` is the host's own reference
+        # for the document it supplied -- opaque, and already in `document.supplied` on the trail
+        # this page is built from, so it is not a new place for chart data to arrive from.
+        "source",
+        "host_document_ref",
     }
 
 

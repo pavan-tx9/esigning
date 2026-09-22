@@ -204,6 +204,14 @@ _SAMPLES: dict[EventType, Callable[[], dict[str, Any]]] = {
         "adopted_signature_id": UUID_B,
         "reason": "replaced",
     },
+    # Addendum 2
+    EventType.DOCUMENT_SUPPLIED: lambda: {
+        "upload_sha256": DIGEST_A,
+        "presented_sha256": DIGEST_B,
+        "page_count": 27,
+        "field_source": "named_fields",
+        "host_document_ref": "report-55120",
+    },
 }
 
 

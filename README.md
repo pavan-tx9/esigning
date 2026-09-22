@@ -754,12 +754,13 @@ in KMS and only its *identifier* is configuration.
 | `MAX_TEMPLATE_BYTES` | 20 MiB | |
 | `MAX_TEMPLATE_PAGES` | `50` | |
 | `MAX_SCAN_BYTES` / `MAX_SCAN_PAGES` | 20 MiB / `100` | a scan filed with `POST /v1/archives` (image-only pages are large) |
+| `MAX_SUPPLIED_DOCUMENT_BYTES` / `MAX_SUPPLIED_DOCUMENT_PAGES` | 25 MiB / `200` | a document the host supplies with a multipart `POST /v1/envelopes` (a generated report is 20 to 30 pages where a template is one to five) |
 | `MAX_SIGNATURE_PNG_BYTES` | 1 MiB | |
 | `MAX_SIGNATURE_PNG_PIXELS` | 4,000,000 | |
 | `MAX_SIGNATURE_PNG_DIMENSION` / `MIN_SIGNATURE_PNG_DIMENSION` | `4000` / `8` | a 4000×1 image passes a pixel budget and is not a signature |
 | `MAX_TYPED_SIGNATURE_CHARS` | `200` | stamped into the document and kept for years |
 | `MAX_TEXT_FIELD_CHARS` | `2000` | likewise |
-| `MAX_REQUEST_BYTES` | 8 MiB | enforced while the body is arriving, not after. Two routes carry files and are bounded by their own limit plus 1 MiB of multipart framing instead: `POST /v1/templates` by `MAX_TEMPLATE_BYTES`, `POST /v1/archives` by `MAX_SCAN_BYTES`. Over the bound is `413 payload_too_large`; an oversized `scan` part inside a legal request is `scan_too_large` |
+| `MAX_REQUEST_BYTES` | 8 MiB | enforced while the body is arriving, not after. Three routes carry files and are bounded by their own limit plus 1 MiB of multipart framing instead: `POST /v1/templates` by `MAX_TEMPLATE_BYTES`, `POST /v1/archives` by `MAX_SCAN_BYTES`, and a multipart `POST /v1/envelopes` by `MAX_SUPPLIED_DOCUMENT_BYTES`. Over the bound is `413 payload_too_large`; an oversized file part inside a legal request is `scan_too_large` / `supplied_too_large` |
 
 ### API and worker
 

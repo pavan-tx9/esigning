@@ -62,6 +62,7 @@ from esign.contracts import (
     IntegrityFailure,
     NewArchive,
     NewEnvelope,
+    NewHostDocumentEnvelope,
     NewSigner,
     NotFound,
     ReauthEvidence,
@@ -179,6 +180,16 @@ class EnvelopeServiceImpl:
             raise Conflict("filing a paper archive is not available here", code="archives_unavailable")
         envelope_id = self._archives.create(db, host, spec, scan, ctx)
         return self.get(db, host, envelope_id)
+
+    def create_from_document(
+        self, db: Session, host: Host, spec: NewHostDocumentEnvelope, ctx: RequestContext
+    ) -> EnvelopeView:
+        # TODO(addendum-2, host-supplied documents): everything ``create`` enforces about people,
+        # plus inspect_supplied_pdf -> fields (named or explicit, pages resolved) ->
+        # validate_definitions -> flatten_supplied -> the upload and revision 1 stored ->
+        # envelope.created + document.supplied. See the contract.
+        _ = (db, host, spec, ctx)
+        raise NotImplementedError("Addendum 2 (host documents): EnvelopeService.create_from_document")
 
     def create(self, db: Session, host: Host, spec: NewEnvelope, ctx: RequestContext) -> EnvelopeView:
         now = self._clock.now()
