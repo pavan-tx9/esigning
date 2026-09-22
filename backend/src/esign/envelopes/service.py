@@ -55,6 +55,7 @@ from esign.contracts import (
     EnvelopeView,
     EsignError,
     EventType,
+    ExplicitFields,
     FieldDef,
     Forbidden,
     Host,
@@ -76,13 +77,17 @@ from esign.contracts import (
     SignerView,
     SigningFieldView,
     SigningView,
+    TemplatePdfInfo,
     ValidationFailed,
     WebhookEvent,
     is_opaque_id,
+    resolve_page,
 )
 from esign.envelopes import repository as repo
 from esign.envelopes.definitions import (
     SIGNABLE_FIELD_TYPES,
+    field_definitions_json,
+    parse_envelope_definitions,
     parse_field_defs,
     parse_prefill_fields,
     parse_signer_roles,
@@ -127,12 +132,21 @@ class _Loaded:
     Addendum 1 A: a ``paper_archive`` has no template, so ``template`` is ``None`` and ``roles``
     is empty. Every use of the template goes through ``_template_of``, which refuses rather than
     inventing one.
+
+    Addendum 2: a ``host_document`` envelope has no template either, and ``roles`` and ``fields``
+    come from ``envelopes.field_definitions`` instead. Nothing downstream asks where they came
+    from: ``fields`` is read through ``_fields_of`` and the roles are already in ``roles``, so
+    presentation, the session payload, signing and the certificate are one code path for both
+    sources.
     """
 
     envelope: repo.EnvelopeRow
     signers: tuple[repo.SignerRow, ...]
     roles: dict[str, SignerRoleDef]
     template: repo.TemplateVersionRow | None
+    #: Addendum 2: the envelope's own field list for a host document; ``None`` for everything
+    #: else, where the template version holds it.
+    fields: tuple[FieldDef, ...] | None = None
 
 
 class EnvelopeServiceImpl:
@@ -184,12 +198,198 @@ class EnvelopeServiceImpl:
     def create_from_document(
         self, db: Session, host: Host, spec: NewHostDocumentEnvelope, ctx: RequestContext
     ) -> EnvelopeView:
-        # TODO(addendum-2, host-supplied documents): everything ``create`` enforces about people,
-        # plus inspect_supplied_pdf -> fields (named or explicit, pages resolved) ->
-        # validate_definitions -> flatten_supplied -> the upload and revision 1 stored ->
-        # envelope.created + document.supplied. See the contract.
-        _ = (db, host, spec, ctx)
-        raise NotImplementedError("Addendum 2 (host documents): EnvelopeService.create_from_document")
+        """Addendum 2: an electronic envelope whose PDF the host's backend supplied.
+
+        The people half is ``create``'s, by the same code: the approved document type, the opaque
+        references, the roles a capacity is allowed in, ``on_behalf_of``, the required roles, the
+        expiry, the superseded envelope. The document half is new, and runs in this order so that
+        nothing is written until every refusal has had its chance:
+
+        1. hygiene (``inspect_supplied_pdf``), which also gives the real page count and sizes;
+        2. the fields -- resolved from the PDF's widget names, or the host's rects with every
+           ``page`` put through ``resolve_page`` -- then ``validate_definitions`` against those
+           real page sizes and the declared roles;
+        3. ``flatten_supplied``, so what the signer sees carries no form and no annotation;
+        4. the upload and the flattened bytes stored, the envelope and revision 1 inserted;
+        5. ``envelope.created`` (no template) and ``document.supplied`` (both hashes).
+
+        Everything after that is the base spec's, unchanged.
+        """
+        now = self._clock.now()
+        document_type = (spec.document_type or "").strip()
+        if not self._settings.is_approved_document_type(document_type):
+            # Compliance decides what may be signed electronically, whoever rendered the PDF.
+            raise ValidationFailed("document type is not approved here", code="document_type_not_approved")
+        if spec.signing_order not in ("sequential", "parallel"):
+            raise ValidationFailed("unknown signing order", code="signing_order_invalid")
+
+        patient_ref = _require_opaque(spec.patient_ref, "patient_ref_invalid")
+        # Opaque here and nowhere else: on this path ``document.supplied`` records it, and the
+        # trail refuses to hold a fact about a person.
+        host_document_ref = (
+            None
+            if spec.host_document_ref is None
+            else _require_opaque(spec.host_document_ref, "host_document_ref_invalid")
+        )
+        roles = self._host_document_roles(spec.signer_roles)
+        planned = self._plan_signers(spec.signers, roles, patient_ref, source="request")
+        expires_at = self._resolve_expiry(spec.expires_at, now)
+        superseded = self._lock_superseded(db, host, spec.supersedes_envelope_id)
+
+        info = self._documents.inspect_supplied_pdf(spec.document)
+        fields = self._resolve_supplied_fields(spec, roles, info)
+        self._documents.validate_definitions(info, list(fields), [], list(roles))
+        flattened = self._documents.flatten_supplied(spec.document)
+
+        retain_until = self._settings.retain_until(document_type, now)
+        # Write-once and content-addressed, both of them. The upload is kept as received so the
+        # step from what the host sent to what the signer was shown can be re-checked rather than
+        # taken on trust (``document.supplied`` carries both hashes).
+        upload = self._blobs.put(db, spec.document, kind="supplied_pdf", retain_until=retain_until)
+        presented = self._blobs.put(db, flattened, kind="presented_pdf", retain_until=retain_until)
+        # ``flatten_supplied`` refuses to change the page count, so the inspected count *is* the
+        # presented count: nothing re-parses 30 pages to learn what it already knows.
+        page_count = info.page_count
+
+        envelope_id = new_id()
+        repo.insert_envelope(
+            db,
+            envelope_id=envelope_id,
+            host_id=host.id,
+            template_version_id=None,
+            document_type=document_type,
+            patient_ref=patient_ref,
+            host_document_ref=host_document_ref,
+            signing_order=spec.signing_order,
+            presented_sha256=presented.sha256,
+            supersedes_envelope_id=superseded.id if superseded else None,
+            expires_at=expires_at,
+            created_at=now,
+            source="host_document",
+            field_definitions=field_definitions_json(fields, roles),
+        )
+        for signer, role in planned:
+            repo.insert_signer(
+                db,
+                signer_id=new_id(),
+                envelope_id=envelope_id,
+                role_key=role.key,
+                host_user_id=signer.host_user_id,
+                display_name=signer.display_name,
+                capacity=signer.capacity,
+                on_behalf_of=signer.on_behalf_of,
+                order_index=role.order_index,
+                # The same standing rule as ``create``: a clinician re-authenticates whatever the
+                # role says, and here the role came from the request, so it matters more.
+                requires_reauth=role.requires_reauth or signer.capacity == "clinician",
+            )
+        repo.insert_revision(
+            db,
+            revision_id=new_id(),
+            envelope_id=envelope_id,
+            revision_no=1,
+            kind="supplied",
+            sha256=presented.sha256,
+            signer_id=None,
+            created_at=now,
+            page_count=page_count,
+        )
+
+        actor = Actor(user_id=None, role="host")
+        self._append(
+            db,
+            envelope_id,
+            EventType.ENVELOPE_CREATED,
+            actor=actor,
+            ctx=ctx,
+            data={
+                "host_id": host.id,
+                # No template key, version or version id: there is no published version to name,
+                # and ``document.supplied`` below says where the document did come from.
+                "document_type": document_type,
+                "signing_order": spec.signing_order,
+                "signer_count": len(planned),
+                "expires_at": expires_at,
+                "supersedes_envelope_id": superseded.id if superseded else None,
+            },
+        )
+        self._append(
+            db,
+            envelope_id,
+            EventType.DOCUMENT_SUPPLIED,
+            actor=actor,
+            ctx=ctx,
+            document_sha256=presented.sha256,
+            data={
+                "upload_sha256": upload.sha256,
+                "presented_sha256": presented.sha256,
+                "page_count": page_count,
+                "field_source": spec.fields.field_source,
+                "host_document_ref": host_document_ref,
+            },
+        )
+        if superseded is not None:
+            self._append(
+                db,
+                superseded.id,
+                EventType.ENVELOPE_SUPERSEDED,
+                actor=actor,
+                ctx=ctx,
+                data={"superseded_by_envelope_id": envelope_id},
+            )
+
+        log.info(
+            "envelope.created",
+            envelope_id=envelope_id,
+            host_id=host.id,
+            document_type=document_type,
+            signing_order=spec.signing_order,
+            signer_count=len(planned),
+            presented_sha256=presented.sha256,
+            page_count=page_count,
+            # ``revision_kind`` rather than a ``source`` key: the structured logger's allowlist is
+            # closed (``esign.logging.LOGGABLE_KEYS``) and ``supplied`` is exactly what says this
+            # envelope's revision 1 came from the host.
+            revision_kind="supplied",
+        )
+        # ``spec.document``, the flattened bytes and the display names never leave this frame.
+        return self.get(db, host, envelope_id)
+
+    def _host_document_roles(self, declared: Sequence[SignerRoleDef]) -> tuple[SignerRoleDef, ...]:
+        """The roles a host document is signed by, checked before anything is planned against them.
+
+        A template's roles were validated once when it was published, and the version is
+        immutable. These arrive with the request, so the two structural rules the rest of this
+        method relies on -- there is at least one, and no key appears twice -- are checked here.
+        Everything else about them (labels, capacities, a clinician role that must re-authenticate,
+        ambiguous order indexes) is ``validate_definitions``' job a few lines later, and it reports
+        every problem at once.
+        """
+        if not declared:
+            raise ValidationFailed("a host document declares at least one signer role", code="signer_roles_required")
+        keys = [role.key for role in declared]
+        if len(set(keys)) != len(keys):
+            raise ValidationFailed("two signer roles share a key", code="duplicate_role")
+        return tuple(declared)
+
+    def _resolve_supplied_fields(
+        self, spec: NewHostDocumentEnvelope, roles: Sequence[SignerRoleDef], info: TemplatePdfInfo
+    ) -> tuple[FieldDef, ...]:
+        """Step 2: where this document's fields are, as positive pages on real page sizes.
+
+        ``NamedFields`` asks the documents module to read the PDF's own widget names.
+        ``ExplicitFields`` takes the host's rects, and every ``page`` goes through
+        ``resolve_page`` -- the one definition of ``-1`` means the last page -- so nothing
+        negative is ever stored, printed or served. A ``page`` outside the document is refused
+        here (``field_page_out_of_range``) rather than reaching ``validate_definitions``, which
+        cannot tell a bad negative page from a bad positive one.
+        """
+        if isinstance(spec.fields, ExplicitFields):
+            return tuple(
+                replace(definition, page=resolve_page(definition.page, info.page_count))
+                for definition in spec.fields.fields
+            )
+        return tuple(self._documents.resolve_named_fields(spec.document, list(roles)))
 
     def create(self, db: Session, host: Host, spec: NewEnvelope, ctx: RequestContext) -> EnvelopeView:
         now = self._clock.now()
@@ -206,7 +406,7 @@ class EnvelopeServiceImpl:
             raise ValidationFailed("unknown signing order", code="signing_order_invalid")
 
         patient_ref = _require_opaque(spec.patient_ref, "patient_ref_invalid")
-        planned = self._plan_signers(spec, roles, patient_ref)
+        planned = self._plan_signers(spec.signers, roles, patient_ref)
         expires_at = self._resolve_expiry(spec.expires_at, now)
         superseded = self._lock_superseded(db, host, spec.supersedes_envelope_id)
 
@@ -261,6 +461,7 @@ class EnvelopeServiceImpl:
             sha256=presented.sha256,
             signer_id=None,
             created_at=now,
+            page_count=page_count,
         )
 
         actor = Actor(user_id=None, role="host")
@@ -353,8 +554,7 @@ class EnvelopeServiceImpl:
         label and status only -- one signer never learns another's name from this service."""
         loaded = self._load(db, session.envelope_id, host=None, lock=False)
         signer = self._signer_of(loaded, session.signer_id)
-        template = self._template_of(loaded)
-        fields = parse_field_defs(template.fields)
+        fields = self._fields_of(loaded)
         current = _require_revision(loaded.envelope.current_revision_sha256)
         requires_reauth = _requires_reauth(loaded.roles.get(signer.role_key), signer.capacity)
         fresh = self._identity.fresh_reauth(db, session.id) if requires_reauth else None
@@ -362,8 +562,8 @@ class EnvelopeServiceImpl:
             envelope_id=loaded.envelope.id,
             envelope_status=loaded.envelope.status,
             document_type=loaded.envelope.document_type,
-            title=template.template_name,
-            page_count=self._documents.page_count(self._blobs.get(db, current)),
+            title=self._title(loaded),
+            page_count=self._page_count(db, loaded.envelope.id, current),
             expires_at=loaded.envelope.expires_at,
             signer=self._signer_view(loaded, signer),
             on_behalf_of_label=signer.on_behalf_of,
@@ -449,7 +649,7 @@ class EnvelopeServiceImpl:
             data={
                 "signer_id": signer.id,
                 "revision_no": repo.latest_revision_no(db, loaded.envelope.id),
-                "page_count": self._documents.page_count(pdf),
+                "page_count": self._page_count(db, loaded.envelope.id, sha),
                 "size_bytes": len(pdf),
             },
         )
@@ -474,8 +674,10 @@ class EnvelopeServiceImpl:
             raise Conflict("the document has not been served to this session", code="not_presented")
 
         # The UI's claim is checked against the bytes this session was actually served, not
-        # against a number the UI also supplied.
-        page_count = self._documents.page_count(self._blobs.get(db, presented))
+        # against a number the UI also supplied. The count comes from the revision row that
+        # recorded those bytes (Addendum 2), and from parsing them for a revision written before
+        # ``0800``; either way it is a fact about the served document, not about the request.
+        page_count = self._page_count(db, loaded.envelope.id, presented)
         if pages_viewed != page_count:
             raise ValidationFailed("every page must be displayed before continuing", code="pages_not_all_viewed")
 
@@ -579,7 +781,7 @@ class EnvelopeServiceImpl:
         if presented != base_sha:
             raise Conflict("this document has changed since it was read", code="not_viewed")
 
-        fields = parse_field_defs(self._template_of(loaded).fields)
+        fields = self._fields_of(loaded)
         mine = tuple(f for f in fields if f.signer_role == signer.role_key)
         by_id = {f.id: f for f in fields}
         accepted = self._check_captures(fields, mine, captures, signer.role_key)
@@ -613,6 +815,10 @@ class EnvelopeServiceImpl:
             sha256=revision.sha256,
             signer_id=signer.id,
             created_at=now,
+            # Counted from the bytes that were actually produced, not carried over from the base
+            # revision: stamping is not supposed to add a page, and a recorded count that merely
+            # assumed so would be the wrong kind of evidence. One parse per signature.
+            page_count=self._documents.page_count(stamped),
         )
         repo.update_envelope(db, loaded.envelope.id, current_revision_sha256=revision.sha256)
         repo.update_signer(db, signer.id, status="signed", signed_at=now)
@@ -832,6 +1038,7 @@ class EnvelopeServiceImpl:
         retain_until = self._settings.retain_until(envelope.document_type, now)
         unsealed = self._blobs.put(db, final_unsealed, kind="final_unsealed_pdf", retain_until=retain_until)
         unsealed_no = repo.next_revision_no(db, envelope.id)
+        final_pages = self._documents.page_count(final_unsealed)
         repo.insert_revision(
             db,
             revision_id=new_id(),
@@ -841,6 +1048,7 @@ class EnvelopeServiceImpl:
             sha256=unsealed.sha256,
             signer_id=None,
             created_at=now,
+            page_count=final_pages,
         )
         result = self._sealer.seal(final_unsealed, reason=_SEAL_REASON, envelope_id=envelope.id)
 
@@ -871,6 +1079,9 @@ class EnvelopeServiceImpl:
             sha256=sealed.sha256,
             signer_id=None,
             created_at=now,
+            # The seal is a signature inside the same pages: ``validate`` has just confirmed it
+            # covers the whole document, so the sealed revision has the finalized one's pages.
+            page_count=final_pages,
         )
         repo.update_envelope(
             db,
@@ -891,7 +1102,7 @@ class EnvelopeServiceImpl:
             document_sha256=unsealed.sha256,
             data={
                 "certificate_sha256": hashlib.sha256(certificate).digest(),
-                "page_count": self._documents.page_count(final_unsealed),
+                "page_count": final_pages,
                 "size_bytes": unsealed.size_bytes,
                 "audit_event_count": summary.audit_event_count,
                 "audit_head_hash": summary.audit_head_hash,
@@ -1061,12 +1272,25 @@ class EnvelopeServiceImpl:
             raise IntegrityFailure("the envelope has no completion time", code="missing_completed_at")
         _require_agreement(envelope.id, None, "envelopes.completed_at", envelope.completed_at, completed.occurred_at)
 
-        prepared = _first_event(events, EventType.DOCUMENT_PREPARED)
         presented_sha = _require_revision(envelope.presented_sha256)
-        if prepared is None or prepared.document_sha256 != presented_sha:
-            raise IntegrityFailure(
-                "the presented revision does not match document.prepared", code="certificate_evidence_mismatch"
-            )
+        # Addendum 2: ``document.supplied`` is a host document's ``document.prepared`` -- the
+        # event that says which bytes revision 1 is -- and it carries the two facts the
+        # certificate prints in place of the template line. Both come from the trail, not from the
+        # (UPDATE-able) ``envelopes`` row.
+        host_document_ref: str | None = None
+        if envelope.source == "host_document":
+            supplied = _first_event(events, EventType.DOCUMENT_SUPPLIED)
+            if supplied is None or supplied.document_sha256 != presented_sha:
+                raise IntegrityFailure(
+                    "the presented revision does not match document.supplied", code="certificate_evidence_mismatch"
+                )
+            host_document_ref = _opt_str(supplied.data.get("host_document_ref"))
+        else:
+            prepared = _first_event(events, EventType.DOCUMENT_PREPARED)
+            if prepared is None or prepared.document_sha256 != presented_sha:
+                raise IntegrityFailure(
+                    "the presented revision does not match document.prepared", code="certificate_evidence_mismatch"
+                )
 
         # The document-level facts get the same treatment as the per-signer ones. ``envelopes`` is
         # UPDATE-able by the runtime role and ``template_version_id`` is a pointer, so "Created",
@@ -1081,16 +1305,25 @@ class EnvelopeServiceImpl:
         _require_same(
             envelope.id, None, "envelopes.document_type", envelope.document_type, created.data.get("document_type")
         )
-        _require_same(
-            envelope.id,
-            None,
-            "envelopes.template_version_id",
-            str(envelope.template_version_id),
-            created.data.get("template_version_id"),
-        )
-        template = self._template_of(loaded)
-        _require_same(envelope.id, None, "template_key", template.template_key, created.data.get("template_key"))
-        _require_same(envelope.id, None, "template_version", template.version, created.data.get("template_version"))
+        template_key: str | None = None
+        template_version: int | None = None
+        if envelope.source == "template":
+            _require_same(
+                envelope.id,
+                None,
+                "envelopes.template_version_id",
+                str(envelope.template_version_id),
+                created.data.get("template_version_id"),
+            )
+            template = self._template_of(loaded)
+            template_key = template.template_key
+            template_version = template.version
+            _require_same(envelope.id, None, "template_key", template_key, created.data.get("template_key"))
+            _require_same(envelope.id, None, "template_version", template_version, created.data.get("template_version"))
+        elif created.data.get("template_version_id") is not None or created.data.get("template_key") is not None:
+            # A host document's ``envelope.created`` names no template. One that does would mean
+            # the row and the trail disagree about what kind of envelope this is.
+            _mismatch(envelope.id, None, "envelopes.source")
 
         signers = tuple(
             self._certificate_signer(db, loaded, events, row)
@@ -1099,8 +1332,8 @@ class EnvelopeServiceImpl:
         return CertificateSummary(
             envelope_id=envelope.id,
             document_type=envelope.document_type,
-            template_key=template.template_key,
-            template_version=template.version,
+            template_key=template_key,
+            template_version=template_version,
             # The configured profile: the certificate is inside the sealed bytes, so it is written
             # before the seal exists. The profile actually achieved is in document.sealed.
             seal_profile=self._settings.seal_profile,
@@ -1111,6 +1344,10 @@ class EnvelopeServiceImpl:
             signers=signers,
             audit_event_count=chain.event_count,
             audit_head_hash=chain.head_hash,
+            # Addendum 2: the certificate prints "Document supplied by the host" and this
+            # reference in place of the template line.
+            source=envelope.source,
+            host_document_ref=host_document_ref,
         )
 
     def _archive_certificate_summary(
@@ -1563,18 +1800,31 @@ class EnvelopeServiceImpl:
         return found
 
     def _plan_signers(
-        self, spec: NewEnvelope, roles: Sequence[SignerRoleDef], patient_ref: str
+        self,
+        signers: Sequence[NewSigner],
+        roles: Sequence[SignerRoleDef],
+        patient_ref: str,
+        *,
+        source: Literal["template", "request"] = "template",
     ) -> tuple[tuple[NewSigner, SignerRoleDef], ...]:
+        """Match each requested signer to a declared role and clean what is stored.
+
+        ``roles`` come from an immutable template version for ``create`` and from the request for
+        ``create_from_document`` (Addendum 2); the rules applied to the *people* are identical
+        either way, which is the point of taking the roles as an argument. ``source`` only changes
+        the wording of two messages, so a host reading them knows which list it got wrong.
+        """
         by_key = {role.key: role for role in roles}
-        if not spec.signers:
+        if not signers:
             raise ValidationFailed("an envelope needs at least one signer", code="signers_required")
+        declared = "this template" if source == "template" else "this request"
 
         planned: list[tuple[NewSigner, SignerRoleDef]] = []
         used: set[str] = set()
-        for signer in spec.signers:
+        for signer in signers:
             role = by_key.get(signer.role_key)
             if role is None:
-                raise ValidationFailed("a signer names a role this template does not declare", code="unknown_role")
+                raise ValidationFailed(f"a signer names a role {declared} does not declare", code="unknown_role")
             if signer.role_key in used:
                 raise ValidationFailed("two signers share a role", code="duplicate_role")
             used.add(signer.role_key)
@@ -1593,8 +1843,8 @@ class EnvelopeServiceImpl:
             planned.append((cleaned, role))
 
         if [role.key for role in roles if role.required and role.key not in used]:
-            # Every required role signs; only a role the template marks optional may be left out.
-            raise ValidationFailed("the template declares a role with no signer", code="missing_required_role")
+            # Every required role signs; only a role marked optional may be left out.
+            raise ValidationFailed(f"{declared} declares a role with no signer", code="missing_required_role")
         return tuple(planned)
 
     def _resolve_expiry(self, requested: datetime | None, now: datetime) -> datetime:
@@ -1674,10 +1924,22 @@ class EnvelopeServiceImpl:
         return self._hydrate(db, envelope)
 
     def _hydrate(self, db: Session, envelope: repo.EnvelopeRow) -> _Loaded:
+        if envelope.source == "host_document":
+            # Addendum 2: an ordinary electronic envelope with signers and sessions, whose field
+            # and role definitions live on its own row because there is no template version to
+            # hold them. ``envelopes_source_field_definitions`` guarantees the column is there.
+            fields, roles = parse_envelope_definitions(envelope.field_definitions)
+            return _Loaded(
+                envelope=envelope,
+                signers=repo.load_signers(db, envelope.id),
+                roles={role.key: role for role in roles},
+                template=None,
+                fields=fields,
+            )
         if envelope.template_version_id is None:
             # Addendum 1 A: a paper archive has no template and no signers. The schema's
-            # ``envelopes_kind_template`` CHECK ties the two together, so this is the archive case
-            # and not a missing row.
+            # ``envelopes_source_template`` CHECK ties the two together, so this is the archive
+            # case and not a missing row.
             return _Loaded(envelope=envelope, signers=(), roles={}, template=None)
         template = repo.load_template_version(db, envelope.template_version_id)
         if template is None:
@@ -1693,13 +1955,53 @@ class EnvelopeServiceImpl:
     def _template_of(loaded: _Loaded) -> repo.TemplateVersionRow:
         """The envelope's template version, or a refusal (Addendum 1 A).
 
-        Only an electronic envelope has one. Nothing can reach these paths for a paper archive --
-        it has no signers, so it has no sessions -- and the honest answer if anything ever does is
-        that this envelope is not signed here, rather than a document built from no template.
+        Only a ``template``-sourced electronic envelope has one. Nothing can reach these paths for
+        a paper archive -- it has no signers, so it has no sessions -- and Addendum 2's host
+        documents go through ``_fields_of`` and ``_title`` instead, which ask this only when there
+        really is a template. The honest answer if anything else ever arrives here is that this
+        envelope is not signed here, rather than a document built from no template.
         """
         if loaded.template is None:
             raise Conflict("this envelope is not signed here", code="not_an_electronic_envelope")
         return loaded.template
+
+    @staticmethod
+    def _fields_of(loaded: _Loaded) -> tuple[FieldDef, ...]:
+        """This envelope's field definitions, wherever they live (Addendum 2).
+
+        For a template envelope, the published version's ``fields`` column; for a host document,
+        the envelope's own. One accessor, so the signing UI, the capture check and the stamping
+        cannot end up reading different lists.
+        """
+        if loaded.fields is not None:
+            return loaded.fields
+        return parse_field_defs(EnvelopeServiceImpl._template_of(loaded).fields)
+
+    @staticmethod
+    def _title(loaded: _Loaded) -> str:
+        """What the signing UI puts at the top of the document.
+
+        A template envelope shows the template's name. A host document has no template name and
+        must not be given one made of the patient's report: ``document_type`` is a closed,
+        compliance-owned vocabulary and carries nothing about anybody, so it is what the UI shows.
+        """
+        if loaded.template is not None:
+            return loaded.template.template_name
+        return loaded.envelope.document_type.replace("_", " ").capitalize()
+
+    def _page_count(self, db: Session, envelope_id: UUID, sha256: bytes) -> int:
+        """How many pages the revision with this hash has (Addendum 2).
+
+        Read from ``document_revisions.page_count``, which is written when the revision is. Only a
+        revision from before ``0800`` has none, and for those the bytes are fetched and counted as
+        they always were -- which also re-hashes them, so the fallback is no weaker, only slower.
+        A 30-page report is presented, viewed and described many times per signature, and parsing
+        it each time is what this exists to stop.
+        """
+        stored = repo.revision_page_count(db, envelope_id, sha256)
+        if stored is not None:
+            return stored
+        return self._documents.page_count(self._blobs.get(db, sha256))
 
     def _load_for_session(self, db: Session, session: SessionInfo) -> tuple[_Loaded, repo.SignerRow]:
         """Load under the envelope lock, then check the session really belongs to this envelope."""
@@ -1823,6 +2125,9 @@ class EnvelopeServiceImpl:
             kind=envelope.kind,
             paper_signed_on=envelope.paper_signed_on,
             attested_at=envelope.attested_at,
+            # Addendum 2: where revision 1 came from. ``template_key`` and ``template_version``
+            # above are already ``None`` for a host document, because it has no template version.
+            source=envelope.source,
         )
 
     def _notify(self, db: Session, event: WebhookEvent, view: EnvelopeView) -> None:

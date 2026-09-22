@@ -9,6 +9,7 @@ The module owns everything that turns bytes into a page and back:
 ``pdfutil``      reading, overlaying, flattening and stripping, deterministically
 ``images``       the one piece of untrusted binary the browser sends
 ``stamping``     prefill values, signer marks, and the caption that makes a mark evidence
+``supplied``     a host document's own named fields, and the flattening that makes it revision 1
 ``certificate``  the certificate of completion
 ``fonts``        the vendored OFL faces, embedded in everything this module writes
 

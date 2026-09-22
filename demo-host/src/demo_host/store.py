@@ -14,12 +14,15 @@ Two rules from the service's spec are honoured here even though nobody would che
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
+
+from demo_host.reports import Report, SignatureBlock, render
 
 __all__ = [
     "ArchiveFiling",
@@ -84,15 +87,27 @@ class TaskSigner:
 
 @dataclass
 class Task:
-    """A document somebody has to sign. The EHR's side of an envelope."""
+    """A document somebody has to sign. The EHR's side of an envelope.
+
+    Addendum 2 gave it a second shape. ``source == "template"`` is everything the base spec
+    describes: the service renders a published template version with the prefill below.
+    ``source == "host_document"`` is a report *this* system generates per patient and uploads;
+    there is no template and no prefill, and the fields come from the PDF's own widget names.
+    """
 
     id: str
     title: str
-    template_key: str
     patient_id: str
     signing_order: Literal["sequential", "parallel"]
     signers: tuple[TaskSigner, ...]
-    prefill: dict[str, str]
+    source: Literal["template", "host_document"] = "template"
+    #: ``source == "template"`` only: the published template to render, and what to merge into it.
+    template_key: str | None = None
+    prefill: dict[str, str] = field(default_factory=dict)
+    #: ``source == "host_document"`` only: what to render, and the type compliance has to have
+    #: approved for it. A template envelope takes its document type from the template version.
+    report: Report | None = None
+    document_type: str | None = None
     note: str = ""
     #: Set once the envelope exists in the signing service.
     envelope_id: str | None = None
@@ -110,6 +125,12 @@ class Task:
     session_started: dict[str, datetime] = field(default_factory=dict)
     #: Set while a member of staff is running this task on the clinic tablet.
     kiosk: tuple[str, str] | None = None  # (staff_user_id, identity_check)
+    #: The report as it was uploaded, kept because ``Idempotency-Key`` on this route hashes the
+    #: document bytes: a retry has to send the same document or it is a different request.
+    upload: bytes | None = None
+    #: The hash of those bytes, so the page can show what was sent and a reader can hold it
+    #: against the ``document.supplied`` event and the certificate.
+    upload_sha256: str | None = None
 
     def signer_for(self, user_id: str) -> TaskSigner | None:
         return next((s for s in self.signers if s.user_id == user_id), None)
@@ -121,8 +142,9 @@ class Task:
 
 @dataclass(frozen=True)
 class ChartDocument:
-    """A sealed PDF filed in a patient's chart: signed electronically, or a scan of a paper
-    original that staff filed and the service sealed (Addendum 1 A)."""
+    """A sealed PDF filed in a patient's chart: signed electronically from a template, generated
+    here and supplied to the service (Addendum 2), or a scan of a paper original that staff filed
+    and the service sealed (Addendum 1 A)."""
 
     id: str
     patient_id: str
@@ -135,6 +157,11 @@ class ChartDocument:
     kind: str = "electronic"
     #: The date on the paper, for a paper archive.
     paper_signed_on: str | None = None
+    #: For a host document: the reference this system gave it and the hash of what it uploaded,
+    #: which is what the ``document.supplied`` event and the certificate name.
+    host_document_ref: str | None = None
+    upload_sha256: str | None = None
+    page_count: int | None = None
 
 
 @dataclass
@@ -220,7 +247,8 @@ class Store:
 
     # ------------------------------------------------------------------ tasks
     def tasks_for(self, user: User) -> list[Task]:
-        return [t for t in self.tasks.values() if t.signer_for(user.id) is not None]
+        """The worklist: documents rendered from a template. Reports have a page of their own."""
+        return [t for t in self.tasks.values() if t.source == "template" and t.signer_for(user.id) is not None]
 
     def tasks_for_patient(self, patient_id: str) -> list[Task]:
         return [t for t in self.tasks.values() if t.patient_id == patient_id]
@@ -229,10 +257,39 @@ class Store:
         return next((t for t in self.tasks.values() if t.envelope_id == envelope_id), None)
 
     def queue_for(self, user: User) -> list[Task]:
-        """The documents waiting on this clinician's signature, in seed order."""
+        """The documents waiting on this clinician's signature, in seed order.
+
+        Order sign-offs, not reports: the queue exists to show one confirmation of identity
+        covering a run of short, near-identical documents (Addendum 1 C). A twenty-five page
+        report is read, not run through, and it has its own page.
+        """
         return [
-            t for t in self.tasks.values() if any(s.user_id == user.id and s.capacity == "clinician" for s in t.signers)
+            t
+            for t in self.tasks.values()
+            if t.source == "template" and any(s.user_id == user.id and s.capacity == "clinician" for s in t.signers)
         ]
+
+    # ------------------------------------------------------------------ reports (Addendum 2)
+    def reports_for(self, user: User) -> list[Task]:
+        """The host-document reports this clinician has a part in, in seed order."""
+        return [t for t in self.tasks.values() if t.source == "host_document" and t.signer_for(user.id) is not None]
+
+    def upload_for(self, task: Task) -> bytes:
+        """Render this task's report, once, and remember the bytes.
+
+        Once, because the same task must upload the same document: the ``Idempotency-Key`` on
+        ``POST /v1/envelopes`` hashes the document as well as the body, so a second attempt with a
+        freshly rendered PDF would be a different request rather than a replay of this one. The
+        renderer is deterministic anyway; this makes it true even if it ever stops being.
+        """
+        if task.report is None:
+            raise ValueError("this task has no report to render")
+        with self._lock:
+            if task.upload is None:
+                pdf = render(task.report)
+                task.upload = pdf
+                task.upload_sha256 = hashlib.sha256(pdf).hexdigest()
+            return task.upload
 
     # ------------------------------------------------------------------ paper archives
     def record_archive(self, filing: ArchiveFiling) -> None:
@@ -272,7 +329,8 @@ class Store:
 
 def build_store() -> Store:
     """Two patients, a guardian, a witness, two clinicians and a member of the front desk, with
-    one worklist item per sample template and a queue of orders waiting on each clinician."""
+    one worklist item per sample template, a queue of orders waiting on each clinician, and two
+    generated reports for them to sign as host documents (Addendum 2)."""
     maria = Patient(id=str(uuid4()), mrn="mrn-100234", name="Maria Alvarez", date_of_birth="1971-04-02")
     sam = Patient(id=str(uuid4()), mrn="mrn-100907", name="Sam Okafor", date_of_birth="2017-11-19")
 
@@ -438,6 +496,7 @@ def build_store() -> Store:
                 (maria, "ORD-4481", "Repeat prescription review: analgesia for the right knee, four weeks."),
             ),
         ),
+        *_reports(maria, sam),
     )
     return Store(users=users, patients=(maria, sam), tasks=tasks)
 
@@ -460,4 +519,95 @@ def _orders(clinician_id: str, orders: tuple[tuple[Patient, str, str], ...]) -> 
             note="A clinician's sign-off. One of the signing queue: confirm your identity once, then sign each in turn.",
         )
         for patient, reference, summary in orders
+    )
+
+
+#: The document type a generated report is filed under. It has to be on the signing service's
+#: approved list before any of this works -- compliance decides what may be signed electronically,
+#: whoever rendered the PDF -- so `demo.sh` adds it to APPROVED_DOCUMENT_TYPES.
+REPORT_DOCUMENT_TYPE = "clinical_report"
+
+
+def _reports(maria: Patient, sam: Patient) -> tuple[Task, ...]:
+    """Addendum 2: two reports this records system generates itself and supplies to the service.
+
+    A long one signed by the clinician who wrote it, and a shorter one a registrar co-signs after
+    the consultant, in that order. Both carry a named signature block on the last page and no
+    template anywhere.
+    """
+    today = datetime.now(UTC).date().isoformat()
+    priya = "Dr. Priya Raman"
+    tomas = "Dr. Tomas Silva"
+    return (
+        Task(
+            id=str(uuid4()),
+            title="Annual care summary",
+            patient_id=maria.id,
+            signing_order="parallel",
+            signers=(
+                TaskSigner(
+                    role_key="clinician",
+                    role_label="Responsible clinician",
+                    user_id="u-priya",
+                    capacity="clinician",
+                ),
+            ),
+            source="host_document",
+            document_type=REPORT_DOCUMENT_TYPE,
+            report=Report(
+                title="Annual care summary",
+                reference="RPT-2291",
+                pages=30,
+                patient_name=maria.name,
+                patient_dob=maria.date_of_birth,
+                patient_ref=maria.mrn,
+                prepared_on=today,
+                prepared_by=priya,
+                blocks=(SignatureBlock(role_key="clinician", caption="Responsible clinician", expected_name=priya),),
+            ),
+            note=(
+                "Thirty pages of this patient's own record, generated here and uploaded to the signing "
+                "service as the document itself. No template exists for it and none could."
+            ),
+        ),
+        Task(
+            id=str(uuid4()),
+            title="Multidisciplinary case review",
+            patient_id=sam.id,
+            signing_order="sequential",
+            signers=(
+                TaskSigner(
+                    role_key="clinician",
+                    role_label="Responsible clinician",
+                    user_id="u-priya",
+                    capacity="clinician",
+                ),
+                TaskSigner(
+                    role_key="cosigner",
+                    role_label="Co-signing clinician",
+                    user_id="u-tomas",
+                    capacity="clinician",
+                ),
+            ),
+            source="host_document",
+            document_type=REPORT_DOCUMENT_TYPE,
+            report=Report(
+                title="Multidisciplinary case review",
+                reference="RPT-2292",
+                pages=25,
+                patient_name=sam.name,
+                patient_dob=sam.date_of_birth,
+                patient_ref=sam.mrn,
+                prepared_on=today,
+                prepared_by=priya,
+                blocks=(
+                    SignatureBlock(role_key="clinician", caption="Responsible clinician", expected_name=priya),
+                    SignatureBlock(role_key="cosigner", caption="Co-signing clinician", expected_name=tomas),
+                ),
+            ),
+            note=(
+                "Two signature blocks on the last page, so two roles: the consultant signs, then the "
+                "registrar co-signs. Both confirm who they are before signing."
+            ),
+        ),
     )

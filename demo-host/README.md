@@ -34,7 +34,11 @@ uv run python -m demo_host
 | `DEMO_PASSWORD` | `demo1234` | The one password everybody here has |
 
 `demo.sh` also exports `REAUTH_SPAN_SECONDS=300` and `REAUTH_MAX_AGE_SECONDS=300` to the service
-it starts (unless they are already set), for the signing queue below.
+it starts (unless they are already set), for the signing queue below, and adds `clinical_report`
+to `APPROVED_DOCUMENT_TYPES` for the reports. Approved document types are a compliance decision
+and the service enforces them whoever rendered the PDF, so a generated report is refused
+(`document_type_not_approved`) until somebody has said that kind of document may be signed
+electronically.
 
 ## What it covers
 
@@ -62,6 +66,17 @@ it starts (unless they are already set), for the signing queue below.
   here, then attested server to server against the *first* document's signing session -- and the
   clinician signs each document in turn without being asked again, because the service is running
   with a re-authentication span.
+- **Reports** (`/reports`, clinicians). Addendum 2: a document this system generates rather than
+  one the service renders. "Generate and sign" renders a report for that patient with
+  `reportlab` -- thirty pages of their own record for the annual summary, twenty-five for the case
+  review -- and uploads it to `POST /v1/envelopes` as multipart, with the roles it is signed by and
+  `fields: {"mode": "named"}`. The signature block on the last page carries AcroForm widgets called
+  `clinician_signature` and `clinician_date` (and `cosigner_signature` / `cosigner_date` on the
+  co-signed one); the service reads the positions off those names, removes every widget, and
+  presents the flattened bytes. The page shows the SHA-256 of what was uploaded and links to those
+  exact bytes, so they can be held against the upload hash in `document.supplied` and against the
+  sealed copy in the chart. The renderer is deterministic -- `invariant=1` and no random number
+  generator -- because the `Idempotency-Key` on that route hashes the document too.
 - **People** (`/people`, staff). The one thing a host may do about a saved signature: remove it
   (`POST /v1/users/{id}/adopted-signature/revoke`). There is no host call to create or read one, so
   staff cannot make a doctor's signature and this page cannot say whether anybody has one.

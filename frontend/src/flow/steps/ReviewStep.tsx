@@ -13,11 +13,34 @@ import { usePdf } from "@/lib/use-pdf";
 
 const ZOOMS = [1, 1.5, 2, 3] as const;
 
+/**
+ * The pages still to be looked at, in words.
+ *
+ * Runs are collapsed ("pages 2 to 30") and long lists are cut short, because a document can be
+ * thirty pages -- a report an EHR generated for one patient, rather than a one-page consent -- and
+ * naming twenty-nine numbers fills a phone screen with a list nobody reads and pushes Continue off
+ * the bottom of it. One unseen page still reads "page 7", which is what most of these say.
+ */
 function listPages(pages: number[]): string {
   if (pages.length <= 1) {
     return `page ${pages[0] ?? 1}`;
   }
-  return `pages ${pages.slice(0, -1).join(", ")} and ${pages[pages.length - 1]}`;
+  const runs: string[] = [];
+  for (let at = 0; at < pages.length; ) {
+    let end = at;
+    while (end + 1 < pages.length && pages[end + 1] === (pages[end] ?? 0) + 1) {
+      end += 1;
+    }
+    const from = pages[at];
+    const to = pages[end];
+    runs.push(from === to ? `${from}` : `${from} to ${to}`);
+    at = end + 1;
+  }
+  const shown = runs.length > 4 ? [...runs.slice(0, 3), `${runs.length - 3} more`] : runs;
+  if (shown.length === 1) {
+    return `pages ${shown[0]}`;
+  }
+  return `pages ${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`;
 }
 
 interface ReviewStepProps {

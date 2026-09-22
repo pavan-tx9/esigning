@@ -231,6 +231,55 @@ class Ehr:
         payload: dict[str, Any] = response.json()
         return payload
 
+    # -- host documents (Addendum 2) -----------------------------------------
+
+    def host_document_body(self, **overrides: Any) -> dict[str, Any]:
+        """The ``body`` part of a multipart ``POST /v1/envelopes``: the clinician report."""
+        body: dict[str, Any] = {
+            "document_type": "clinical_order",
+            "patient_ref": "chart-77120",
+            "host_document_ref": "report-5531",
+            "signing_order": "sequential",
+            "signers": [
+                {
+                    "role_key": "clinician",
+                    "host_user_id": "dr-0311",
+                    "display_name": CLINICIAN_NAME,
+                    "capacity": "clinician",
+                }
+            ],
+            "signer_roles": [
+                {
+                    "key": "clinician",
+                    "label": "Clinician",
+                    "allowed_capacities": ["clinician"],
+                    "requires_reauth": True,
+                    "order_index": 0,
+                }
+            ],
+        }
+        body.update(overrides)
+        return body
+
+    def post_host_document(
+        self, document: bytes, body: dict[str, Any] | None = None, /, **headers: str
+    ) -> httpx.Response:
+        response: httpx.Response = self.client.post(
+            "/v1/envelopes",
+            headers={**self.headers, **headers},
+            files={"document": ("report.pdf", document, "application/pdf")},
+            data={"body": json.dumps(body if body is not None else self.host_document_body())},
+        )
+        return response
+
+    def create_host_document_envelope(
+        self, document: bytes, body: dict[str, Any] | None = None, /, **headers: str
+    ) -> dict[str, Any]:
+        response = self.post_host_document(document, body, **headers)
+        assert response.status_code == 201, response.text
+        payload: dict[str, Any] = response.json()
+        return payload
+
     def envelope(self, envelope_id: str) -> dict[str, Any]:
         response = self.get(f"/envelopes/{envelope_id}")
         assert response.status_code == 200, response.text

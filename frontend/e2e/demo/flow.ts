@@ -230,6 +230,27 @@ export async function useSavedSignature(frame: FrameLocator): Promise<void> {
   await frame.getByRole("button", { name: "Use this signature" }).click();
 }
 
+/** A report on a clinician's Reports page (Addendum 2), by the EHR's own reference for it. */
+export function report(page: Page, reference: string) {
+  return page.locator(`[data-testid="report"][data-reference="${reference}"]`);
+}
+
+/**
+ * Generate a report and open it for signing.
+ *
+ * Pressing this button is the whole of Addendum 2 from the outside: the EHR renders twenty-five or
+ * thirty pages for this patient, uploads them to `POST /v1/envelopes` as multipart, and the
+ * service hashes, checks, resolves the fields from the widget names and flattens them away before
+ * the iframe below ever asks for a page. Longer than a template envelope, hence the timeout.
+ */
+export async function openReport(page: Page, reference: string): Promise<FrameLocator> {
+  await report(page, reference).getByTestId("open-report").click();
+  await expect(page).toHaveURL(/\/sign\//);
+  const frame = ui(page);
+  await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 90_000 });
+  return frame;
+}
+
 /** A queue document: open from the queue page, read, agree, sign with a typed name. */
 export async function openFromQueue(page: Page, title: string): Promise<FrameLocator> {
   await page

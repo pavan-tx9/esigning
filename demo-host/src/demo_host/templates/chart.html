@@ -30,6 +30,7 @@
             <a href="/chart/document/{{ document.id }}">{{ document.title }}</a>
             <span class="fine">
               {% if document.kind == 'paper_archive' %}scan of a paper document signed on {{ document.paper_signed_on }} ·{% endif %}
+              {% if document.kind == 'host_document' %}report supplied by this system, {{ document.page_count }} pages ·{% endif %}
               filed {{ document.filed_at.strftime('%Y-%m-%d %H:%M UTC') }}
             </span>
           </li>

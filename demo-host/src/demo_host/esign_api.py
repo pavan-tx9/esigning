@@ -100,6 +100,49 @@ class EsignClient:
             },
         )
 
+    def create_document_envelope(
+        self,
+        *,
+        document: bytes,
+        filename: str,
+        document_type: str,
+        patient_ref: str,
+        host_document_ref: str,
+        signing_order: str,
+        signers: list[dict[str, Any]],
+        signer_roles: list[dict[str, Any]],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Addendum 2: ``POST /v1/envelopes`` as multipart, carrying the document itself.
+
+        The same route as a template envelope, and the same reply. What is different is that this
+        system generated the PDF, so instead of ``template_key`` and ``prefill`` the body carries
+        the document type, the roles the document is signed by, and how to find the fields --
+        here always ``{"mode": "named"}``, because the report generator named the widgets in the
+        signature block and the service can read them. The service does the rest: hygiene,
+        resolving the fields, flattening every widget away, storing the upload beside the bytes it
+        will actually show, and recording ``document.supplied`` with both hashes.
+
+        ``Idempotency-Key`` covers the document bytes as well as the body, so a retry has to send
+        the same document; the caller keeps the rendered PDF for exactly that reason.
+        """
+        body = {
+            "patient_ref": patient_ref,
+            "document_type": document_type,
+            "host_document_ref": host_document_ref,
+            "signing_order": signing_order,
+            "signers": signers,
+            "signer_roles": signer_roles,
+            "fields": {"mode": "named"},
+        }
+        return self._json(
+            "POST",
+            "/v1/envelopes",
+            headers={"Idempotency-Key": idempotency_key},
+            files={"document": (filename, document, "application/pdf")},
+            data={"body": json.dumps(body)},
+        )
+
     def envelope(self, envelope_id: str | UUID) -> dict[str, Any]:
         return self._json("GET", f"/v1/envelopes/{envelope_id}")
 

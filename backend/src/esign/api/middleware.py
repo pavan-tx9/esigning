@@ -40,6 +40,17 @@ class _BodyTooLarge(Exception):
     pass
 
 
+def _is_multipart(scope: Scope) -> bool:
+    """Whether this request declares a multipart body, read from the raw ASGI headers.
+
+    The limit is decided before anything reads the body, so there is no ``Request`` to ask yet.
+    """
+    for name, value in scope.get("headers") or []:
+        if bytes(name).lower() == b"content-type":
+            return bytes(value).split(b";", 1)[0].strip().lower() == b"multipart/form-data"
+    return False
+
+
 class BodySizeLimit:
     """413 for a body over the limit: by ``Content-Length`` up front, and by counting for a chunked
     body that never declared one. Template uploads get the template limit; everything else the
@@ -53,6 +64,11 @@ class BodySizeLimit:
         #: (SPEC section 9). Image-only pages are large, and the route refuses the part itself as
         #: well, so this bound only has to leave room for the multipart framing and the JSON body.
         self._scans = settings.max_scan_bytes + _TEMPLATE_UPLOAD_SLACK
+        #: Addendum 2: a host-supplied document arrives as a multipart ``POST /v1/envelopes`` and
+        #: is bounded by ``MAX_SUPPLIED_DOCUMENT_BYTES`` (SPEC section 9). A 30-page generated
+        #: report is bigger than the default request limit, and the JSON shape of the same route
+        #: is not: the raise applies to the multipart shape alone.
+        self._supplied = settings.max_supplied_document_bytes + _TEMPLATE_UPLOAD_SLACK
 
     def _limit(self, scope: Scope) -> int:
         path = str(scope.get("path", ""))
@@ -60,6 +76,8 @@ class BodySizeLimit:
             return self._templates
         if path.startswith("/v1/archives"):
             return self._scans
+        if path == "/v1/envelopes" and str(scope.get("method", "")) == "POST" and _is_multipart(scope):
+            return self._supplied
         return self._default
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

@@ -4,11 +4,18 @@ The documents module writes these columns; this module only reads them, and read
 defensively: a malformed definition is a template problem, not a signer problem, so it surfaces
 as ``ValidationFailed`` with a code that names the column rather than blowing up mid-signature.
 
+Addendum 2: a ``host_document`` envelope has no template version, so the same two lists live on
+``envelopes.field_definitions`` instead. They are read back with exactly the functions above --
+one parser, so the signing UI cannot be served one shape for a template and another for a host
+document -- and written with :func:`field_definitions_json`, which is the only place that shape is
+constructed.
+
 Nothing here touches the database or the clock.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Final, get_args
 
 from esign.contracts import (
@@ -25,6 +32,8 @@ __all__ = [
     "CAPACITIES",
     "FIELD_TYPES",
     "SIGNABLE_FIELD_TYPES",
+    "field_definitions_json",
+    "parse_envelope_definitions",
     "parse_field_defs",
     "parse_prefill_fields",
     "parse_signer_roles",
@@ -66,6 +75,56 @@ def parse_signer_roles(raw: Any) -> tuple[SignerRoleDef, ...]:
     if len(set(keys)) != len(keys):
         raise ValidationFailed("template declares a duplicate signer role", code="template_definitions_invalid")
     return roles
+
+
+def parse_envelope_definitions(raw: Any) -> tuple[tuple[FieldDef, ...], tuple[SignerRoleDef, ...]]:
+    """Addendum 2: ``envelopes.field_definitions`` as the two lists it holds.
+
+    The schema's ``envelopes_field_definitions_shape`` CHECK already insists on an object with
+    exactly these two keys, both non-empty arrays. This reads it with the same parsers a template
+    version's columns go through, so a host document and a template are turned into ``FieldDef``s
+    and ``SignerRoleDef``s by one piece of code; a row that got past the CHECK and still cannot be
+    read raises ``ValidationFailed`` here rather than blowing up mid-signature.
+    """
+    if not isinstance(raw, dict):
+        raise _bad("field_definitions is not an object")
+    return parse_field_defs(raw.get("fields")), parse_signer_roles(raw.get("signer_roles"))
+
+
+def field_definitions_json(
+    fields: Sequence[FieldDef], signer_roles: Sequence[SignerRoleDef]
+) -> dict[str, list[dict[str, Any]]]:
+    """Addendum 2: the value written to ``envelopes.field_definitions``.
+
+    The one place that shape is constructed, and the inverse of
+    :func:`parse_envelope_definitions`. Pages are already positive here (``resolve_page`` ran at
+    the API edge of the envelope service); nothing negative is ever stored.
+    """
+    return {
+        "fields": [
+            {
+                "id": f.id,
+                "type": f.type,
+                "page": f.page,
+                "rect": {"x": f.rect.x, "y": f.rect.y, "w": f.rect.w, "h": f.rect.h},
+                "signer_role": f.signer_role,
+                "required": f.required,
+                "label": f.label,
+            }
+            for f in fields
+        ],
+        "signer_roles": [
+            {
+                "key": role.key,
+                "label": role.label,
+                "allowed_capacities": list(role.allowed_capacities),
+                "requires_reauth": role.requires_reauth,
+                "order_index": role.order_index,
+                "required": role.required,
+            }
+            for role in signer_roles
+        ],
+    }
 
 
 # --------------------------------------------------------------------------- internals

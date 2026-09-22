@@ -8,7 +8,7 @@ two different database sessions.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -27,12 +27,16 @@ from esign.contracts import (
     AuthMethod,
     Capacity,
     EnvelopeView,
+    FieldSpec,
     Host,
     KioskContext,
+    NamedFields,
     NewEnvelope,
+    NewHostDocumentEnvelope,
     NewSigner,
     RequestContext,
     SessionInfo,
+    SignerRoleDef,
     WebhookEvent,
 )
 from esign.envelopes import build_envelope_service
@@ -44,6 +48,7 @@ from tests.envelopes.fakes import (
     FakeDocumentService,
     FakeIdentityService,
     FakeSealer,
+    supplied_pdf,
 )
 
 CTX = RequestContext(ip="198.51.100.7", user_agent="EsignTest/1.0", auth_method="password")
@@ -128,6 +133,31 @@ HIPAA_PAIR = TemplateSpec(
     ),
 )
 
+#: Addendum 2. The roles a generated clinical report is signed by, declared in the request
+#: instead of published as a template version: one clinician, who re-authenticates.
+CLINICIAN_ROLES: tuple[SignerRoleDef, ...] = (
+    SignerRoleDef(
+        key="clinician",
+        label="Clinician",
+        allowed_capacities=("clinician",),
+        requires_reauth=True,
+        order_index=0,
+    ),
+)
+
+#: ...and the two-role variant: the report is signed, then co-signed.
+COSIGNED_ROLES: tuple[SignerRoleDef, ...] = (
+    CLINICIAN_ROLES[0],
+    SignerRoleDef(
+        key="cosigner",
+        label="Co-signing physician",
+        allowed_capacities=("clinician",),
+        requires_reauth=True,
+        order_index=1,
+    ),
+)
+
+
 #: Patient, then witness, then a clinician who must re-authenticate. SPEC section 6's third sample.
 PROCEDURE_CONSENT = TemplateSpec(
     key="procedure_consent",
@@ -167,7 +197,7 @@ class Bench:
         self.clock = clock
         self.blobs = FakeBlobService(blob_dir)
         self.audit = FakeAuditLog(clock)
-        self.documents = FakeDocumentService()
+        self.documents = FakeDocumentService(settings)
         self.identity = FakeIdentityService(settings, clock)
         self.sealer = FakeSealer(clock)
         self.service: EnvelopeServiceImpl = build_envelope_service(
@@ -281,6 +311,62 @@ class Bench:
     def create(self, db: Session, host: Host, spec: TemplateSpec, **kwargs: Any) -> EnvelopeView:
         return self.service.create(db, host, self.new_envelope(spec, **kwargs), CTX)
 
+    # -- host documents (Addendum 2) ---------------------------------------
+
+    def new_host_document(
+        self,
+        *,
+        document: bytes | None = None,
+        document_type: str = "clinical_order",
+        roles: tuple[SignerRoleDef, ...] = CLINICIAN_ROLES,
+        signers: tuple[NewSigner, ...] | None = None,
+        fields: FieldSpec | None = None,
+        signing_order: str = "sequential",
+        patient_ref: str = "patient-ref-001",
+        host_document_ref: str | None = "report-88120",
+        expires_at: datetime | None = None,
+        supersedes: UUID | None = None,
+    ) -> NewHostDocumentEnvelope:
+        return NewHostDocumentEnvelope(
+            document=supplied_pdf() if document is None else document,
+            document_type=document_type,
+            patient_ref=patient_ref,
+            host_document_ref=host_document_ref,
+            signing_order=signing_order,  # type: ignore[arg-type]
+            signers=signers if signers is not None else signers_for(roles, patient_ref),
+            signer_roles=roles,
+            fields=NamedFields() if fields is None else fields,
+            expires_at=expires_at,
+            supersedes_envelope_id=supersedes,
+        )
+
+    def create_from_document(self, db: Session, host: Host, **kwargs: Any) -> EnvelopeView:
+        return self.service.create_from_document(db, host, self.new_host_document(**kwargs), CTX)
+
+    def ready_to_sign_pages(self, db: Session, session: SessionInfo, pages: int) -> None:
+        """``ready_to_sign`` for a document that is not the fake's default three pages."""
+        self.service.present(db, session, CTX)
+        self.service.record_viewed(db, session, pages, CTX)
+        self.service.accept_consent(db, session, CONSENT_VERSION, CTX)
+
+    def field_definitions(self, db: Session, envelope_id: UUID) -> Any:
+        return db.execute(
+            text("SELECT field_definitions FROM envelopes WHERE id = :id"), {"id": envelope_id}
+        ).scalar_one()
+
+    def event_data(self, db: Session, envelope_id: UUID, event_type: str) -> dict[str, Any]:
+        return next(e.data for e in self.audit.list(db, "envelope", envelope_id) if str(e.event_type) == event_type)
+
+    def revision_pages(self, db: Session, envelope_id: UUID) -> list[tuple[int, str, int | None]]:
+        rows = db.execute(
+            text(
+                "SELECT revision_no, kind, page_count FROM document_revisions "
+                "WHERE envelope_id = :id ORDER BY revision_no"
+            ),
+            {"id": envelope_id},
+        ).all()
+        return [(int(r.revision_no), str(r.kind), None if r.page_count is None else int(r.page_count)) for r in rows]
+
     # -- sessions ----------------------------------------------------------
 
     def session(
@@ -329,6 +415,20 @@ class Bench:
             {"id": envelope_id},
         ).all()
         return [(int(r.revision_no), str(r.kind)) for r in rows]
+
+
+def signers_for(roles: Sequence[SignerRoleDef], patient_ref: str) -> tuple[NewSigner, ...]:
+    """One signer per declared role, in the first capacity the role allows (Addendum 2)."""
+    return tuple(
+        NewSigner(
+            role_key=definition.key,
+            host_user_id=f"host-user-{index}",
+            display_name=f"{definition.label} Person",
+            capacity=definition.allowed_capacities[0],
+            on_behalf_of=patient_ref if definition.allowed_capacities[0] in ("guardian", "proxy") else None,
+        )
+        for index, definition in enumerate(roles)
+    )
 
 
 def default_signers(spec: TemplateSpec, patient_ref: str) -> tuple[NewSigner, ...]:

@@ -185,7 +185,7 @@ class Verifier:
         the CLI passes ``None``."""
         envelope = db.execute(
             text(
-                "SELECT id, host_id, status, kind, presented_sha256, current_revision_sha256, sealed_sha256 "
+                "SELECT id, host_id, status, kind, source, presented_sha256, current_revision_sha256, sealed_sha256 "
                 # A shared row lock: signing and sealing wait, so the envelope, its revisions and
                 # its trail are read as one consistent state and a seal landing mid-check cannot
                 # show up as a false finding. Other verifications are not blocked.
@@ -202,6 +202,12 @@ class Verifier:
         #: ``envelope.created`` / ``document.prepared``, and the sealed document carries a cover
         #: page before the scanned pages.
         kind = str(envelope.kind)
+        #: Addendum 2. A host-supplied document is verified like any other electronic envelope,
+        #: with two differences that follow from having no template version: revision 1 is the
+        #: ``supplied`` one, and ``document.supplied`` stands where ``document.prepared`` stands.
+        #: It also has one check of its own -- the raw upload, which no other source stores.
+        source = str(envelope.source)
+        first_kind = _first_revision_kind(kind, source)
         run = _Run()
 
         revisions = db.execute(
@@ -212,7 +218,7 @@ class Verifier:
         ).all()
         blobs_checked, fetched = self._check_revisions(db, run, revisions)
         sealed_pdf = next(iter(fetched.get("sealed", [])), None)
-        self._check_pointers(run, envelope, revisions, kind)
+        self._check_pointers(run, envelope, revisions, first_kind)
 
         chain = self._audit.verify(db, "envelope", envelope_id)
         if chain.ok:
@@ -220,9 +226,11 @@ class Verifier:
         else:
             run.failed("audit_chain", "; ".join(chain.problems) or "chain did not verify")
         events = self._audit.list(db, "envelope", envelope_id)
-        self._check_trail_against_revisions(run, events, revisions, status, kind)
+        self._check_trail_against_revisions(run, events, revisions, status, kind, source)
+        if source == "host_document":
+            blobs_checked += self._check_supplied_document(db, run, events, envelope, revisions)
 
-        self._check_envelope_row_against_trail(db, run, events, envelope_id, kind)
+        self._check_envelope_row_against_trail(db, run, events, envelope_id, kind, source)
         self._check_signer_rows_against_trail(db, run, events, envelope_id)
         self._check_reauth_attestations(db, run, events, envelope_id)
         blobs_checked += self._check_capture_images(db, run, events, envelope_id)
@@ -309,13 +317,13 @@ class Verifier:
             fetched.setdefault(str(revision.kind), []).append(data)
         return checked, fetched
 
-    def _check_pointers(self, run: _Run, envelope: Any, revisions: Any, kind: str = "electronic") -> None:
+    def _check_pointers(self, run: _Run, envelope: Any, revisions: Any, first_kind: str = "presented") -> None:
         by_kind: dict[str, list[bytes]] = {}
         for revision in revisions:
             by_kind.setdefault(str(revision.kind), []).append(bytes(revision.sha256))
-        # Addendum 1 A: revision 1 of a paper archive is the ``scan``, and it is also the last
-        # revision -- nothing is ever applied to it, so both pointers name it.
-        first_kind = "scan" if kind == "paper_archive" else "presented"
+        # ``first_kind`` is what revision 1 is called for this envelope: ``presented`` for a
+        # template, ``scan`` for a paper archive (Addendum 1 A, and also the last revision, since
+        # nothing is ever applied to it), ``supplied`` for a host document (Addendum 2).
         presented = by_kind.get(first_kind, [None])[0]
         run.expect(
             "envelope_presented_pointer",
@@ -345,16 +353,23 @@ class Verifier:
             )
 
     def _check_trail_against_revisions(
-        self, run: _Run, events: list[AuditEvent], revisions: Any, status: str, kind: str = "electronic"
+        self,
+        run: _Run,
+        events: list[AuditEvent],
+        revisions: Any,
+        status: str,
+        kind: str = "electronic",
+        source: str = "template",
     ) -> None:
         """The hashes the trail recorded must be the hashes of the revisions that are stored."""
         by_no = {int(r.revision_no): bytes(r.sha256) for r in revisions}
         by_kind = {str(r.kind): bytes(r.sha256) for r in revisions}
 
         # Addendum 1 A: ``archive.created`` is a paper archive's ``document.prepared`` -- the
-        # event that says which bytes revision 1 is. The claim checked is the same one.
-        first_event = EventType.ARCHIVE_CREATED if kind == "paper_archive" else EventType.DOCUMENT_PREPARED
-        first_revision = by_kind.get("scan" if kind == "paper_archive" else "presented")
+        # event that says which bytes revision 1 is. Addendum 2: ``document.supplied`` is a host
+        # document's. The claim checked is the same one in all three cases.
+        first_event = _first_revision_event(kind, source)
+        first_revision = by_kind.get(_first_revision_kind(kind, source))
         prepared = [e for e in events if e.event_type == first_event]
         run.expect(
             "trail_presented_hash",
@@ -440,8 +455,81 @@ class Verifier:
             f"the seal names {found!r}; this envelope is {expected!r}",
         )
 
+    def _check_supplied_document(
+        self, db: Session, run: _Run, events: list[AuditEvent], envelope: Any, revisions: Any
+    ) -> int:
+        """Addendum 2: the two blobs ``document.supplied`` claims, and the step between them.
+
+        A host document is the one source whose revision 1 is a *transformation* of something
+        else: the host sent a PDF with widgets, the service flattened it, and the signer saw the
+        result. That claim is only evidence if both ends are stored and both still hash to what
+        the trail said -- otherwise "we flattened what you sent us" is an assertion about bytes
+        nobody can produce any more. So:
+
+        * the upload named by ``upload_sha256`` is fetched (``BlobService.get`` re-hashes it) and
+          its ``blobs.kind`` must still be ``supplied_pdf``: a swapped upload is a failure here,
+          not a silence;
+        * ``presented_sha256`` in the event's own data must be the hash on the event row, the hash
+          of the stored ``supplied`` revision *and* the envelope's ``presented_sha256``: a swapped
+          revision cannot agree with all three.
+
+        Returns how many blobs were read, for the report's count.
+        """
+        supplied = [e for e in events if e.event_type == EventType.DOCUMENT_SUPPLIED]
+        if len(supplied) != 1:
+            run.failed(
+                "supplied_document_recorded",
+                f"a host-document envelope has {len(supplied)} document.supplied events, not 1",
+            )
+            run.failed("supplied_upload_intact", "there is no document.supplied event to check against")
+            return 0
+        event = supplied[0]
+        run.passed("supplied_document_recorded")
+
+        upload_sha = _sha256(event.data.get("upload_sha256"))
+        presented_sha = _sha256(event.data.get("presented_sha256"))
+        stored_first = next((bytes(r.sha256) for r in revisions if str(r.kind) == "supplied"), None)
+        problems: list[str] = []
+        if presented_sha is None:
+            problems.append("document.supplied records no presented_sha256")
+        else:
+            if event.document_sha256 != presented_sha:
+                problems.append("document.supplied's own hash is not the presented hash it records")
+            if stored_first != presented_sha:
+                problems.append(
+                    f"the stored supplied revision is {_hex(stored_first)}, not the {_hex(presented_sha)} recorded"
+                )
+            if _opt(envelope.presented_sha256) != presented_sha:
+                problems.append("the envelope's presented_sha256 is not the one document.supplied records")
+        run.expect("supplied_revision_matches_trail", not problems, "; ".join(problems))
+
+        if upload_sha is None:
+            run.failed("supplied_upload_intact", "document.supplied records no upload_sha256")
+            return 0
+        try:
+            self._blobs.get(db, upload_sha)
+        except EsignError as exc:
+            reason = "integrity_failure" if isinstance(exc, IntegrityFailure) else "unreadable"
+            run.failed("supplied_upload_intact", f"{reason} ({exc.code}) for {upload_sha.hex()}")
+            return 0
+        blob_kind = db.execute(
+            text("SELECT kind FROM blobs WHERE sha256 = :sha"), {"sha": upload_sha}
+        ).scalar_one_or_none()
+        run.expect(
+            "supplied_upload_intact",
+            str(blob_kind) == "supplied_pdf",
+            f"the upload {upload_sha.hex()} is stored as {blob_kind!r}, not as a supplied_pdf",
+        )
+        return 1
+
     def _check_envelope_row_against_trail(
-        self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID, kind: str = "electronic"
+        self,
+        db: Session,
+        run: _Run,
+        events: list[AuditEvent],
+        envelope_id: UUID,
+        kind: str = "electronic",
+        source: str = "template",
     ) -> None:
         """The document-level facts the certificate prints must still say what the trail says.
 
@@ -452,6 +540,9 @@ class Verifier:
         """
         if kind == "paper_archive":
             self._check_archive_row_against_trail(db, run, events, envelope_id)
+            return
+        if source == "host_document":
+            self._check_host_document_row_against_trail(db, run, events, envelope_id)
             return
         row = db.execute(
             text(
@@ -481,6 +572,49 @@ class Verifier:
         ):
             if _text(row_value) != _text(event_value):
                 problems.append(f"{what} is not what envelope.created recorded")
+        run.expect("envelope_row_matches_trail", not problems, "; ".join(problems))
+
+    def _check_host_document_row_against_trail(
+        self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID
+    ) -> None:
+        """The same comparison for a host-supplied document (Addendum 2), against its own trail.
+
+        There is no template version here, so the two columns that would name one must be empty
+        and ``envelope.created`` must name no template either: an envelope whose row says
+        ``host_document`` while its creation event names a published version is a row and a trail
+        disagreeing about what this document *is*, which is exactly the class of drift these
+        comparisons exist for. ``host_document_ref`` is compared too, because the certificate
+        prints it beside "Document supplied by the host" and the column it would otherwise come
+        from is UPDATE-able.
+        """
+        row = db.execute(
+            text(
+                "SELECT created_at, document_type, template_version_id, host_document_ref, field_definitions "
+                "FROM envelopes WHERE id = :id"
+            ),
+            {"id": envelope_id},
+        ).first()
+        created = next((e for e in events if e.event_type == EventType.ENVELOPE_CREATED), None)
+        supplied = next((e for e in events if e.event_type == EventType.DOCUMENT_SUPPLIED), None)
+        if created is None or supplied is None:
+            run.failed("envelope_row_matches_trail", "the envelope has no envelope.created / document.supplied event")
+            return
+        if row is None:  # pragma: no cover - it was selected a moment ago
+            run.failed("envelope_row_matches_trail", "the envelope row is gone")
+            return
+        problems: list[str] = []
+        if abs(row.created_at - created.occurred_at) > _ROW_EVENT_TOLERANCE:
+            problems.append("created_at is not the time envelope.created recorded")
+        if _text(row.document_type) != _text(created.data.get("document_type")):
+            problems.append("document_type is not what envelope.created recorded")
+        if row.template_version_id is not None:
+            problems.append("a host-document envelope names a template version")
+        if created.data.get("template_key") is not None or created.data.get("template_version_id") is not None:
+            problems.append("envelope.created names a template for a host-document envelope")
+        if _text(row.host_document_ref) != _text(supplied.data.get("host_document_ref")):
+            problems.append("host_document_ref is not what document.supplied recorded")
+        if row.field_definitions is None:
+            problems.append("a host-document envelope has no field definitions")
         run.expect("envelope_row_matches_trail", not problems, "; ".join(problems))
 
     def _check_archive_row_against_trail(
@@ -642,17 +776,25 @@ class Verifier:
         run.expect("signer_rows_match_trail", not problems, "; ".join(sorted(set(problems))))
 
     def _role_reauth(self, db: Session, envelope_id: UUID) -> dict[str, bool]:
-        """``requires_reauth`` per role key, from the envelope's own template version.
+        """``requires_reauth`` per role key, from wherever this envelope keeps its roles.
 
         ``template_versions`` is immutable once published (its trigger and the foundation tests
         say so), which is what makes it usable as the authority for a column that is not in the
         trail. A paper archive has no template version and no signers, so the empty map is the
         right answer for it.
+
+        Addendum 2: a host document keeps its roles in ``envelopes.field_definitions``, which is
+        *not* immutable -- ``envelopes`` has no update guard. So for that source this is a
+        consistency check between two mutable copies rather than a re-derivation from something
+        fixed, and it is weaker than the template case by exactly that much. What still holds
+        whatever either says: ``signer.signed.reauth_used`` and ``reauth_attestation_id`` are in
+        the append-only trail, and ``reauth_attestations_match_trail`` checks the attestation
+        behind them. See the hand-off report.
         """
         roles = db.execute(
             text(
-                "SELECT v.signer_roles AS signer_roles FROM envelopes e "
-                "JOIN template_versions v ON v.id = e.template_version_id WHERE e.id = :id"
+                "SELECT COALESCE(v.signer_roles, e.field_definitions -> 'signer_roles') AS signer_roles "
+                "FROM envelopes e LEFT JOIN template_versions v ON v.id = e.template_version_id WHERE e.id = :id"
             ),
             {"id": envelope_id},
         ).scalar()
@@ -902,6 +1044,38 @@ class Verifier:
             bool(head) and head in printed,
             "the head hash in the trail is not the one printed on the sealed certificate page",
         )
+
+
+def _first_revision_kind(kind: str, source: str) -> str:
+    """What revision 1 is called: ``scan`` for a paper archive (Addendum 1 A), ``supplied`` for a
+    host document (Addendum 2), ``presented`` for a template envelope."""
+    if kind == "paper_archive":
+        return "scan"
+    return "supplied" if source == "host_document" else "presented"
+
+
+def _first_revision_event(kind: str, source: str) -> EventType:
+    """The event that says which bytes revision 1 is, for this kind and source."""
+    if kind == "paper_archive":
+        return EventType.ARCHIVE_CREATED
+    return EventType.DOCUMENT_SUPPLIED if source == "host_document" else EventType.DOCUMENT_PREPARED
+
+
+def _sha256(value: Any) -> bytes | None:
+    """A digest read back out of stored audit ``data``, which is canonical JSON: lowercase hex.
+
+    Anything that is not 32 bytes of hex is not a digest this service wrote, and the caller
+    reports that rather than comparing a half-read value.
+    """
+    if isinstance(value, bytes):
+        return value if len(value) == 32 else None
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        return None
+    return raw if len(raw) == 32 else None
 
 
 def _opt(value: Any) -> bytes | None:

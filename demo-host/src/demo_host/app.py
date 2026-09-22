@@ -60,7 +60,11 @@ SESSION_REUSE = timedelta(minutes=25)
 
 #: Where a page may send somebody back to after signing. A closed list, so a return address can
 #: never be a link somebody else chose.
-RETURN_URLS = {"/worklist": "Back to the worklist", "/queue": "Back to the signing queue"}
+RETURN_URLS = {
+    "/worklist": "Back to the worklist",
+    "/queue": "Back to the signing queue",
+    "/reports": "Back to the reports",
+}
 
 #: The paper documents staff can file (Addendum 1 A). The document type is what the service's
 #: retention and approval rules key on; the title is this EHR's own label for the chart.
@@ -135,36 +139,72 @@ def create_app(
     def may_see_chart(user: User, patient_id: str) -> bool:
         return user.role in {"clinician", "staff"} or user.patient_id == patient_id
 
+    def signers_body(task: Task) -> list[dict[str, Any]]:
+        return [
+            {
+                "role_key": signer.role_key,
+                "host_user_id": state.users[signer.user_id].id,
+                "display_name": state.users[signer.user_id].display_name,
+                "capacity": signer.capacity,
+                "on_behalf_of": signer.on_behalf_of,
+            }
+            for signer in task.signers
+        ]
+
+    def signer_roles_body(task: Task) -> list[dict[str, Any]]:
+        """The roles a host document is signed by, in the shape a template version carries them.
+
+        A template publishes these once; a generated report has no template, so the request says
+        them. They are derived from the task's own signers rather than written out twice: the
+        capacity each role allows is the capacity that role signs in, and a clinician's signature
+        always needs a fresh confirmation of who they are.
+        """
+        return [
+            {
+                "key": signer.role_key,
+                "label": signer.role_label,
+                "allowed_capacities": [signer.capacity],
+                "requires_reauth": signer.capacity == "clinician",
+                "order_index": index,
+                "required": True,
+            }
+            for index, signer in enumerate(task.signers)
+        ]
+
     def ensure_envelope(task: Task) -> dict[str, Any]:
         """Create the envelope the first time somebody opens this task, then reuse it.
 
         The idempotency key is the task id, so two people opening the same task at the same moment
-        get one envelope rather than two.
+        get one envelope rather than two. Addendum 2: a report takes the other path through the
+        same route -- multipart, with the PDF this system generated.
         """
         if task.envelope_id is not None:
             return esign.envelope(task.envelope_id)
         patient = state.patients[task.patient_id]
-        signers = []
-        for signer in task.signers:
-            person = state.users[signer.user_id]
-            signers.append(
-                {
-                    "role_key": signer.role_key,
-                    "host_user_id": person.id,
-                    "display_name": person.display_name,
-                    "capacity": signer.capacity,
-                    "on_behalf_of": signer.on_behalf_of,
-                }
+        if task.source == "host_document":
+            assert task.report is not None and task.document_type is not None
+            view = esign.create_document_envelope(
+                document=state.upload_for(task),
+                filename=f"{task.report.reference}.pdf",
+                document_type=task.document_type,
+                patient_ref=patient.mrn,
+                host_document_ref=f"report-{task.id}",
+                signing_order=task.signing_order,
+                signers=signers_body(task),
+                signer_roles=signer_roles_body(task),
+                idempotency_key=task.id,
             )
-        view = esign.create_envelope(
-            template_key=task.template_key,
-            patient_ref=patient.mrn,
-            host_document_ref=f"task-{task.id}",
-            signing_order=task.signing_order,
-            signers=signers,
-            prefill=task.prefill,
-            idempotency_key=task.id,
-        )
+        else:
+            assert task.template_key is not None
+            view = esign.create_envelope(
+                template_key=task.template_key,
+                patient_ref=patient.mrn,
+                host_document_ref=f"task-{task.id}",
+                signing_order=task.signing_order,
+                signers=signers_body(task),
+                prefill=task.prefill,
+                idempotency_key=task.id,
+            )
         absorb(task, view)
         return view
 
@@ -434,6 +474,75 @@ def create_app(
             at=_now(), valid_until=str(result.get("reauth_valid_until", "")), session_id=session_id
         )
         return RedirectResponse("/queue", status_code=303)
+
+    # ------------------------------------------------------------------ reports (Addendum 2)
+
+    @app.get("/reports", response_class=HTMLResponse)
+    def reports(
+        request: Request,
+        problem_code: str | None = None,
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        """The reports waiting on this clinician's signature.
+
+        Each one is a document this records system generates for this patient -- twenty-five or
+        thirty pages of their own record, different every time -- and hands to the signing service
+        as the document itself. There is no template: the service is told the document type, who
+        signs it and in what roles, and finds the fields from the names in the signature block on
+        the last page. Everything after that is the ordinary signing flow.
+        """
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        if user.role != "clinician":
+            return problem(request, user, "Clinicians only", "Reports are signed off by clinicians.", 403)
+        rows = []
+        unreachable: str | None = None
+        for task in state.reports_for(user):
+            unreachable = refresh(task) or unreachable
+            signer = task.signer_for(user.id)
+            assert signer is not None
+            my_status = task.signer_status.get(signer.role_key, "pending")
+            rows.append(
+                {
+                    "task": task,
+                    "report": task.report,
+                    "signer": signer,
+                    "patient": state.patients[task.patient_id],
+                    "my_status": my_status,
+                    "waiting_for": waiting_for(task, signer),
+                    "ready": my_status not in {"signed", "declined"}
+                    and not task.is_finished
+                    and waiting_for(task, signer) is None,
+                    "document": state.document_for_envelope(task.envelope_id or ""),
+                }
+            )
+        return render(
+            request,
+            "reports.html",
+            {"user": user, "rows": rows, "problem_code": problem_code, "unreachable": unreachable},
+        )
+
+    @app.get("/reports/{task_id}/generated.pdf")
+    def report_generated(task_id: str, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
+        """What this system rendered, before the service saw it.
+
+        Worth having in a demo: the bytes on this link are the ones whose SHA-256 the reports page
+        shows, the ones ``document.supplied`` records as the upload hash, and the ones the service
+        flattened the widgets out of to make revision 1. The sealed copy in the chart is the other
+        end of that chain.
+        """
+        user = current_user(demo_session)
+        task = state.tasks.get(task_id)
+        if user is None or task is None or task.source != "host_document":
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        if task.signer_for(user.id) is None:
+            return JSONResponse({"error": "not_your_report"}, status_code=403)
+        return Response(
+            state.upload_for(task),
+            media_type="application/pdf",
+            headers={"Cache-Control": "no-store", "Content-Disposition": 'inline; filename="report.pdf"'},
+        )
 
     # ------------------------------------------------------------------ the embedded signing page
 
@@ -960,6 +1069,7 @@ def create_app(
             pdf = esign.sealed_document(task.envelope_id)
         except EsignApiError:
             return
+        report = task.report
         state.file_document(
             ChartDocument(
                 id=str(uuid4()),
@@ -970,6 +1080,10 @@ def create_app(
                 sealed_sha256=str(payload.get("sealed_sha256", "")),
                 filed_at=_now(),
                 pdf=pdf,
+                kind="electronic" if report is None else "host_document",
+                host_document_ref=None if report is None else f"report-{task.id}",
+                upload_sha256=task.upload_sha256,
+                page_count=None if report is None else report.pages,
             )
         )
 

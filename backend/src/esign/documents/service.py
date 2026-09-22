@@ -27,7 +27,7 @@ from esign.contracts import (
 from esign.documents import archive_cover as archive_cover_module
 from esign.documents import certificate as certificate_module
 from esign.documents import definitions as definitions_module
-from esign.documents import images, inspection, stamping
+from esign.documents import images, inspection, stamping, supplied
 from esign.documents.fonts import ensure_fonts_registered
 from esign.documents.pdfutil import open_reader, sanitize_document, to_bytes, writer_from_bytes
 from esign.logging import get_logger
@@ -37,11 +37,16 @@ __all__ = ["PdfDocumentService"]
 log = get_logger(__name__)
 
 
-def _scan_code(code: str) -> str:
-    """``template_too_many_pages`` -> ``scan_too_many_pages``, ``pdf_encrypted`` -> ``scan_encrypted``."""
+def _recoded(code: str, kind: str) -> str:
+    """``template_too_many_pages`` -> ``<kind>_too_many_pages``, ``pdf_encrypted`` -> ``<kind>_encrypted``.
+
+    The hygiene rules are one implementation under three sets of bounds, so a host uploading a scan
+    or supplying a report would otherwise read ``template_too_large`` about a file that is not a
+    template. Only the prefix changes; the reason does not.
+    """
     for prefix in ("template_", "pdf_"):
         if code.startswith(prefix):
-            return f"scan_{code[len(prefix) :]}"
+            return f"{kind}_{code[len(prefix) :]}"
     return code
 
 
@@ -85,28 +90,45 @@ class PdfDocumentService:
         try:
             info = inspection.inspect_template(pdf, bounds)
         except ValidationFailed as exc:
-            raise ValidationFailed("the scan was refused", code=_scan_code(exc.code)) from None
+            raise ValidationFailed("the scan was refused", code=_recoded(exc.code, "scan")) from None
         log.info("documents.scan_inspected", page_count=info.page_count, sha256=info.sha256, size_bytes=len(pdf))
         return info
 
+    # ------------------------------------------------------------------ host-supplied documents
+
     def inspect_supplied_pdf(self, pdf: bytes) -> TemplatePdfInfo:
-        # TODO(addendum-2, host-supplied documents): the template hygiene rules under
-        # max_supplied_document_bytes / max_supplied_document_pages, with ``supplied_`` codes --
-        # ``inspect_scan_pdf`` above is the shape. Widgets are still legal at this point.
-        _ = pdf
-        raise NotImplementedError("Addendum 2 (host documents): DocumentService.inspect_supplied_pdf")
+        """The template hygiene rules under the supplied-document bounds (Addendum 2).
+
+        A generated report is 20 to 30 pages where a template is one to five, so the bounds differ;
+        the rules do not. Widgets are still allowed through here on purpose -- they are how
+        ``resolve_named_fields`` finds the signature block -- and ``flatten_supplied`` removes them
+        before the bytes become revision 1. A widget carrying JavaScript, in ``/AA`` or anywhere
+        else, is still refused: ``inspection`` walks the whole object graph, AcroForm included.
+        """
+        bounds = self._settings.model_copy(
+            update={
+                "max_template_bytes": self._settings.max_supplied_document_bytes,
+                "max_template_pages": self._settings.max_supplied_document_pages,
+            }
+        )
+        try:
+            info = inspection.inspect_template(pdf, bounds)
+        except ValidationFailed as exc:
+            raise ValidationFailed("the supplied document was refused", code=_recoded(exc.code, "supplied")) from None
+        log.info("documents.supplied_inspected", page_count=info.page_count, sha256=info.sha256, size_bytes=len(pdf))
+        return info
 
     def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
-        # TODO(addendum-2, host-supplied documents): map AcroForm widgets to FieldDefs by name;
-        # see the contract for the naming rules, the geometry and ``fields_unresolved``.
-        _ = (pdf, signer_roles)
-        raise NotImplementedError("Addendum 2 (host documents): DocumentService.resolve_named_fields")
+        fields = supplied.resolve_named_fields(pdf, signer_roles)
+        # Counts, never names: a widget name in a generated report is host text of unknown
+        # provenance, and the role keys are already logged by the envelope service.
+        log.info("documents.named_fields_resolved", field_count=len(fields), signer_count=len(signer_roles))
+        return fields
 
     def flatten_supplied(self, pdf: bytes) -> bytes:
-        # TODO(addendum-2, host-supplied documents): widgets and annotations removed, page content
-        # untouched, page count unchanged (else ``supplied_flatten_changed_pages``).
-        _ = pdf
-        raise NotImplementedError("Addendum 2 (host documents): DocumentService.flatten_supplied")
+        out = supplied.flatten_supplied(pdf)
+        log.info("documents.supplied_flattened", size_bytes=len(out))
+        return out
 
     def validate_definitions(
         self,

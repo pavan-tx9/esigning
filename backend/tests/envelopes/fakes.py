@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -54,6 +55,7 @@ from esign.contracts import (
     NotFound,
     PrefillFieldDef,
     ReauthEvidence,
+    Rect,
     RequestContext,
     SealResult,
     SealUnavailable,
@@ -323,19 +325,85 @@ class FakeAuditLog:
 # --------------------------------------------------------------------------- documents
 
 
+#: Addendum 2. The shape of a pseudo host document, so the fake can be as picky as the real
+#: service about things the envelope service is supposed to notice. A supplied document is
+#:
+#:     %PDF-1.7\n% supplied pages=25 widgets=clinician_signature,clinician_date problems=
+#:
+#: and the fake reads its own header rather than inventing an answer: the page count is what the
+#: document says it is, the widgets are the AcroForm the host left in it, and ``problems=`` is how
+#: a test asks for a hygiene rejection without needing a real malformed PDF (the real rejections
+#: are the documents module's own tests).
+_SUPPLIED_HEADER = re.compile(rb"% supplied ([^\n]*)")
+
+#: ``<role>_signature`` and friends, and the general ``<role>__<field_id>`` with an optional type
+#: suffix. The real resolver's naming rules, in the smallest form that exercises them.
+_WIDGET_TYPES: dict[str, str] = {
+    "signature": "signature",
+    "initials": "initials",
+    "date": "date_signed",
+}
+
+
+def supplied_pdf(
+    *,
+    pages: int = 25,
+    widgets: tuple[str, ...] = ("clinician_signature", "clinician_date"),
+    problems: tuple[str, ...] = (),
+) -> bytes:
+    """A pseudo host document in the shape ``FakeDocumentService`` understands."""
+    header = f"% supplied pages={pages} widgets={','.join(widgets)} problems={','.join(problems)}"
+    return b"%PDF-1.7\n" + header.encode() + b"\n% body\n"
+
+
+def _claimed_by(name: str, roles: dict[str, SignerRoleDef]) -> tuple[str | None, str]:
+    """Which role a widget named ``name`` belongs to, and what kind of field it becomes.
+
+    ``<role_key>__<field_id>`` first, because a role key may itself contain an underscore and the
+    double underscore is the unambiguous spelling; then ``<role_key>_<type>``. A widget no role
+    claims returns ``(None, ...)`` and is dropped.
+    """
+    role_key, sep, rest = name.partition("__")
+    if sep and role_key in roles:
+        suffix = rest.rpartition("_")[2]
+        return role_key, _WIDGET_TYPES.get(suffix, "text")
+    for suffix, field_type in _WIDGET_TYPES.items():
+        if name.endswith(f"_{suffix}") and name[: -len(suffix) - 1] in roles:
+            return name[: -len(suffix) - 1], field_type
+    return None, "text"
+
+
+def _supplied_header(pdf: bytes) -> dict[str, str] | None:
+    found = _SUPPLIED_HEADER.search(pdf)
+    if found is None:
+        return None
+    out: dict[str, str] = {}
+    for part in found.group(1).decode().split(" "):
+        key, _, value = part.partition("=")
+        out[key] = value
+    return out
+
+
 class FakeDocumentService:
     """Deterministic pseudo-PDFs.
 
     ``apply_signer_marks`` enforces the preconditions the real contract promises, so a test that
     passes here would also have been caught downstream -- which is the point: the service must not
-    be *relying* on that, and the tests assert the service refuses first.
+    be *relying* on that, and the tests assert the service refuses first. Addendum 2's three
+    methods are written the same way: the page count, the widget names and the flattening are read
+    from the document rather than assumed, so a test that lies about one of them fails here too.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Any = None) -> None:
         self.pages = 3
         self.prepared_with: list[dict[str, str]] = []
         self.marks: list[tuple[UUID, tuple[str, ...]]] = []
         self.sanitized = 0
+        self._settings = settings
+        #: Addendum 2: make ``flatten_supplied`` lose a page, which the contract says it must
+        #: refuse to do.
+        self.flatten_drops_a_page = False
+        self.flattened = 0
 
     def inspect_template_pdf(self, pdf: bytes) -> TemplatePdfInfo:
         return TemplatePdfInfo(
@@ -347,20 +415,78 @@ class FakeDocumentService:
     def inspect_scan_pdf(self, pdf: bytes) -> TemplatePdfInfo:
         return self.inspect_template_pdf(pdf)
 
+    # -- Addendum 2 --------------------------------------------------------
+
     def inspect_supplied_pdf(self, pdf: bytes) -> TemplatePdfInfo:
-        # TODO(addendum-2, host-supplied documents): the supplied bounds, with ``supplied_`` codes.
-        _ = pdf
-        raise NotImplementedError("Addendum 2 (host documents): FakeDocumentService.inspect_supplied_pdf")
+        """The template hygiene rules under the supplied bounds, with ``supplied_`` codes."""
+        header = _supplied_header(pdf)
+        if header is None:
+            raise ValidationFailed("the supplied document could not be read", code="supplied_unreadable")
+        problems = [p for p in header.get("problems", "").split(",") if p]
+        if problems:
+            raise ValidationFailed("the supplied document was refused", code=f"supplied_{problems[0]}")
+        pages = int(header.get("pages", "0"))
+        max_bytes = getattr(self._settings, "max_supplied_document_bytes", 25 * 1024 * 1024)
+        max_pages = getattr(self._settings, "max_supplied_document_pages", 200)
+        if len(pdf) > max_bytes:
+            raise ValidationFailed("the supplied document is too large", code="supplied_too_large")
+        if pages < 1 or pages > max_pages:
+            raise ValidationFailed("the supplied document has too many pages", code="supplied_too_many_pages")
+        return TemplatePdfInfo(
+            page_count=pages,
+            page_sizes=tuple((612.0, 792.0) for _ in range(pages)),
+            sha256=hashlib.sha256(pdf).digest(),
+        )
 
     def resolve_named_fields(self, pdf: bytes, signer_roles: list[SignerRoleDef]) -> list[FieldDef]:
-        # TODO(addendum-2, host-supplied documents): deterministic pseudo widgets, one per role.
-        _ = (pdf, signer_roles)
-        raise NotImplementedError("Addendum 2 (host documents): FakeDocumentService.resolve_named_fields")
+        """Map the document's widget names onto the declared roles, dropping the rest."""
+        header = _supplied_header(pdf)
+        if header is None:
+            raise ValidationFailed("the supplied document could not be read", code="supplied_unreadable")
+        pages = int(header.get("pages", "0"))
+        widgets = [w for w in header.get("widgets", "").split(",") if w]
+        by_key = {role.key: role for role in signer_roles}
+
+        fields: list[FieldDef] = []
+        for index, name in enumerate(widgets):
+            role_key, field_type = _claimed_by(name, by_key)
+            if role_key is None:
+                continue  # an unmatched widget is dropped here and flattened away below
+            fields.append(
+                FieldDef(
+                    id=name,
+                    type=field_type,  # type: ignore[arg-type]  # from _WIDGET_TYPES
+                    # The signature block is at the end of a generated report; the widget's own
+                    # page is what the real resolver reads, and here that is the last one.
+                    page=pages,
+                    rect=Rect(x=72.0, y=120.0 + 60.0 * index, w=220.0, h=48.0),
+                    signer_role=role_key,
+                    label=name.replace("_", " ").strip().capitalize(),
+                )
+            )
+        unresolved = sorted(
+            role.key
+            for role in signer_roles
+            if not any(f.signer_role == role.key and f.type in ("signature", "initials") for f in fields)
+        )
+        if unresolved:
+            # The roles, never the widget names: the host chose those and the message would echo them.
+            raise ValidationFailed(
+                f"no signature field was found for {', '.join(unresolved)}", code="fields_unresolved"
+            )
+        return fields
 
     def flatten_supplied(self, pdf: bytes) -> bytes:
-        # TODO(addendum-2, host-supplied documents): the same page count, marked as flattened.
-        _ = pdf
-        raise NotImplementedError("Addendum 2 (host documents): FakeDocumentService.flatten_supplied")
+        """Widgets gone, page content untouched, page count unchanged."""
+        header = _supplied_header(pdf)
+        if header is None:
+            raise ValidationFailed("the supplied document could not be read", code="supplied_unreadable")
+        pages = int(header.get("pages", "0")) - (1 if self.flatten_drops_a_page else 0)
+        if pages != int(header.get("pages", "0")):
+            raise ValidationFailed("flattening changed the page count", code="supplied_flatten_changed_pages")
+        self.flattened += 1
+        rewritten = _SUPPLIED_HEADER.sub(f"% supplied pages={pages} widgets= problems=".encode(), pdf)
+        return rewritten + b"\n% flattened"
 
     def validate_definitions(
         self,
@@ -369,7 +495,32 @@ class FakeDocumentService:
         prefill_fields: list[PrefillFieldDef],
         signer_roles: list[Any],
     ) -> None:
-        _ = (info, fields, prefill_fields, signer_roles)
+        """The clauses the envelope service leans on, in the smallest honest form.
+
+        Not the real validator (that has its own tests): page within the document, rect inside the
+        page as the document reports it, every field pointing at a declared role, every role
+        carrying a signature. Those four are what ``create_from_document`` promises it runs before
+        anything is written, so the fake has to be able to refuse them.
+        """
+        _ = prefill_fields
+        declared = {role.key for role in signer_roles}
+        problems: list[str] = []
+        for definition in fields:
+            what = f"field {definition.id!r}"
+            if definition.page < 1 or definition.page > info.page_count:
+                problems.append(f"{what}: page {definition.page} is outside 1..{info.page_count}")
+                continue
+            width, height = info.page_sizes[definition.page - 1]
+            rect = definition.rect
+            if rect.x < 0 or rect.y < 0 or rect.x + rect.w > width or rect.y + rect.h > height:
+                problems.append(f"{what}: rect does not fit inside page {definition.page}")
+            if definition.signer_role not in declared:
+                problems.append(f"{what}: references undeclared signer role {definition.signer_role!r}")
+        for role in signer_roles:
+            if not any(f.signer_role == role.key and f.type in ("signature", "initials") for f in fields):
+                problems.append(f"role {role.key!r}: has no signature or initials field")
+        if problems:
+            raise ValidationFailed("; ".join(sorted(problems)), code="template_definitions_invalid")
 
     def prepare(self, template_pdf: bytes, prefill_fields: list[PrefillFieldDef], prefill: dict[str, str]) -> bytes:
         self.prepared_with.append(dict(prefill))
@@ -413,7 +564,9 @@ class FakeDocumentService:
         raise NotImplementedError("Addendum 1 A (paper archives): FakeDocumentService.build_archive_cover")
 
     def page_count(self, pdf: bytes) -> int:
-        return self.pages + (1 if b"% certificate" in pdf else 0)
+        header = _supplied_header(pdf)
+        base = self.pages if header is None else int(header.get("pages", "0"))
+        return base + (1 if b"% certificate" in pdf else 0)
 
     def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
         return pdf + b"\n% certificate\n" + certificate_pdf

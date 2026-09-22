@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 from datetime import UTC, datetime
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -28,11 +28,19 @@ from esign.contracts import (
     CaptureKind,
     ConsentText,
     EnvelopeView,
+    ExplicitFields,
+    FieldDef,
+    FieldSpec,
+    FieldType,
     IdentityCheck,
     KioskContext,
+    NamedFields,
     NewEnvelope,
+    NewHostDocumentEnvelope,
     NewSigner,
+    Rect,
     SessionInfo,
+    SignerRoleDef,
     SigningView,
     ValidationFailed,
 )
@@ -42,6 +50,7 @@ __all__ = [
     "ConsentBody",
     "DeclineBody",
     "NewEnvelopeBody",
+    "NewHostDocumentEnvelopeBody",
     "ReauthBody",
     "RevokeAdoptedBody",
     "SessionBody",
@@ -102,6 +111,146 @@ class NewEnvelopeBody(_Body):
                 for s in self.signers
             ),
             prefill=dict(self.prefill),
+            expires_at=self.expires_at,
+            supersedes_envelope_id=self.supersedes_envelope_id,
+        )
+
+
+class RectBody(_Body):
+    """Addendum 2: a rect in displayed-page points, as ``ExplicitFields`` carries it.
+
+    Bounded so an absurd number cannot reach ``validate_definitions`` as a float; the real check
+    -- "does this fit on that page?" -- is made there, against the document's own page sizes.
+    """
+
+    x: float = Field(ge=-100_000, le=100_000)
+    y: float = Field(ge=-100_000, le=100_000)
+    w: float = Field(gt=0, le=100_000)
+    h: float = Field(gt=0, le=100_000)
+
+    def to_contract(self) -> Rect:
+        return Rect(x=self.x, y=self.y, w=self.w, h=self.h)
+
+
+class FieldDefBody(_Body):
+    """Addendum 2: one ``FieldDef`` as an ``explicit`` host-document request spells it.
+
+    ``page`` may be negative here and nowhere else: ``-1`` is the last page, so a report whose
+    length varies per patient can still place its signature block. ``contracts.resolve_page``
+    turns it into a positive page against the document's actual page count before anything is
+    validated or stored, and ``0`` is not a page at all.
+    """
+
+    id: str = Field(max_length=64)
+    type: FieldType
+    page: int = Field(ge=-1_000, le=1_000)
+    rect: RectBody
+    signer_role: str = Field(max_length=64)
+    required: bool = True
+    label: str = Field(default="", max_length=120)
+
+    def to_contract(self) -> FieldDef:
+        return FieldDef(
+            id=self.id,
+            type=self.type,
+            page=self.page,
+            rect=self.rect.to_contract(),
+            signer_role=self.signer_role,
+            required=self.required,
+            label=self.label,
+        )
+
+
+class SignerRoleBody(_Body):
+    """Addendum 2: a ``SignerRoleDef`` the host declares for the document it is supplying.
+
+    The same shape a template version carries. ``validate_definitions`` applies the same rules to
+    it as to a published template's -- including that a role allowing the clinician capacity must
+    set ``requires_reauth`` -- so a host document cannot declare its way out of the developer
+    guide's requirement.
+    """
+
+    key: str = Field(max_length=64)
+    label: str = Field(max_length=120)
+    allowed_capacities: list[Capacity] = Field(min_length=1, max_length=6)
+    requires_reauth: bool = False
+    order_index: int = Field(default=0, ge=0, le=1_000)
+    required: bool = True
+
+    def to_contract(self) -> SignerRoleDef:
+        return SignerRoleDef(
+            key=self.key,
+            label=self.label,
+            allowed_capacities=tuple(self.allowed_capacities),
+            requires_reauth=self.requires_reauth,
+            order_index=self.order_index,
+            required=self.required,
+        )
+
+
+class NamedFieldsBody(_Body):
+    """``{"mode": "named"}``: find the fields in the PDF I sent you."""
+
+    mode: Literal["named"] = "named"
+
+    def to_contract(self) -> FieldSpec:
+        return NamedFields()
+
+
+class ExplicitFieldsBody(_Body):
+    """``{"mode": "explicit", "fields": [...]}``: put the fields exactly here."""
+
+    mode: Literal["explicit"]
+    fields: list[FieldDefBody] = Field(min_length=1, max_length=500)
+
+    def to_contract(self) -> FieldSpec:
+        return ExplicitFields(fields=tuple(f.to_contract() for f in self.fields))
+
+
+#: Discriminated on ``mode``, so a request that sends ``fields`` with ``mode: "named"`` is refused
+#: rather than having them silently ignored.
+FieldsBody = Annotated[NamedFieldsBody | ExplicitFieldsBody, Field(discriminator="mode")]
+
+
+class NewHostDocumentEnvelopeBody(_Body):
+    """Addendum 2: the ``body`` part of a multipart ``POST /v1/envelopes``.
+
+    ``NewEnvelope`` minus ``template_key``, ``template_version`` and ``prefill`` -- the host
+    generated the document, so there is nothing to name and nothing to merge -- plus
+    ``document_type``, the roles it is signed by, and where the fields are. Unknown keys are
+    refused like everywhere else, so a host that sends ``template_key`` or ``prefill`` on this
+    path is told so rather than having it dropped.
+    """
+
+    document_type: str = Field(max_length=64)
+    patient_ref: str = Field(max_length=128)
+    host_document_ref: str | None = Field(default=None, max_length=200)
+    signing_order: Literal["sequential", "parallel"]
+    signers: list[SignerBody] = Field(min_length=1, max_length=20)
+    signer_roles: list[SignerRoleBody] = Field(min_length=1, max_length=10)
+    fields: FieldsBody = Field(default_factory=NamedFieldsBody)
+    expires_at: datetime | None = None
+    supersedes_envelope_id: UUID | None = None
+
+    def to_contract(self, document: bytes) -> NewHostDocumentEnvelope:
+        return NewHostDocumentEnvelope(
+            document=document,
+            document_type=self.document_type,
+            patient_ref=self.patient_ref,
+            host_document_ref=self.host_document_ref,
+            signing_order=self.signing_order,
+            signers=tuple(
+                NewSigner(
+                    role_key=s.role_key,
+                    host_user_id=s.host_user_id,
+                    display_name=s.display_name,
+                    capacity=s.capacity,
+                    on_behalf_of=s.on_behalf_of,
+                )
+                for s in self.signers
+            ),
+            signer_roles=tuple(r.to_contract() for r in self.signer_roles),
+            fields=self.fields.to_contract(),
             expires_at=self.expires_at,
             supersedes_envelope_id=self.supersedes_envelope_id,
         )
@@ -277,11 +426,16 @@ def envelope_json(view: EnvelopeView) -> dict[str, Any]:
     Addendum 1 A: ``kind`` says which sort of envelope this is. A ``paper_archive`` has no
     template, no signing order and no signers, and carries the date on the paper and the moment it
     was attested instead; an ``electronic`` envelope carries ``null`` for those two.
+
+    Addendum 2: ``source`` says where an electronic envelope's revision 1 came from. A
+    ``host_document`` has no template version, so ``template_key`` and ``template_version`` are
+    ``null`` and everything else is exactly as for a template envelope.
     """
     return {
         "id": str(view.id),
         "status": view.status,
         "kind": view.kind,
+        "source": view.source,
         "document_type": view.document_type,
         "template_key": view.template_key,
         "template_version": view.template_version,

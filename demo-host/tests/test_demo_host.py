@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,12 +19,14 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pypdf import PdfReader
 
 from demo_host.app import create_app
 from demo_host.config import Config
 from demo_host.esign_api import EsignClient
+from demo_host.reports import render
 from demo_host.signatures import verify_signature
-from demo_host.store import Store, build_store
+from demo_host.store import Store, Task, build_store
 
 SECRET = bytes.fromhex("a1" * 32)
 ENVELOPE_ID = "11111111-2222-4333-8444-555555555555"
@@ -53,25 +56,40 @@ class FakeService:
         self.reauth_status = 200
         self.sessions_created = 0
         self.archives: list[tuple[bytes, dict[str, Any]]] = []
+        #: Addendum 2: ``(document bytes, body)`` per multipart ``POST /v1/envelopes``.
+        self.documents: list[tuple[bytes, dict[str, Any]]] = []
+        self.idempotency: list[str] = []
         self.revoked: list[str] = []
+        #: The last envelope this fake was asked to create, so a later GET describes that one.
+        self.created: dict[str, Any] | None = None
+        self.created_source = "template"
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         content_type = request.headers.get("content-type", "")
         if content_type.startswith("multipart/form-data"):
-            # POST /v1/archives: the scan beside a JSON ``body`` part. Only the shape is checked;
-            # the real thing is exercised by the Playwright specs against the real service.
+            # Two routes are multipart: POST /v1/archives (a scan) and, since Addendum 2, POST
+            # /v1/envelopes (a document the host generated). Both put a JSON ``body`` beside the
+            # file. Only the shape is checked here; the real thing is exercised by the Playwright
+            # specs against the real service.
             body = _multipart_body(request)
             self.calls.append((request.method, path, body))
-            self.archives.append((body["scan"], json.loads(body["body"])))
+            sent = json.loads(body["body"])
+            if path == "/v1/envelopes":
+                self.idempotency.append(request.headers.get("idempotency-key", ""))
+                self.documents.append((body["document"], sent))
+                self.created, self.created_source = sent, "host_document"
+                return httpx.Response(201, json=self._envelope(sent, source="host_document"))
+            self.archives.append((body["scan"], sent))
             return httpx.Response(201, json=self._archive_view())
         body = json.loads(request.content) if request.content else {}
         self.calls.append((request.method, path, body))
-
         if request.method == "POST" and path == "/v1/envelopes":
+            self.idempotency.append(request.headers.get("idempotency-key", ""))
+            self.created, self.created_source = body, "template"
             return httpx.Response(201, json=self._envelope(body))
         if request.method == "GET" and path == f"/v1/envelopes/{ENVELOPE_ID}":
-            return httpx.Response(200, json=self._envelope(None))
+            return httpx.Response(200, json=self._envelope(self.created, source=self.created_source))
         if path.endswith("/adopted-signature/revoke"):
             self.revoked.append(path.split("/")[3])
             return httpx.Response(200, json={"revoked": path.split("/")[3] == "u-priya"})
@@ -132,16 +150,18 @@ class FakeService:
             "attested_at": "2026-09-21T19:00:00Z",
         }
 
-    def _envelope(self, created: dict[str, Any] | None) -> dict[str, Any]:
+    def _envelope(self, created: dict[str, Any] | None, *, source: str = "template") -> dict[str, Any]:
         roles = (
             [s["role_key"] for s in created["signers"]] if created is not None else ["patient", "witness", "clinician"]
         )
+        supplied = source == "host_document"
         return {
             "id": ENVELOPE_ID,
             "status": self.envelope_status,
-            "document_type": "hipaa_acknowledgement",
-            "template_key": "hipaa_acknowledgement",
-            "template_version": 1,
+            "source": source,
+            "document_type": "clinical_report" if supplied else "hipaa_acknowledgement",
+            "template_key": None if supplied else "hipaa_acknowledgement",
+            "template_version": None if supplied else 1,
             "signing_order": "parallel",
             "signers": [
                 {
@@ -649,3 +669,174 @@ def test_staff_can_remove_a_saved_signature_and_are_told_whether_there_was_one(
         client.post("/people/u-maria/revoke-signature", follow_redirects=False).headers["location"]
         == "/people?result=refused"
     )
+
+
+# --------------------------------------------------------------------------- Addendum 2: reports
+
+
+def report(store: Store, reference: str) -> Task:
+    return next(t for t in store.tasks.values() if t.report is not None and t.report.reference == reference)
+
+
+def widgets(pdf: bytes) -> dict[int, list[str]]:
+    """The AcroForm widget names on each page, the way the signing service will read them."""
+    found: dict[int, list[str]] = {}
+    reader = PdfReader(io.BytesIO(pdf))
+    for number, page in enumerate(reader.pages, start=1):
+        names = [str(annotation.get_object()["/T"]) for annotation in page.get("/Annots") or []]
+        if names:
+            found[number] = names
+    return found
+
+
+def test_a_report_is_rendered_to_its_stated_length_with_a_named_signature_block(store: Store) -> None:
+    task = report(store, "RPT-2291")
+    assert task.report is not None
+
+    pdf = store.upload_for(task)
+
+    reader = PdfReader(io.BytesIO(pdf))
+    assert len(reader.pages) == task.report.pages == 30
+    # The whole contract with the service: two widgets, named after the role, on the last page.
+    assert widgets(pdf) == {30: ["clinician_signature", "clinician_date"]}
+    # The patient is named on the document because the document is their record. Nothing about
+    # them reaches an identifier: the reference, not the name, is what the service is told.
+    assert "Maria Alvarez" in reader.pages[0].extract_text()
+    assert "RPT-2291" in reader.pages[0].extract_text()
+    # Reproducible, because the Idempotency-Key on this route hashes the document as well: a
+    # retry that rendered different bytes would be a different request, not a replay.
+    assert render(task.report) == pdf
+    assert task.upload_sha256 == hashlib.sha256(pdf).hexdigest()
+
+
+def test_a_co_signed_report_carries_a_second_named_block(store: Store) -> None:
+    task = report(store, "RPT-2292")
+    assert task.report is not None
+
+    pdf = store.upload_for(task)
+
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 25
+    assert widgets(pdf) == {25: ["clinician_signature", "clinician_date", "cosigner_signature", "cosigner_date"]}
+    assert [signer.role_key for signer in task.signers] == ["clinician", "cosigner"]
+
+
+def test_opening_a_report_uploads_the_document_and_takes_the_host_document_path(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    sign_in(client, "priya")
+    task = report(store, "RPT-2291")
+
+    response = client.post(f"/tasks/{task.id}/open", data={"return_to": "/reports"}, follow_redirects=False)
+
+    assert response.headers["location"] == f"/sign/{task.id}?return_to=/reports"
+    document, body = service.documents[0]
+    assert document.startswith(b"%PDF") and document == task.upload
+    # No template, no version, no prefill: there is nothing to merge into a document we wrote.
+    assert "template_key" not in body and "template_version" not in body and "prefill" not in body
+    assert body["document_type"] == "clinical_report"
+    assert body["patient_ref"] == store.patients[task.patient_id].mrn
+    assert body["host_document_ref"] == f"report-{task.id}"
+    assert body["fields"] == {"mode": "named"}
+    assert body["signers"][0]["host_user_id"] == "u-priya"
+    assert body["signer_roles"] == [
+        {
+            "key": "clinician",
+            "label": "Responsible clinician",
+            "allowed_capacities": ["clinician"],
+            "requires_reauth": True,
+            "order_index": 0,
+            "required": True,
+        }
+    ]
+    assert service.idempotency == [task.id]
+    # One envelope, however many times it is opened, and the same bytes if it ever is sent again.
+    client.post(f"/tasks/{task.id}/open", data={"return_to": "/reports"}, follow_redirects=False)
+    assert len(service.documents) == 1
+
+
+def test_a_co_signed_report_declares_both_roles_in_order(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    sign_in(client, "priya")
+    task = report(store, "RPT-2292")
+
+    client.post(f"/tasks/{task.id}/open", data={"return_to": "/reports"}, follow_redirects=False)
+
+    _document, body = service.documents[0]
+    assert body["signing_order"] == "sequential"
+    assert [role["key"] for role in body["signer_roles"]] == ["clinician", "cosigner"]
+    assert [role["order_index"] for role in body["signer_roles"]] == [0, 1]
+    # Both sign in a professional capacity, so both are asked to confirm who they are.
+    assert all(role["requires_reauth"] for role in body["signer_roles"])
+
+
+def test_reports_are_for_clinicians_and_are_not_on_the_worklist_or_in_the_queue(
+    client: TestClient, store: Store
+) -> None:
+    sign_in(client, "priya")
+    page = client.get("/reports")
+    assert page.status_code == 200
+    assert page.text.count('data-testid="report"') == 2
+    assert "RPT-2291" in page.text and "RPT-2292" in page.text
+    # A report is read, not run through: the worklist and the signing queue are unchanged.
+    assert "Annual care summary" not in client.get("/worklist").text
+    assert "Annual care summary" not in client.get("/queue").text
+    assert client.get("/queue").text.count('data-testid="queue-task"') == 4
+    # Tomas sees only the one he co-signs, and it is waiting on the consultant.
+    sign_in(client, "tomas")
+    his = client.get("/reports").text
+    assert his.count('data-testid="report"') == 1
+    assert "Multidisciplinary case review" in his
+    sign_in(client, "maria")
+    assert client.get("/reports").status_code == 403
+
+
+def test_the_uploaded_bytes_can_be_read_back_and_only_by_a_signer(client: TestClient, store: Store) -> None:
+    """The page links to exactly what was sent, so it can be held against the upload hash the
+    service recorded. Nobody else's business, though: it is the patient's whole record."""
+    task = report(store, "RPT-2291")
+    sign_in(client, "priya")
+
+    sent = client.get(f"/reports/{task.id}/generated.pdf")
+
+    assert sent.status_code == 200
+    assert sent.content == store.upload_for(task)
+    assert sent.headers["cache-control"] == "no-store"
+    sign_in(client, "tomas")
+    assert client.get(f"/reports/{task.id}/generated.pdf").status_code == 403
+
+
+def test_a_sealed_report_is_filed_in_the_chart_as_a_document_this_system_supplied(
+    client: TestClient, store: Store
+) -> None:
+    sign_in(client, "priya")
+    task = report(store, "RPT-2291")
+    client.post(f"/tasks/{task.id}/open", data={"return_to": "/reports"}, follow_redirects=False)
+
+    deliver(client, {**sealed_payload("d-report"), "template_key": None, "source": "host_document"})
+
+    filed = store.document_for_envelope(ENVELOPE_ID)
+    assert filed is not None
+    assert (filed.kind, filed.page_count, filed.template_key) == ("host_document", 30, None)
+    assert filed.host_document_ref == f"report-{task.id}"
+    assert filed.upload_sha256 == task.upload_sha256
+    page = client.get(f"/chart/document/{filed.id}").text
+    assert "Report supplied by this records system, 30 pages" in page
+    assert task.upload_sha256 is not None and task.upload_sha256 in page
+
+
+def test_a_reports_page_puts_nothing_about_the_patient_in_a_url(client: TestClient, store: Store) -> None:
+    sign_in(client, "priya")
+    task = report(store, "RPT-2291")
+    client.post(f"/tasks/{task.id}/open", data={"return_to": "/reports"}, follow_redirects=False)
+
+    page = client.get("/reports")
+
+    links = [link.split('"')[0] for link in page.text.split('href="')[1:] if link.startswith("/")]
+    links += [link.split('"')[0] for link in page.text.split('action="')[1:] if link.startswith("/")]
+    assert links
+    for url in links:
+        for patient in store.patients.values():
+            assert patient.name.replace(" ", "") not in url.replace("%20", "")
+            assert patient.mrn not in url
+        assert "est_" not in url and "esk_" not in url

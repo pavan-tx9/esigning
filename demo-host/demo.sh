@@ -101,6 +101,15 @@ fi
 export REAUTH_SPAN_SECONDS="${REAUTH_SPAN_SECONDS:-300}"
 export REAUTH_MAX_AGE_SECONDS="${REAUTH_MAX_AGE_SECONDS:-300}"
 
+# Addendum 2: the demo host generates clinical reports and supplies them as the document itself.
+# The service will not take a document type nobody approved, whoever rendered the PDF, so the
+# clinic's list gets `clinical_report` on it -- the four defaults plus the one this demo adds.
+#
+# As JSON, not as `a,b,c`: pydantic-settings decodes a tuple-typed setting from the environment as
+# JSON before the comma-separated form is ever seen, so the plain spelling stops the service from
+# starting. (backend/.env.example line 69 has the plain spelling and would do the same.)
+export APPROVED_DOCUMENT_TYPES="${APPROVED_DOCUMENT_TYPES:-[\"patient_consent\",\"hipaa_acknowledgement\",\"procedure_consent\",\"clinical_order\",\"clinical_report\"]}"
+
 step "starting the API on ${API_PORT} (re-authentication span ${REAUTH_SPAN_SECONDS}s)"
 # `esign serve` rather than uvicorn directly: it drops uvicorn's log config, so its own loggers
 # propagate to the allowlisted structured handler instead of writing straight to stdout.
@@ -197,9 +206,12 @@ if [ -z "${DEMO_QUIET:-}" ]; then
     ${BOLD}ben${RESET}     the witness on the procedure consent. His turn comes after Maria's.
     ${BOLD}priya${RESET}   the clinician on it. Signing in a professional capacity, so she is asked
               for her password again before the signature is taken. Also has a queue of
-              order sign-offs: "Signing queue" confirms her identity once for all of them.
+              order sign-offs: "Signing queue" confirms her identity once for all of them,
+              and "Reports", where a thirty-page summary this system generates is signed
+              as a host document -- no template anywhere.
     ${BOLD}tomas${RESET}   the other clinician, with a queue of his own. Save a signature on the
-              first order and the second offers it back.
+              first order and the second offers it back. He co-signs Priya's case review
+              from his own "Reports" page, after she has signed it.
     ${BOLD}alice${RESET}   the front desk. Starts the clinic tablet from "Clinic tablet", files a
               scan of an ink-signed document from "File a paper document", and can remove
               anybody's saved signature from "People".

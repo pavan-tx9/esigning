@@ -8,6 +8,7 @@ another host's envelope, template or session is ``not_found`` (SPEC section 10).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import timedelta
 from typing import Annotated, Any
@@ -15,12 +16,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, File, Form, Header, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from esign.api import idempotency
 from esign.api.adopted import revoke_and_record
 from esign.api.context import authenticate_host, runtime_of
 from esign.api.schemas import (
     NewEnvelopeBody,
+    NewHostDocumentEnvelopeBody,
     ReauthBody,
     RevokeAdoptedBody,
     SessionBody,
@@ -58,6 +63,11 @@ _HOST_ACTOR = Actor(role="host")
 #: Long enough for any identifier ``is_opaque_id`` accepts; a path longer than that is not one.
 _MAX_HOST_USER_ID = 128
 _PDF_HEADERS = {"Cache-Control": "no-store", "Content-Disposition": 'attachment; filename="document.pdf"'}
+
+#: Addendum 2: the JSON half of a multipart ``POST /v1/envelopes``. Generous for 500 explicit
+#: field rects and ten roles, and far short of anything that would be a document in disguise. The
+#: same bound ``POST /v1/archives`` puts on its own ``body`` part, for the same reason.
+_MAX_BODY_PART_CHARS = 1_000_000
 
 
 def _templates(rt: Runtime) -> TemplateService:
@@ -162,36 +172,156 @@ def get_template(request: Request, key: str) -> JSONResponse:
 
 
 @router.post("/envelopes", status_code=201)
-def create_envelope(
+async def create_envelope(
     request: Request,
-    body: NewEnvelopeBody,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key", max_length=200)] = None,
 ) -> JSONResponse:
-    """Create an envelope from a published template version. With an ``Idempotency-Key`` a retry
-    returns the same envelope instead of creating a second one. The stored replay is the envelope's
-    *id*, not the response body -- the body carries display names and there is no reason to keep
-    a second copy of those -- so a replay shows that envelope as it is now."""
+    """Create an envelope, from a published template version or from a document the host supplies.
+
+    Two request shapes on one route (SPEC section 9, section 15). A JSON body is ``NewEnvelope``
+    and names a template. A multipart body -- ``document`` plus ``body`` -- is
+    ``NewHostDocumentEnvelope``: the host's backend generated the PDF and sends it over the same
+    API key, and the answer is an ``EnvelopeView`` with ``source: "host_document"``. They are one
+    route because they create the same thing; the content type is what distinguishes them, and a
+    route that sounded like "upload a PDF" is exactly what a signer-side upload would reach for
+    (``.../documents`` stays refused).
+
+    ``Idempotency-Key`` applies to both, and on the multipart path the request hash covers the
+    document bytes: the same key with a different report is a different request, not a replay.
+
+    This handler is ``async`` only because reading a multipart body is; the work itself is the
+    ordinary synchronous, one-transaction handler, run in the threadpool FastAPI would have used
+    anyway.
+    """
+    rt = runtime_of(request)
+    if _is_multipart(request):
+        document, body_text = await _read_multipart(rt, request)
+        supplied = _parse_host_document_body(body_text)
+        return await run_in_threadpool(_create_from_document, request, supplied, document, idempotency_key)
+    body = _parse_envelope_body(await request.body())
+    return await run_in_threadpool(_create_from_template, request, body, idempotency_key)
+
+
+def _is_multipart(request: Request) -> bool:
+    return request.headers.get("content-type", "").split(";", 1)[0].strip().lower() == "multipart/form-data"
+
+
+async def _read_multipart(rt: Runtime, request: Request) -> tuple[bytes, str]:
+    """The two parts of a host-document request, bounded before anything parses them.
+
+    The middleware caps the whole request at ``MAX_SUPPLIED_DOCUMENT_BYTES`` plus multipart
+    overhead; this catches the parts themselves, so a host that sends one enormous part inside a
+    legal request gets ``supplied_too_large`` rather than a 413 about the envelope around it.
+    """
+    async with request.form(max_files=2, max_fields=2) as form:
+        document = form.get("document")
+        body = form.get("body")
+        if not isinstance(document, StarletteUploadFile):
+            raise ValidationFailed("a multipart request carries the document as `document`", code="validation_failed")
+        if not isinstance(body, str):
+            raise ValidationFailed("a multipart request carries the JSON as `body`", code="validation_failed")
+        if len(body) > _MAX_BODY_PART_CHARS:
+            raise ValidationFailed("body is too large", code="validation_failed")
+        data = await document.read(rt.settings.max_supplied_document_bytes + 1)
+    if len(data) > rt.settings.max_supplied_document_bytes:
+        raise ValidationFailed("the supplied document is too large", code="supplied_too_large")
+    return data, body
+
+
+def _parse_envelope_body(raw: bytes) -> NewEnvelopeBody:
+    """The JSON path's body. Pydantic's own message quotes the input, so it never leaves here."""
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        raise ValidationFailed("body is not valid JSON", code="validation_failed") from None
+    if not isinstance(document, dict):
+        raise ValidationFailed("body must be an object", code="validation_failed")
+    try:
+        return NewEnvelopeBody.model_validate(document)
+    except ValidationError:
+        raise ValidationFailed("body is not a valid envelope", code="validation_failed") from None
+
+
+def _parse_host_document_body(raw: str) -> NewHostDocumentEnvelopeBody:
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        raise ValidationFailed("body is not valid JSON", code="validation_failed") from None
+    if not isinstance(document, dict):
+        raise ValidationFailed("body must be an object", code="validation_failed")
+    try:
+        return NewHostDocumentEnvelopeBody.model_validate(document)
+    except ValidationError:
+        raise ValidationFailed("body is not a valid host-document envelope", code="validation_failed") from None
+
+
+def _create_from_template(request: Request, body: NewEnvelopeBody, idempotency_key: str | None) -> JSONResponse:
+    """Create from a published template version. With an ``Idempotency-Key`` a retry returns the
+    same envelope instead of creating a second one. The stored replay is the envelope's *id*, not
+    the response body -- the body carries display names and there is no reason to keep a second
+    copy of those -- so a replay shows that envelope as it is now."""
     rt = runtime_of(request)
     with rt.transaction() as db:
         host, ctx = authenticate_host(request, rt, db)
         scope = f"host:{host.id}"
         if idempotency_key is not None:
             digest = idempotency.request_hash("POST", "/v1/envelopes", body.model_dump(mode="json"))
-            stored = idempotency.begin(
-                db,
-                scope=scope,
-                key=idempotency_key,
-                digest=digest,
-                now=rt.clock.now(),
-                ttl=timedelta(hours=rt.settings.idempotency_ttl_hours),
-            )
-            if stored is not None:
-                view = rt.envelopes.get(db, host, UUID(str(stored.body["envelope_id"])))
-                return JSONResponse(envelope_json(view), status_code=stored.status)
+            replayed = _replay(rt, db, host, scope, idempotency_key, digest)
+            if replayed is not None:
+                return replayed
         view = rt.envelopes.create(db, host, body.to_contract(), ctx)
         if idempotency_key is not None:
             idempotency.complete(db, scope=scope, key=idempotency_key, status=201, body={"envelope_id": str(view.id)})
     return JSONResponse(envelope_json(view), status_code=201)
+
+
+def _create_from_document(
+    request: Request, body: NewHostDocumentEnvelopeBody, document: bytes, idempotency_key: str | None
+) -> JSONResponse:
+    """Addendum 2: create from the PDF the host's backend generated."""
+    rt = runtime_of(request)
+    with rt.transaction() as db:
+        host, ctx = authenticate_host(request, rt, db)
+        scope = f"host:{host.id}"
+        if idempotency_key is not None:
+            # The digest covers the document as well as the body, as ``POST /v1/archives`` does:
+            # the same key with different bytes is a different request and must not replay this
+            # one's answer.
+            digest = idempotency.request_hash(
+                "POST",
+                "/v1/envelopes",
+                {**body.model_dump(mode="json"), "document_sha256": hashlib.sha256(document).hexdigest()},
+            )
+            replayed = _replay(rt, db, host, scope, idempotency_key, digest)
+            if replayed is not None:
+                return replayed
+        # Creating a host-document envelope stores two blobs that have no delete path and runs a
+        # whole PDF through hygiene, field resolution and flattening. Metered on the host like the
+        # other calls that create evidence, and after the replay check for the same reason
+        # ``POST /v1/archives`` meters after its own: a retry of a creation that already succeeded
+        # must get its first answer back, not a 429.
+        limit = RateLimits.SESSION_CREATE
+        rt.limiter.hit(host_key("envelope_document", host.id), limit=limit.limit, window_seconds=limit.window_seconds)
+        view = rt.envelopes.create_from_document(db, host, body.to_contract(document), ctx)
+        if idempotency_key is not None:
+            idempotency.complete(db, scope=scope, key=idempotency_key, status=201, body={"envelope_id": str(view.id)})
+    return JSONResponse(envelope_json(view), status_code=201)
+
+
+def _replay(rt: Runtime, db: Any, host: Host, scope: str, idempotency_key: str, digest: bytes) -> JSONResponse | None:
+    """Claim the key, or return the answer the first request left. One definition for both shapes."""
+    stored = idempotency.begin(
+        db,
+        scope=scope,
+        key=idempotency_key,
+        digest=digest,
+        now=rt.clock.now(),
+        ttl=timedelta(hours=rt.settings.idempotency_ttl_hours),
+    )
+    if stored is None:
+        return None
+    view = rt.envelopes.get(db, host, UUID(str(stored.body["envelope_id"])))
+    return JSONResponse(envelope_json(view), status_code=stored.status)
 
 
 @router.get("/envelopes/{envelope_id}")

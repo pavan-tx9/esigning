@@ -16,6 +16,7 @@ markers below each sit on one of those, and nowhere else.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
@@ -29,6 +30,7 @@ from esign.contracts import (
     BlobKind,
     Capacity,
     EnvelopeKind,
+    EnvelopeSource,
     EnvelopeStatus,
     IntegrityFailure,
     PaperSigner,
@@ -58,6 +60,7 @@ __all__ = [
     "load_template_version",
     "lock_envelope",
     "next_revision_no",
+    "revision_page_count",
     "revoke_envelope_sessions",
     "revoke_other_sessions",
     "seal_job_attempts",
@@ -76,7 +79,12 @@ __all__ = [
 class EnvelopeRow:
     """One envelope row. Addendum 1 A: ``kind`` decides which half of it is filled in --
     ``template_version_id`` and ``signing_order`` for an ``electronic`` envelope, the three paper
-    columns for a ``paper_archive``, and the schema's CHECKs make the mixture unrepresentable."""
+    columns for a ``paper_archive``, and the schema's CHECKs make the mixture unrepresentable.
+
+    Addendum 2 (``0800``): ``source`` decides where an *electronic* envelope's revision 1 came
+    from, and ``envelopes_source_template`` ties it to ``template_version_id`` -- exactly the
+    envelopes that are electronic *and* ``template``-sourced name a template version. A
+    ``host_document`` envelope carries its own ``field_definitions`` instead."""
 
     id: UUID
     host_id: UUID
@@ -100,6 +108,12 @@ class EnvelopeRow:
     paper_signed_on: date | None = None
     attestation: Attestation | None = None
     attested_at: datetime | None = None
+    #: Addendum 2 (``0800``).
+    source: EnvelopeSource = "template"
+    #: ``{"fields": [...], "signer_roles": [...]}`` for a host document, ``None`` otherwise. Read
+    #: with ``envelopes.definitions.parse_envelope_definitions``; a field ``label`` is shown in
+    #: the signing UI, so nothing here carries PHI.
+    field_definitions: Any = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +242,8 @@ def _envelope(row: Any) -> EnvelopeRow:
         paper_signed_on=row.paper_signed_on,
         attestation=_attestation(row.attestation, envelope_id),
         attested_at=_opt_utc(row.attested_at),
+        source=str(row.source),  # type: ignore[arg-type]  # CHECK-constrained in the schema
+        field_definitions=row.field_definitions,
     )
 
 
@@ -259,7 +275,10 @@ _ENVELOPE_COLUMNS = (
     "expires_at, created_at, completed_at, sealed_at, "
     # Addendum 1 A (0700): which kind of envelope this is, and the paper facts that only a
     # paper_archive carries.
-    "kind, paper_signed_on, attestation, attested_at"
+    "kind, paper_signed_on, attestation, attested_at, "
+    # Addendum 2 (0800): where an electronic envelope's revision 1 came from, and -- when the host
+    # supplied it -- the field and role definitions a template version would otherwise hold.
+    "source, field_definitions"
 )
 
 _SIGNER_COLUMNS = (
@@ -294,7 +313,7 @@ def insert_envelope(
     *,
     envelope_id: UUID,
     host_id: UUID,
-    template_version_id: UUID,
+    template_version_id: UUID | None,
     document_type: str,
     patient_ref: str,
     host_document_ref: str | None,
@@ -303,14 +322,25 @@ def insert_envelope(
     supersedes_envelope_id: UUID | None,
     expires_at: datetime,
     created_at: datetime,
+    source: EnvelopeSource = "template",
+    field_definitions: dict[str, Any] | None = None,
 ) -> None:
+    """Insert a new electronic envelope.
+
+    Addendum 2: ``source`` and ``field_definitions`` travel together with
+    ``template_version_id``. ``envelopes_source_template`` and
+    ``envelopes_source_field_definitions`` make the three consistent or refuse the row, so a
+    host-document envelope cannot be written with a template version and a template one cannot be
+    written carrying its own definitions.
+    """
     db.execute(
         text(
             "INSERT INTO envelopes (id, host_id, template_version_id, document_type, patient_ref, "
             "  host_document_ref, signing_order, status, presented_sha256, current_revision_sha256, "
-            "  supersedes_envelope_id, expires_at, created_at) "
+            "  supersedes_envelope_id, expires_at, created_at, source, field_definitions) "
             "VALUES (:id, :host_id, :tv, :document_type, :patient_ref, :host_document_ref, :signing_order, "
-            "  'created', :sha, :sha, :supersedes, :expires_at, :created_at)"
+            "  'created', :sha, :sha, :supersedes, :expires_at, :created_at, :source, "
+            "  CAST(:field_definitions AS jsonb))"
         ),
         {
             "id": envelope_id,
@@ -324,6 +354,8 @@ def insert_envelope(
             "supersedes": supersedes_envelope_id,
             "expires_at": expires_at,
             "created_at": created_at,
+            "source": source,
+            "field_definitions": None if field_definitions is None else json.dumps(field_definitions),
         },
     )
 
@@ -568,11 +600,18 @@ def insert_revision(
     sha256: bytes,
     signer_id: UUID | None,
     created_at: datetime,
+    page_count: int | None = None,
 ) -> None:
+    """Record a revision. Addendum 2: ``page_count`` is written once, here, and read back by
+    :func:`revision_page_count` -- a 30-page report is otherwise re-parsed on every presentation,
+    every viewed-every-page check and every session payload. It is nullable because
+    ``document_revisions`` is append-only and rows written before ``0800`` cannot be backfilled;
+    the callers fall back to counting for those."""
     db.execute(
         text(
-            "INSERT INTO document_revisions (id, envelope_id, revision_no, kind, sha256, signer_id, created_at) "
-            "VALUES (:id, :env, :no, :kind, :sha, :signer, :at)"
+            "INSERT INTO document_revisions "
+            "(id, envelope_id, revision_no, kind, sha256, signer_id, created_at, page_count) "
+            "VALUES (:id, :env, :no, :kind, :sha, :signer, :at, :pages)"
         ),
         {
             "id": revision_id,
@@ -582,8 +621,27 @@ def insert_revision(
             "sha": sha256,
             "signer": signer_id,
             "at": created_at,
+            "pages": page_count,
         },
     )
+
+
+def revision_page_count(db: Session, envelope_id: UUID, sha256: bytes) -> int | None:
+    """Pages in the stored revision with this hash, or ``None`` when it was written before ``0800``.
+
+    Scoped to the envelope as well as the hash: two envelopes can hold the same bytes (an
+    identical generated report for two patients is one content-addressed blob), and a page count
+    is a fact about the bytes either way -- but a cross-envelope read would be a join nothing else
+    in this module makes.
+    """
+    row = db.execute(
+        text(
+            "SELECT page_count FROM document_revisions WHERE envelope_id = :id AND sha256 = :sha "
+            "ORDER BY revision_no DESC LIMIT 1"
+        ),
+        {"id": envelope_id, "sha": sha256},
+    ).one_or_none()
+    return None if row is None or row.page_count is None else int(row.page_count)
 
 
 def revision_sha(db: Session, envelope_id: UUID, kind: str) -> bytes | None:

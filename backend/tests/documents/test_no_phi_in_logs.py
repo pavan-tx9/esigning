@@ -20,7 +20,15 @@ from uuid import UUID
 
 import pytest
 
-from esign.contracts import Capture, DocumentService, FieldDef, PrefillFieldDef, Rect, SignerStamp
+from esign.contracts import (
+    Capture,
+    DocumentService,
+    FieldDef,
+    PrefillFieldDef,
+    Rect,
+    SignerRoleDef,
+    SignerStamp,
+)
 from esign.documents import certificate as certificate_module
 from esign.documents import definitions as definitions_module
 from esign.documents import images as images_module
@@ -29,13 +37,15 @@ from esign.documents import service as service_module
 from esign.documents import stamping as stamping_module
 from esign.logging import LOGGABLE_KEYS, RESERVED_KEYS, drop_unlisted_keys
 from tests.documents.conftest import certificate_summary
-from tests.documents.helpers import handwriting_png, make_pdf
+from tests.documents.helpers import NamedWidget, generated_report, handwriting_png, make_pdf
 
 #: Things that must never reach a log line. Distinctive so a substring search is meaningful.
 PATIENT_NAME = "Zebediah Quillfeather"
 PREFILL_VALUE = "Left total knee replacement, MRN 998877"
 TYPED_SIGNATURE = "Zebediah Quillfeather"
 GUARDIAN_LABEL = "patient-ref-Quillfeather"
+#: Addendum 2: a host generating a report per patient can put anything in a widget's name.
+PHI_IN_A_WIDGET_NAME = "quillfeather_998877"
 
 
 class RecordingLogger:
@@ -82,9 +92,33 @@ def captured_logs(monkeypatch: pytest.MonkeyPatch) -> RecordingLogger:
     return recorder
 
 
+def run_the_supplied_path(documents: DocumentService) -> None:
+    """Addendum 2's share: a host document is the one input whose *field names* are host text.
+
+    The report is built with a widget whose name carries an identifier, so a log line that echoed
+    the name -- or an error message that echoed it -- would be caught by the assertions below
+    rather than discovered in a customer's log aggregator.
+    """
+    report = generated_report(
+        pages=2,
+        widgets=[NamedWidget(name=f"patient__{PHI_IN_A_WIDGET_NAME}_signature", rect=(72, 96, 292, 146), page=2)],
+    )
+    documents.inspect_supplied_pdf(report)
+    role = SignerRoleDef(
+        key="patient",
+        label=PATIENT_NAME,  # a role label is host-chosen and may well be a person's name
+        allowed_capacities=("self",),
+        requires_reauth=False,
+        order_index=0,
+    )
+    documents.resolve_named_fields(report, [role])
+    documents.flatten_supplied(report)
+
+
 def run_the_pipeline(documents: DocumentService) -> None:
     template = make_pdf(pages=2)
     documents.inspect_template_pdf(template)
+    run_the_supplied_path(documents)
 
     prefill_fields = [
         PrefillFieldDef(key="patient_name", page=1, rect=Rect(x=72, y=600, w=240, h=14)),

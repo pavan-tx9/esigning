@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,23 +42,28 @@ from esign.documents.pdfutil import Matrix, compose
 
 __all__ = [
     "Box",
+    "NamedWidget",
     "PlacedImage",
     "PlacedText",
     "blank_png",
     "bomb_png",
+    "generated_report",
     "geometry_of",
     "handwriting_png",
     "make_pdf",
     "not_a_png",
+    "pdf_with_acroform_javascript",
     "pdf_with_embedded_file",
     "pdf_with_javascript",
     "pdf_with_launch_action",
+    "pdf_with_named_widgets",
     "pdf_with_page_additional_actions",
     "pdf_with_signature_field",
     "pdf_with_widget_annotation",
     "pdf_with_xfa",
     "placed_images",
     "placed_text",
+    "widget_names",
 ]
 
 
@@ -248,6 +254,169 @@ def pdf_with_widget_annotation(*, rect: tuple[float, float, float, float] = (72,
         writer.pages[0][NameObject("/Annots")] = ArrayObject([annot])
 
     return _rewrite(make_pdf(), mutate)
+
+
+# ------------------------------------------------------- host-supplied documents (Addendum 2)
+
+
+@dataclass(frozen=True)
+class NamedWidget:
+    """One AcroForm widget to plant in a fixture.
+
+    ``rect`` is in the page's own *user space*, deliberately: that is what a real generator writes,
+    and the point of the geometry tests is that the conversion to displayed coordinates happens in
+    the code under test rather than in the fixture. A ``name`` containing a ``.`` is built as a
+    parent field with a kid, which is the other shape generators produce.
+    """
+
+    name: str
+    rect: tuple[float, float, float, float]
+    page: int = 1  # 1-based
+    ft: str = "/Tx"
+    flags: int = 0  # /Ff
+    javascript: bool = False  # an /AA keystroke action, which intake must refuse
+
+
+def _widget_dict(writer: PdfWriter, widget: NamedWidget) -> tuple[Any, Any]:
+    """``(field_to_register, annotation_on_the_page)`` for one widget.
+
+    They are the same object unless the name is hierarchical, in which case the page gets the kid
+    and the AcroForm gets the parent -- the widget then carries no ``/T`` of its own, so resolving
+    its name means walking ``/Parent``. That pair references itself both ways, as a real form does,
+    so both halves are registered as indirect objects: a direct cycle is not writable.
+    """
+    annot = DictionaryObject()
+    annot[NameObject("/Type")] = NameObject("/Annot")
+    annot[NameObject("/Subtype")] = NameObject("/Widget")
+    annot[NameObject("/Rect")] = ArrayObject([FloatObject(value) for value in widget.rect])
+    annot[NameObject("/F")] = NumberObject(4)  # Print
+
+    if widget.javascript:
+        action = DictionaryObject()
+        action[NameObject("/S")] = NameObject("/JavaScript")
+        action[NameObject("/JS")] = TextStringObject("this.getField('x').value = 'tampered';")
+        additional = DictionaryObject()
+        additional[NameObject("/K")] = action
+        annot[NameObject("/AA")] = additional
+
+    head, _, tail = widget.name.partition(".")
+    if not tail:
+        annot[NameObject("/T")] = TextStringObject(widget.name)
+        annot[NameObject("/FT")] = NameObject(widget.ft)
+        if widget.flags:
+            annot[NameObject("/Ff")] = NumberObject(widget.flags)
+        return annot, annot
+
+    parent = DictionaryObject()
+    parent[NameObject("/T")] = TextStringObject(head)
+    parent[NameObject("/FT")] = NameObject(widget.ft)
+    if widget.flags:
+        parent[NameObject("/Ff")] = NumberObject(widget.flags)
+    annot[NameObject("/T")] = TextStringObject(tail)
+    parent_ref = writer._add_object(parent)
+    annot[NameObject("/Parent")] = parent_ref
+    parent[NameObject("/Kids")] = ArrayObject([writer._add_object(annot)])
+    return parent_ref, annot
+
+
+def _attach_widgets(data: bytes, widgets: Sequence[NamedWidget]) -> bytes:
+    def mutate(writer: PdfWriter) -> None:
+        fields = ArrayObject()
+        by_page: dict[int, ArrayObject] = {}
+        for widget in widgets:
+            field, annot = _widget_dict(writer, widget)
+            fields.append(field)
+            by_page.setdefault(widget.page, ArrayObject()).append(annot)
+        form = DictionaryObject()
+        form[NameObject("/Fields")] = fields
+        writer.root_object[NameObject("/AcroForm")] = form
+        for page_number, annots in by_page.items():
+            writer.pages[page_number - 1][NameObject("/Annots")] = annots
+
+    return _rewrite(data, mutate)
+
+
+def pdf_with_named_widgets(
+    widgets: Sequence[NamedWidget],
+    *,
+    pages: int = 1,
+    size: tuple[float, float] = (612.0, 792.0),
+    rotate: int = 0,
+    origin: tuple[float, float] = (0.0, 0.0),
+) -> bytes:
+    """A plain document carrying exactly ``widgets``, on pages that may be rotated or offset."""
+    return _attach_widgets(make_pdf(pages=pages, size=size, rotate=rotate, origin=origin), widgets)
+
+
+def pdf_with_acroform_javascript() -> bytes:
+    """A form field whose keystroke action runs JavaScript.
+
+    The hygiene rules allow widgets through on a supplied document -- they are how the signature
+    block is found -- so this is the fixture that proves "widgets allowed" did not quietly become
+    "anything in the AcroForm allowed".
+    """
+    return pdf_with_named_widgets([NamedWidget(name="clinician_signature", rect=(72, 96, 292, 146), javascript=True)])
+
+
+def _report_line(page_index: int, line_index: int) -> str:
+    """One line of plausible, entirely synthetic report prose. No names, no dates, no numbers
+    that could be mistaken for a record identifier."""
+    phrases = (
+        "Findings within expected range for the region examined.",
+        "No acute abnormality identified on the current study.",
+        "Comparison made with the prior study of record.",
+        "Measurements are stable relative to the previous examination.",
+        "Recommend routine follow-up per the standing care pathway.",
+        "Technique: standard protocol, no contrast administered.",
+        "Correlation with the clinical picture is advised.",
+    )
+    return f"{phrases[(page_index * 7 + line_index) % len(phrases)]} (section {line_index + 1})"
+
+
+def generated_report(
+    *,
+    pages: int = 25,
+    widgets: Sequence[NamedWidget] = (),
+    size: tuple[float, float] = (612.0, 792.0),
+) -> bytes:
+    """A stand-in for the EHR's per-patient report: pages of generated text, a signature block last.
+
+    Built with reportlab rather than committed, so the timing test measures work on a document of
+    the shape and weight the addendum describes instead of on a one-page stub.
+    """
+    buffer = io.BytesIO()
+    canvas = Canvas(buffer, pagesize=size, invariant=1, pageCompression=1)
+    width, height = size
+    for index in range(pages):
+        canvas.setFont("Helvetica-Bold", 13)
+        canvas.drawString(54, height - 60, f"Clinical summary - page {index + 1} of {pages}")
+        canvas.setFont("Helvetica", 9.5)
+        y = height - 88
+        while y > 120:
+            canvas.drawString(54, y, _report_line(index, int((height - 88 - y) // 14)))
+            y -= 14
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(width - 120, 48, f"page {index + 1}")
+        canvas.showPage()
+    canvas.save()
+    data = buffer.getvalue()
+    return _attach_widgets(data, widgets) if widgets else data
+
+
+def widget_names(pdf: bytes) -> list[str]:
+    """Every widget annotation name still reachable from the page tree, for the flattening tests."""
+    reader = PdfReader(io.BytesIO(pdf))
+    found: list[str] = []
+    for page in reader.pages:
+        annots = page.get("/Annots")
+        annots = annots.get_object() if isinstance(annots, IndirectObject) else annots
+        if not isinstance(annots, ArrayObject | list):
+            continue
+        for ref in annots:
+            annot = ref.get_object() if isinstance(ref, IndirectObject) else ref
+            if isinstance(annot, DictionaryObject):
+                found.append(str(annot.get("/T", "")))
+    return found
 
 
 # --------------------------------------------------------------------------- PNG builders

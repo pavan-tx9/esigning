@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Reports · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack">
+  <section class="card">
+    <h1>Reports</h1>
+    <p class="lead">
+      Reports waiting on your signature. Each one is generated here, for this patient, and handed
+      to the signing service as the document itself.
+    </p>
+    <p class="fine">
+      There is no template behind these. A twenty-five or thirty page report is different for every
+      patient, so this records system renders the PDF, names the widgets in the signature block on
+      the last page (<code>clinician_signature</code>, <code>clinician_date</code>, and
+      <code>cosigner_*</code> where a second clinician signs), and uploads it over the same API key
+      it uses for everything else. The service checks it, reads the field positions off those
+      names, removes every widget, stores what we sent <em>and</em> the bytes it will actually show,
+      and records both hashes. From there it is an ordinary electronic envelope.
+    </p>
+    {% if problem_code %}
+      <p class="notice error" role="alert" data-testid="reports-problem">
+        That did not work: <code>{{ problem_code }}</code>.
+        {% if problem_code == 'document_type_not_approved' %}
+          The signing service has not been told that this kind of document may be signed
+          electronically. That is a compliance decision, not a bug.
+        {% endif %}
+      </p>
+    {% endif %}
+    {% if unreachable %}
+      <p class="notice warn" role="alert">
+        The signing service did not answer (<code>{{ unreachable }}</code>), so the statuses below may
+        be out of date.
+      </p>
+    {% endif %}
+  </section>
+
+  {% for row in rows %}
+    <section class="card task" data-testid="report" data-reference="{{ row.report.reference }}" data-status="{{ row.my_status }}">
+      <h2>{{ row.task.title }}</h2>
+      <dl class="facts">
+        <div><dt>Patient</dt><dd>{{ row.patient.name }}</dd></div>
+        <div><dt>Reference</dt><dd>{{ row.report.reference }}</dd></div>
+        <div><dt>Length</dt><dd data-testid="report-pages">{{ row.report.pages }} pages</dd></div>
+        <div><dt>Your part</dt><dd>{{ row.signer.role_label }}</dd></div>
+        <div><dt>Your status</dt><dd><span class="pill pill-{{ row.my_status }}">{{ row.my_status }}</span></dd></div>
+        <div><dt>Document</dt><dd>{{ row.task.envelope_status|replace('_', ' ') }}</dd></div>
+      </dl>
+      <p class="fine">{{ row.task.note }}</p>
+      {% if row.task.signers|length > 1 %}
+        <ol class="signers">
+          {% for signer in row.task.signers %}
+            <li data-role="{{ signer.role_key }}">
+              {{ signer.role_label }}
+              <span class="pill pill-{{ row.task.signer_status.get(signer.role_key, 'pending') }}">
+                {{ row.task.signer_status.get(signer.role_key, 'pending') }}
+              </span>
+            </li>
+          {% endfor %}
+        </ol>
+      {% endif %}
+      {% if row.task.upload_sha256 %}
+        <dl class="facts">
+          <div>
+            <dt>What we uploaded</dt>
+            <dd><code class="hash" data-testid="upload-hash">{{ row.task.upload_sha256 }}</code></dd>
+          </div>
+        </dl>
+        <p class="fine">
+          That is the hash of the PDF this system sent. The service records it as the upload hash
+          beside the hash of the flattened bytes it presents, so the step between the two is
+          evidence rather than a claim.
+        </p>
+      {% endif %}
+      <div class="actions">
+        {% if row.my_status == 'signed' %}
+          <p class="done" data-testid="report-done">You have signed this.</p>
+          {% if row.document %}
+            <a class="button" href="/chart/document/{{ row.document.id }}">See it in the chart</a>
+          {% endif %}
+        {% elif row.my_status == 'declined' %}
+          <p class="done">You chose to sign this on paper. The clinic has been told.</p>
+        {% elif row.waiting_for %}
+          <p class="done" data-testid="report-waiting">Waiting for the {{ row.waiting_for|lower }} to sign first.</p>
+        {% elif row.ready %}
+          <form method="post" action="/tasks/{{ row.task.id }}/open">
+            <input type="hidden" name="return_to" value="/reports" />
+            <button type="submit" data-testid="open-report">Generate and sign</button>
+          </form>
+        {% else %}
+          <p class="done">This document is no longer open for signature.</p>
+        {% endif %}
+        {% if row.task.upload_sha256 %}
+          <a class="button secondary" href="/reports/{{ row.task.id }}/generated.pdf" data-testid="report-preview">
+            See what was uploaded
+          </a>
+        {% endif %}
+      </div>
+    </section>
+  {% else %}
+    <section class="card"><p data-testid="reports-empty">No reports are waiting for your signature.</p></section>
+  {% endfor %}
+</div>
+{% endblock %}
