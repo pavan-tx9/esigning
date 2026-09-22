@@ -11,10 +11,12 @@ import {
   openTask,
   readEveryPage,
   reauthenticate,
+  reloadUntilVisible,
   shot,
   signIn,
   task,
   ui,
+  waitForWebhook,
 } from "./flow";
 
 /**
@@ -61,6 +63,7 @@ test.describe("a patient with a phone in the waiting room", () => {
     expect(await sidewaysScroll(embeddedFrame(page))).toBe(0);
 
     await frame.getByRole("button", { name: "Continue" }).click();
+    await expect(frame.getByTestId("step-consent")).toBeVisible();
     await shot(page, "phone-03-consent");
     await agree(frame);
 
@@ -125,15 +128,22 @@ test("the webhook log is verified deliveries and nothing about the patient", asy
 
   const rows = page.locator('[data-testid="webhook-row"]');
   await expect(rows.first()).toBeVisible();
-  const verified = await rows.evaluateAll((items) =>
-    items.map((i) => (i as HTMLElement).dataset.verified),
+  const deliveries = await rows.evaluateAll((items) =>
+    items.map((i) => ({
+      verified: (i as HTMLElement).dataset.verified,
+      event: (i as HTMLElement).dataset.event,
+    })),
   );
-  expect(verified).not.toContain("false");
-  const events = await rows.evaluateAll((items) =>
-    items.map((i) => (i as HTMLElement).dataset.event),
-  );
-  expect(events).toContain("envelope.completed");
-  expect(events).toContain("envelope.sealed");
+
+  // The service has other hosts, and one of them may have a delivery of its own still queued for
+  // this URL. Arriving with a secret this host does not hold, it is refused and nothing is read
+  // out of it -- so a refused row says nothing about any envelope, and no envelope was ever
+  // believed on an unverified word.
+  const refused = deliveries.filter((row) => row.verified === "false");
+  expect(refused.map((row) => row.event).filter(Boolean)).toEqual([]);
+  const believed = deliveries.filter((row) => row.verified === "true").map((row) => row.event);
+  expect(believed).toContain("envelope.completed");
+  expect(believed).toContain("envelope.sealed");
 
   // SPEC section 10: a webhook leaves the network, so it carries ids, statuses and hashes only.
   const log = page.getByTestId("webhook-log");
@@ -157,6 +167,7 @@ test.describe("a procedure consent needing three people", () => {
       expect(await sidewaysScroll(embeddedFrame(page))).toBe(0);
 
       await frame.getByRole("button", { name: "Continue" }).click();
+      await expect(frame.getByTestId("step-consent")).toBeVisible();
       await shot(page, "tablet-02-consent");
       await agree(frame);
       await adoptDrawn(page, frame);
@@ -219,7 +230,10 @@ test.describe("a procedure consent needing three people", () => {
     await expect(page.getByTestId("verification-result")).toContainText("Verified.");
     await shot(page, "23-three-signers-verified");
 
-    const pdf = await page.request.get(`${new URL(page.url()).pathname}/pdf`);
+    // What the chart actually holds, as bytes: one seal over a document three people signed.
+    const href = await page.getByTestId("download-sealed").getAttribute("href");
+    const pdf = await page.request.get(href ?? "");
+    expect(pdf.ok()).toBe(true);
     looksSealed(Buffer.from(await pdf.body()));
   });
 });
@@ -247,9 +261,8 @@ test("choosing paper ends the envelope and tells the clinic", async ({ page }) =
   await signIn(page, "grace");
   await expect(task(page, "Consent to treatment")).toContainText("sign this on paper");
   await page.getByRole("link", { name: "Webhooks" }).click();
-  await expect(
-    page.locator('[data-testid="webhook-row"][data-event="envelope.declined"]').first(),
-  ).toBeVisible();
+  await waitForWebhook(page, "envelope.declined");
+  await shot(page, "32-declined-webhook");
 });
 
 // --------------------------------------------------------------------------- the clinic tablet
@@ -269,7 +282,10 @@ test.describe("the clinic tablet", () => {
     await card.getByTestId("kiosk-start").click();
 
     await expect(page).toHaveURL(/\/sign\//);
-    await expect(page.getByText(/identity checked by photo id/i)).toBeVisible();
+    // Who is signing, and on whose word: the tablet says both, and the session carries them.
+    await expect(page.getByTestId("who-is-signing")).toContainText(
+      "Maria Alvarez is signing in front of Alice Wu; identity checked by photo id",
+    );
     const frame = ui(page);
     await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 45_000 });
     await readEveryPage(frame);
@@ -292,7 +308,7 @@ test.describe("the clinic tablet", () => {
     await signIn(page, "tomas");
     await page.getByRole("link", { name: "Maria Alvarez" }).click();
     const filed = page.locator('[data-testid="chart-document"]', { hasText: "physiotherapy" });
-    await expect(filed).toBeVisible({ timeout: 120_000 });
+    await reloadUntilVisible(page, filed);
     await filed.getByRole("link").click();
     await page.getByTestId("verify").click();
     await expect(page.getByTestId("verification-result")).toContainText("Verified.");

@@ -208,7 +208,12 @@ def test_an_unverified_delivery_changes_nothing(client: TestClient, store: Store
 
     assert response.status_code == 401
     assert store.documents == {}
-    assert store.webhooks[0].verified is False
+    # Recorded as having arrived and failed the check, with nothing taken from the body: the event
+    # name and the envelope id in it are a stranger's claims until the signature says otherwise.
+    refused = store.webhooks[0]
+    assert refused.verified is False
+    assert (refused.event, refused.envelope_id) == ("", "")
+    assert "nothing was read" in refused.note
 
 
 def test_a_replayed_delivery_is_refused(client: TestClient, store: Store) -> None:

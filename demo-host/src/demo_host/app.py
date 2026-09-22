@@ -561,11 +561,30 @@ def create_app(
     async def receive_webhook(request: Request) -> Response:
         """Every delivery is verified before it is believed, and an unverified one changes nothing.
 
+        Nothing is *read* out of an unverified body either, not even the event name: a body whose
+        signature does not check out is a stranger's assertion, and putting its words in this log
+        would show them as if they were facts. So a refusal records that a delivery arrived and
+        failed the check, and no more. That is not hypothetical here -- the service has other
+        hosts, and another host's delivery, signed with another host's secret, is exactly what
+        arriving at this URL unverified looks like.
+
         Delivery is at-least-once, so the payload's ``id`` is what makes filing happen once.
         """
         body = await request.body()
         header = request.headers.get(SIGNATURE_HEADER, "")
-        ok = verify_signature(settings.webhook_secret, body, header, now=_now())
+        if not verify_signature(settings.webhook_secret, body, header, now=_now()):
+            state.record_webhook(
+                WebhookRecord(
+                    received_at=_now(),
+                    event="",
+                    envelope_id="",
+                    delivery_id=str(uuid4()),
+                    verified=False,
+                    note="signature did not check out; nothing was read and nothing was changed",
+                )
+            )
+            return JSONResponse({"error": "bad_signature"}, status_code=401)
+
         try:
             payload = json.loads(body)
         except ValueError:
@@ -573,19 +592,6 @@ def create_app(
         event = str(payload.get("event", "unknown"))
         envelope_id = str(payload.get("envelope_id", ""))
         delivery_id = str(payload.get("id", uuid4()))
-        if not ok:
-            state.record_webhook(
-                WebhookRecord(
-                    received_at=_now(),
-                    event=event,
-                    envelope_id=envelope_id,
-                    delivery_id=delivery_id,
-                    verified=False,
-                    note="signature rejected; nothing was changed",
-                )
-            )
-            return JSONResponse({"error": "bad_signature"}, status_code=401)
-
         task = state.task_by_envelope(envelope_id)
         note = "no task here for that envelope" if task is None else ""
         first_time = state.record_webhook(

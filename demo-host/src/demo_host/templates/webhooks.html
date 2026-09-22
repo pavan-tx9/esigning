@@ -20,14 +20,14 @@
   <section class="card">
     {% if records %}
       <table data-testid="webhook-log">
-        <thead><tr><th>Received</th><th>Event</th><th>Signature</th><th>Envelope</th><th>Note</th></tr></thead>
+        <thead><tr><th>Received (UTC)</th><th>Event</th><th>Signature</th><th>Envelope</th><th>Note</th></tr></thead>
         <tbody>
           {% for record in records %}
             <tr data-testid="webhook-row" data-event="{{ record.event }}" data-verified="{{ 'true' if record.verified else 'false' }}">
               <td>{{ record.received_at.strftime('%H:%M:%S') }}</td>
-              <td><code>{{ record.event }}</code></td>
+              <td>{% if record.event %}<code>{{ record.event }}</code>{% else %}<span class="fine">not read</span>{% endif %}</td>
               <td><span class="pill pill-{{ 'passed' if record.verified else 'failed' }}">{{ 'verified' if record.verified else 'rejected' }}</span></td>
-              <td><code class="hash">{{ record.envelope_id }}</code></td>
+              <td>{% if record.envelope_id %}<code class="hash">{{ record.envelope_id }}</code>{% else %}<span class="fine">not read</span>{% endif %}</td>
               <td class="fine">{{ record.note }}</td>
             </tr>
           {% endfor %}

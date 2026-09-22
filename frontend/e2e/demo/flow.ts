@@ -4,7 +4,7 @@
  * spec reads as a story rather than as a list of selectors.
  */
 
-import { expect, type FrameLocator, type Page } from "@playwright/test";
+import { expect, type FrameLocator, type Locator, type Page } from "@playwright/test";
 
 export const PASSWORD = "demo1234";
 
@@ -147,6 +147,28 @@ export async function reauthenticate(page: Page, frame: FrameLocator): Promise<v
   await page.getByTestId("reauth-confirm").click();
   await expect(frame.getByTestId("reauth-verified")).toBeVisible();
 }
+
+/**
+ * Wait for something the EHR only finds out by asking again. Its pages are plain server-rendered
+ * HTML with no polling of their own -- the webhook log and the chart know nothing after they were
+ * sent -- so waiting for a delivery or a filing means reloading, exactly as a person would.
+ */
+export async function reloadUntilVisible(
+  page: Page,
+  locator: Locator,
+  timeout = 120_000,
+): Promise<void> {
+  await expect(async () => {
+    await page.reload();
+    await expect(locator).toBeVisible({ timeout: 2_000 });
+  }).toPass({ timeout, intervals: [1_000] });
+}
+
+export const waitForWebhook = (page: Page, event: string) =>
+  reloadUntilVisible(
+    page,
+    page.locator(`[data-testid="webhook-row"][data-event="${event}"]`).first(),
+  );
 
 /** Every message that crossed the iframe boundary, as the host page recorded it. */
 export const heard = (page: Page) =>

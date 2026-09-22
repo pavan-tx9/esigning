@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { type LoadedPdf, loadPdf } from "@/lib/pdf";
 
 export type PdfState =
@@ -42,11 +42,16 @@ export function usePdf(bytes: Uint8Array | undefined): PdfState {
   return state;
 }
 
-/** Width of an element's content box, kept current. */
+/**
+ * Width of an element's content box, kept current. Measured in a layout effect, before the
+ * browser paints: everything sized from it (the close-up of a field, a page of the document)
+ * would otherwise be painted once at zero width, which reads as a blank box where the document
+ * should be.
+ */
 export function useMeasuredWidth<T extends HTMLElement>(): [(node: T | null) => void, number] {
   const [node, setNode] = useState<T | null>(null);
   const [width, setWidth] = useState(0);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (node === null) {
       return;
     }

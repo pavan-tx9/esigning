@@ -148,6 +148,17 @@
     transition-duration: 0.01ms;
     scroll-behavior: auto;
   }
+
+  /*
+   * Shortening an animation is not the same as removing it. `step-enter` fills both ways, so
+   * until its first frame runs the step is held at `opacity: 0` -- and a step that has been
+   * asserted as visible can still be painted blank, which is what a screenshot of the consent
+   * screen caught. Somebody who asked for less motion should get a step that is simply there,
+   * so drop the animation rather than racing it.
+   */
+  .step-enter {
+    animation: none;
+  }
 }
 
 @keyframes step-enter {

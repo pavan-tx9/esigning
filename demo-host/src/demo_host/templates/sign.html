@@ -12,7 +12,7 @@
 
   <section class="card">
     <h1>{{ task.title }}</h1>
-    <p class="lead">
+    <p class="lead" data-testid="who-is-signing">
       {% if kiosk %}
         Clinic tablet. {{ patient.name }} is signing in front of {{ user.display_name }}; identity
         checked by {{ kiosk_check|lower }}. The signature is attributed to the patient, never to the
