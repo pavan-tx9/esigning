@@ -59,6 +59,14 @@ def test_an_adopted_capture_stamps_the_stored_image_and_names_it_in_the_trail(eh
     assert capture["image_sha256"] == stored_image_hex(world, saved["id"])
     assert capture["typed_text_sha256"] is None
 
+    # Verification follows the pointer: the capture row holds no ink, the saved signature does,
+    # and the trail's digest is checked against *that*, which is also re-hashed.
+    report = ehr.verification(envelope["id"])
+    assert report["complete"] is True, report["problems"]
+    checks = {c["name"]: c for c in report["checks"]}
+    assert checks["captures_match_trail"]["status"] == "passed"
+    assert checks["capture_images_intact"]["status"] == "passed"
+
 
 def test_an_adopted_typed_signature_carries_its_text_digest(ehr: Ehr, world: World) -> None:
     adopt(ehr, kind="typed")
@@ -77,6 +85,8 @@ def test_an_adopted_typed_signature_carries_its_text_digest(ehr: Ehr, world: Wor
     assert capture["image_sha256"] is None
     assert capture["typed_text_sha256"] is not None
     assert capture["typed_text_sha256"] != saved["typed_text"]  # a digest, never the name
+    report = ehr.verification(envelope["id"])
+    assert report["complete"] is True, report["problems"]
 
 
 def test_a_signature_without_a_saved_one_records_no_adopted_id(ehr: Ehr) -> None:

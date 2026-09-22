@@ -381,6 +381,48 @@ def build_store() -> Store:
             },
             note="The one to run on the clinic tablet: the front desk starts it, the patient signs it there, and the tablet comes back.",
         ),
+        # Sam's own documents (he is old enough to have a portal login of his own in this demo):
+        # one to sign on the portal, one for the clinic tablet, one for afterwards. Together they
+        # show that a signature saved on the portal is never offered on a shared tablet, and that
+        # the front desk can take a saved signature away.
+        Task(
+            id=str(uuid4()),
+            title="Acknowledgement of privacy practices (annual)",
+            template_key="hipaa_acknowledgement",
+            patient_id=sam.id,
+            signing_order="parallel",
+            signers=(TaskSigner(role_key="patient", role_label="Patient", user_id="u-sam", capacity="self"),),
+            prefill={"patient_name": sam.name, "notice_version": "2026-03"},
+            note="Sam signs this one himself. Tick 'Save this signature for next time' to keep it.",
+        ),
+        Task(
+            id=str(uuid4()),
+            title="Consent to treatment (hydrotherapy)",
+            template_key="patient_consent",
+            patient_id=sam.id,
+            signing_order="parallel",
+            signers=(TaskSigner(role_key="patient", role_label="Patient", user_id="u-sam", capacity="self"),),
+            prefill={
+                "patient_name": sam.name,
+                "date_of_birth": sam.date_of_birth,
+                "treatment_summary": "Six sessions of hydrotherapy for the left ankle, weekly.",
+            },
+            note="For the clinic tablet. A shared tablet is never offered a saved signature, whatever Sam kept on the portal.",
+        ),
+        Task(
+            id=str(uuid4()),
+            title="Consent to treatment (review appointment)",
+            template_key="patient_consent",
+            patient_id=sam.id,
+            signing_order="parallel",
+            signers=(TaskSigner(role_key="patient", role_label="Patient", user_id="u-sam", capacity="self"),),
+            prefill={
+                "patient_name": sam.name,
+                "date_of_birth": sam.date_of_birth,
+                "treatment_summary": "A review of the ankle at the end of the physiotherapy course.",
+            },
+            note="Open this after the front desk has removed Sam's saved signature from 'People': it is no longer offered.",
+        ),
         *_orders(
             "u-priya",
             (

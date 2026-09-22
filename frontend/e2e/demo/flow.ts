@@ -188,3 +188,35 @@ export function looksSealed(pdf: Buffer, envelopeId?: string): void {
     expect(text).toContain(`envelope:${envelopeId}`);
   }
 }
+
+/** Adopt a typed signature and tick the box that keeps it for next time (SPEC section 14 B). */
+export async function adoptTypedAndSave(frame: FrameLocator, name: string): Promise<void> {
+  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+  await frame.getByRole("radio", { name: /Type it/ }).check();
+  await frame.getByLabel("Type your full name").fill(name);
+  const keep = frame.getByRole("checkbox", { name: /Save this signature for next time/ });
+  await expect(keep).not.toBeChecked();
+  await keep.check();
+  await frame.getByRole("button", { name: "Use this signature" }).click();
+}
+
+/** The signature saved last time is offered first; take it. Still placed per field afterwards. */
+export async function useSavedSignature(frame: FrameLocator): Promise<void> {
+  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+  await expect(frame.getByTestId("saved-signature")).toBeVisible();
+  await expect(frame.getByRole("radio", { name: /Use my saved signature/ })).toBeChecked();
+  await frame.getByRole("button", { name: "Use this signature" }).click();
+}
+
+/** A queue document: open from the queue page, read, agree, sign with a typed name. */
+export async function openFromQueue(page: Page, title: string): Promise<FrameLocator> {
+  await page
+    .locator('[data-testid="queue-task"]')
+    .filter({ has: page.getByRole("heading", { name: title }) })
+    .getByTestId("queue-sign")
+    .click();
+  await expect(page).toHaveURL(/\/sign\//);
+  const frame = ui(page);
+  await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 45_000 });
+  return frame;
+}

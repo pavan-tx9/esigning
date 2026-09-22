@@ -743,10 +743,17 @@ class Verifier:
         the hashing), and every digest ``signer.signed`` recorded is the digest of a capture that is
         still there. Returns how many blobs were read.
         """
+        # An ``adopted`` capture (Addendum 1 B) keeps no ink of its own: it points at the saved
+        # signature that was applied, and the image or text lives on that row. What the trail
+        # recorded is the digest of what was stamped, so the comparison follows the pointer.
         rows = db.execute(
             text(
-                "SELECT c.signer_id, c.field_id, c.kind, c.image_sha256, c.typed_text "
-                "FROM signature_captures c JOIN signers s ON s.id = c.signer_id "
+                "SELECT c.signer_id, c.field_id, c.kind, "
+                "       COALESCE(c.image_sha256, a.image_sha256) AS image_sha256, "
+                "       COALESCE(c.typed_text, a.typed_text) AS typed_text "
+                "FROM signature_captures c "
+                "JOIN signers s ON s.id = c.signer_id "
+                "LEFT JOIN adopted_signatures a ON a.id = c.adopted_signature_id "
                 "WHERE s.envelope_id = :id ORDER BY c.created_at, c.id"
             ),
             {"id": envelope_id},
