@@ -51,6 +51,14 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        # Hand complex fields (the two tuples and the retention dict) to their ``mode="before"``
+        # validators as the raw string. Without this, pydantic-settings JSON-decodes a
+        # complex-typed field *inside the env source*, before any validator runs, so the spelling
+        # `.env.example` documents and :func:`_split_csv` promises --
+        # `APPROVED_DOCUMENT_TYPES=a,b,c` -- raised `SettingsError` and the service refused to
+        # start. Every complex field here parses its own string (:func:`_split_csv` still accepts
+        # the JSON form, `_json_dict` requires it), so nothing is lost by taking the decoding back.
+        enable_decoding=False,
     )
 
     # ----------------------------------------------------------------- environment

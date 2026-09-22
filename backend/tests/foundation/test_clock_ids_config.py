@@ -122,6 +122,32 @@ def test_list_settings_also_accept_json() -> None:
     assert settings.trusted_proxy_cidrs == ("10.0.0.0/8",)
 
 
+def test_both_spellings_survive_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The spelling `.env.example` documents has to work *through the environment*, not only when
+    a string is handed to the constructor.
+
+    The two tests above construct `Settings` directly, which enters the model's own validators.
+    A real deployment sets an env var, and pydantic-settings used to JSON-decode a complex-typed
+    field inside the env source -- before `_split_csv` ever ran. So `APPROVED_DOCUMENT_TYPES=a,b`
+    raised `SettingsError` at startup while the same value passed as an argument was fine, and
+    `.env.example` shipped the spelling that failed. `enable_decoding=False` takes that decoding
+    back; this test is the one that would have noticed.
+    """
+    monkeypatch.setenv("APPROVED_DOCUMENT_TYPES", "patient_consent, clinical_report")
+    monkeypatch.setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/8")
+    monkeypatch.setenv("RETENTION_YEARS_BY_DOCUMENT_TYPE", '{"clinical_report": 7}')
+    settings = Settings()
+    assert settings.approved_document_types == ("patient_consent", "clinical_report")
+    assert settings.trusted_proxy_cidrs == ("10.0.0.0/8",)
+    assert settings.retention_years("clinical_report") == 7
+
+    monkeypatch.setenv("APPROVED_DOCUMENT_TYPES", '["patient_consent"]')
+    monkeypatch.setenv("TRUSTED_PROXY_CIDRS", '["10.0.0.0/8", "192.168.0.0/16"]')
+    json_spelling = Settings()
+    assert json_spelling.approved_document_types == ("patient_consent",)
+    assert json_spelling.trusted_proxy_cidrs == ("10.0.0.0/8", "192.168.0.0/16")
+
+
 def test_an_unknown_seal_profile_is_refused() -> None:
     with pytest.raises(ValueError, match="seal_profile"):
         Settings(seal_profile="PAdES-B-MAYBE")

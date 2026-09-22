@@ -104,11 +104,11 @@ export REAUTH_MAX_AGE_SECONDS="${REAUTH_MAX_AGE_SECONDS:-300}"
 # Addendum 2: the demo host generates clinical reports and supplies them as the document itself.
 # The service will not take a document type nobody approved, whoever rendered the PDF, so the
 # clinic's list gets `clinical_report` on it -- the four defaults plus the one this demo adds.
-#
-# As JSON, not as `a,b,c`: pydantic-settings decodes a tuple-typed setting from the environment as
-# JSON before the comma-separated form is ever seen, so the plain spelling stops the service from
-# starting. (backend/.env.example line 69 has the plain spelling and would do the same.)
-export APPROVED_DOCUMENT_TYPES="${APPROVED_DOCUMENT_TYPES:-[\"patient_consent\",\"hipaa_acknowledgement\",\"procedure_consent\",\"clinical_order\",\"clinical_report\"]}"
+# The plain comma-separated spelling, the one `.env.example` documents: it used to stop the
+# service from starting, because pydantic-settings JSON-decoded a tuple-typed setting before the
+# validator that accepts commas ever ran. `Settings` now takes that decoding back
+# (`enable_decoding=False`), so a deployment can spell it either way and so can this.
+export APPROVED_DOCUMENT_TYPES="${APPROVED_DOCUMENT_TYPES:-patient_consent,hipaa_acknowledgement,procedure_consent,clinical_order,clinical_report}"
 
 step "starting the API on ${API_PORT} (re-authentication span ${REAUTH_SPAN_SECONDS}s)"
 # `esign serve` rather than uvicorn directly: it drops uvicorn's log config, so its own loggers
