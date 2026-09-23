@@ -178,6 +178,61 @@ export const procedureFields: MockField[] = [
   },
 ];
 
+// --------------------------------------------------------------------------- one-page order
+
+/**
+ * The shape of document a signing queue is made of (addendum 3 B): one page, one signature, and
+ * the clinician has twenty of them. Everything this addendum saves is saved here -- a queue of
+ * thirty-page reports was never the case it was written for.
+ */
+export const orderFields: MockField[] = [
+  {
+    id: "clinician_sig",
+    type: "signature",
+    page: 1,
+    rect: { x: 72, y: 300, w: 220, h: 48 },
+    required: true,
+    label: "Clinician signature",
+    role: "clinician",
+  },
+  {
+    id: "clinician_date",
+    type: "date_signed",
+    page: 1,
+    rect: { x: 330, y: 300, w: 120, h: 24 },
+    required: true,
+    label: "Date signed",
+    role: "clinician",
+  },
+];
+
+export function orderPdf(sealed = false): Uint8Array {
+  const page = new PageWriter();
+  header(page, "Order for imaging", 1, 1);
+  // Plain ASCII only: this stand-in writes bytes straight into the PDF, so a typographic dash or
+  // a middot would reach the page as mojibake and make the sample look broken.
+  let y = page.paragraph(72, 650, 11, [
+    "Patient: R. P. (sample) - MRN 00-114-2 (sample) - ordered by the attending clinician.",
+    "",
+    "Chest radiograph, two views, to be performed before discharge. Clinical question: rule out",
+    "consolidation. No contrast. Standing precautions apply.",
+  ]);
+  y = page.paragraph(72, y - 24, 11, [
+    "By signing this order you confirm that it reflects your clinical decision for this patient",
+    "and that you have reviewed the details above.",
+  ]);
+  signatureBlock(page, 300, "Clinician", sealed ? "Dr. Priya Raman" : undefined);
+  if (sealed) {
+    page.text(
+      72,
+      80,
+      9,
+      "Sealed copy (mock). Certificate of completion follows in the real service.",
+    );
+  }
+  return buildPdf([page]);
+}
+
 export function procedurePdf(options: { earlierSigned: boolean; sealed?: boolean }): Uint8Array {
   const p1 = new PageWriter();
   header(p1, "Consent to procedure", 1, 3);

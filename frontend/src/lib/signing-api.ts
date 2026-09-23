@@ -76,6 +76,16 @@ export const adoptedSignatureSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
+/**
+ * A standing acceptance of the electronic-signature disclosure (addendum 3 C): the same person,
+ * on the same host, for the same consent version and locale, inside `CONSENT_SPAN_SECONDS`. The
+ * envelope it was given for is named because the UI sends it back and the server re-checks it.
+ */
+export const standingConsentSchema = z.object({
+  accepted_at: timestamp,
+  envelope_id: z.uuid(),
+});
+
 export const sessionSchema = z.object({
   envelope: z.object({
     id: z.uuid(),
@@ -100,7 +110,19 @@ export const sessionSchema = z.object({
   }),
   other_signers: z.array(z.object({ role_label: z.string(), status: signerStatusSchema })),
   fields: z.array(fieldSchema),
-  consent: z.object({ version: z.string().min(1), locale: z.string(), body: z.string().min(1) }),
+  consent: z.object({
+    version: z.string().min(1),
+    locale: z.string(),
+    body: z.string().min(1),
+    /**
+     * An acceptance this person already gave, for this same disclosure, inside the host's consent
+     * span (addendum 3 C). It is what lets the Read screen show one line instead of a checkbox.
+     * `.default(null)` rather than required: a service with `CONSENT_SPAN_SECONDS=0` -- the
+     * default, and every service built before this addendum -- sends no such key, and that is the
+     * ordinary per-envelope case, not a broken response.
+     */
+    standing: standingConsentSchema.nullable().default(null),
+  }),
   session: z.object({
     // The host page is told which session to re-authenticate (`esign:reauth_required`), so this
     // is required, as SPEC section 9 has it. A response without it is a broken response.
@@ -119,6 +141,7 @@ export type EnvelopeStatus = z.infer<typeof envelopeStatusSchema>;
 export type SignerStatus = z.infer<typeof signerStatusSchema>;
 export type ReauthScope = z.infer<typeof reauthScopeSchema>;
 export type SavedSignature = z.infer<typeof adoptedSignatureSchema>;
+export type StandingConsent = z.infer<typeof standingConsentSchema>;
 
 export const signingKeys = {
   all: ["signing"] as const,
@@ -233,11 +256,26 @@ export function postViewed(pagesViewed: number) {
 /**
  * `locale` is the language of the disclosure as the *server served it* (`consent.locale` in the
  * session payload), never the host's raw request: the trail has to say which text was accepted.
+ *
+ * `reliesOnEnvelopeId` is the earlier envelope whose acceptance this one leans on (addendum 3 C).
+ * It is sent only when the session reported a standing acceptance; the server re-checks that it
+ * is the signer's own, matches version and locale, and is inside the span, and refuses with 409
+ * `consent_not_standing` otherwise -- at which point the screen asks for the tick instead.
  */
-export function postConsent(consentVersion: string, locale: string) {
-  return api("/signing/consent", ackSchema, {
-    body: { consent_version: consentVersion, accepted: true, locale },
-  });
+export function postConsent(
+  consentVersion: string,
+  locale: string,
+  reliesOnEnvelopeId?: string | null,
+) {
+  const body: Record<string, unknown> = {
+    consent_version: consentVersion,
+    accepted: true,
+    locale,
+  };
+  if (reliesOnEnvelopeId !== undefined && reliesOnEnvelopeId !== null) {
+    body.relies_on_envelope_id = reliesOnEnvelopeId;
+  }
+  return api("/signing/consent", ackSchema, { body });
 }
 
 export function postDecline(reasonCode: string) {
@@ -294,6 +332,16 @@ export function isSessionGone(error: unknown): boolean {
 
 export function isNetworkError(error: unknown): boolean {
   return error instanceof ApiNetworkError;
+}
+
+/**
+ * The server will not let this consent lean on the earlier one after all (addendum 3 C): the
+ * span ran out between the session being read and the button being pressed, the disclosure
+ * version moved on, or the earlier acceptance is not this signer's. Nothing is wrong and nothing
+ * is lost -- the screen falls back to the checkbox and asks for it in as many words.
+ */
+export function isConsentNotStanding(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409 && error.code === "consent_not_standing";
 }
 
 /**

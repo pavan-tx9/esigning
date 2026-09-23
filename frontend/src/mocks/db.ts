@@ -9,6 +9,8 @@ import {
   hipaaFields,
   hipaaPdf,
   type MockField,
+  orderFields,
+  orderPdf,
   procedureFields,
   procedurePdf,
 } from "@/mocks/documents";
@@ -30,6 +32,20 @@ export const SCENARIOS = {
     "Clinician in a signing queue whose earlier re-authentication has run out: the hand-off is needed again.",
   "span-saved":
     "Clinician in a signing queue signing with their saved signature. The host can revoke it mid-flow (__esignMock.hostRevokedSignature) to see the signature go out from under them.",
+  queue:
+    "A clinician's signing queue (addendum 3 B): three one-page orders, one confirmation of identity covering all of them, consent already given for the first. Three taps a document.",
+  "standing-consent":
+    "A patient who agreed to sign electronically a few minutes ago, for an earlier document in the same sitting. The Read screen states that instead of asking again.",
+  "first-time":
+    "A signer with nothing on file: no saved signature and no standing consent. The signature panel opens on the chooser and the box is unticked.",
+  "reauth-press":
+    "A clinician with no live confirmation. Pressing Sign is what asks for one, and the signature goes by itself when the host answers.",
+  "reauth-timeout":
+    "The same, but the host never answers (press 'Do nothing'). The press times out and says nothing has been signed.",
+  "reauth-lapsed":
+    "The confirmation is live when the screen opens and has run out by the time the signature lands: 403 reauth_required on the sign request.",
+  "consent-lapsed":
+    "The session reports a standing agreement, but the span has run out by the time Continue is pressed: 409 consent_not_standing, and the checkbox comes back.",
   "flaky-sign":
     "The first sign request is processed but the reply is lost. Retry must reuse the key.",
   "sealing-stuck": "Sealing never finishes. The UI must stay honest.",
@@ -43,7 +59,20 @@ export const SCENARIOS = {
 
 export type Scenario = keyof typeof SCENARIOS;
 
-export const tokenFor = (scenario: Scenario) => `est_mock_${scenario}`;
+/** How many documents the `queue` scenario's host has waiting. */
+export const QUEUE_TOTAL = 3;
+/** What the host calls each of them; the host owns the queue, so these live on its side. */
+export const QUEUE_TITLES = ["Order for R. P.", "Order for T. N.", "Order for K. A."];
+
+/**
+ * The token names the scenario. `queue` takes a position as well (`est_mock_queue-2`), because
+ * each document in a run is its own envelope, its own session and its own token: the host opens
+ * the next one into the same iframe, and nothing about the previous one comes with it.
+ */
+export const tokenFor = (scenario: Scenario, position?: number) =>
+  scenario === "queue" && position !== undefined
+    ? `est_mock_queue-${position}`
+    : `est_mock_${scenario}`;
 
 /**
  * The disclosure the real service ships (`backend/src/esign/identity/consent/en-US.2026-09.txt`),
@@ -162,8 +191,21 @@ export interface MockSavedSignature {
   revokeReason: "replaced" | "user" | "host" | null;
 }
 
+/**
+ * An acceptance of the disclosure given for an *earlier* envelope by this person on this host,
+ * still inside `CONSENT_SPAN_SECONDS` (addendum 3 C). The mock keeps it on the record because
+ * that is all the UI can see of it: `GET /signing/session` reports it, and `POST /signing/consent`
+ * re-checks it.
+ */
+export interface MockStandingConsent {
+  acceptedAt: number;
+  envelopeId: string;
+}
+
 export interface MockRecord {
   scenario: Scenario;
+  /** The envelope this session is for. One per document, so a queue has one per position. */
+  envelopeId: string;
   signerStatus: SignerStatus;
   envelopeStatus: EnvelopeStatus;
   reauthValidUntil: number | null;
@@ -192,6 +234,18 @@ export interface MockRecord {
   requestedLocale: string | null;
   /** The locale the UI said the signer read the disclosure in, as posted with consent. */
   consentLocale: string | null;
+  /** The standing acceptance this session reports, or null for the per-envelope default. */
+  standingConsent: MockStandingConsent | null;
+  /**
+   * Whether the server would still honour it *now*. The session payload and the POST are answered
+   * at different moments, and the span can run out in between: that is the case the UI has to
+   * fall back from, so the mock can be told to stop honouring it without un-reporting it.
+   */
+  standingHonoured: boolean;
+  /** What the accepted consent leaned on, as the audit event's `relied_on_envelope_id` would. */
+  reliedOnEnvelopeId: string | null;
+  /** Let the session read as covered, then refuse the signature once, as a lapse does. */
+  lapseOnSign: boolean;
   sessionExpiresAt: number;
   createdAt: number;
 }
@@ -218,8 +272,14 @@ let deviceClockSkewMs = 0;
 const serverNow = () => Date.now() - deviceClockSkewMs;
 
 function scenarioOf(token: string): Scenario | null {
-  const name = token.replace(/^est_mock_/, "");
-  return token.startsWith("est_mock_") && name in SCENARIOS ? (name as Scenario) : null;
+  if (!token.startsWith("est_mock_")) {
+    return null;
+  }
+  const name = token.slice("est_mock_".length);
+  if (/^queue-[1-9]$/.test(name)) {
+    return "queue";
+  }
+  return name in SCENARIOS ? (name as Scenario) : null;
 }
 
 export const mockDb = {
@@ -243,12 +303,10 @@ export const mockDb = {
     let record = records.get(token);
     if (record === undefined) {
       const now = serverNow();
-      const spanAge =
-        scenario === "span-valid" || scenario === "span-saved" || scenario === "span-expired"
-          ? SPAN_AUTH_AGE_MS[scenario]
-          : null;
+      const spanAge = spanAuthAge(scenario);
       record = {
         scenario,
+        envelopeId: envelopeIdFor(token),
         signerStatus: "pending",
         envelopeStatus: scenario === "voided" ? "voided" : "in_progress",
         // A queue scenario starts with an attestation made for an *earlier* document of this
@@ -279,6 +337,14 @@ export const mockDb = {
         declineReason: null,
         requestedLocale: null,
         consentLocale: null,
+        // A kiosk is never among these: a shared tablet is a different person until proved
+        // otherwise, so `hasStandingConsent` never names one and `sessionBody` nulls it as well.
+        standingConsent: hasStandingConsent(scenario)
+          ? { acceptedAt: now - 8 * 60_000, envelopeId: EARLIER_ENVELOPE_ID }
+          : null,
+        standingHonoured: scenario !== "consent-lapsed",
+        reliedOnEnvelopeId: null,
+        lapseOnSign: scenario === "reauth-lapsed",
         sessionExpiresAt: now + (scenario === "ending-soon" ? 100_000 : 1_800_000),
         createdAt: now,
       };
@@ -290,9 +356,21 @@ export const mockDb = {
     return record;
   },
 
+  /**
+   * The span ran out between the session being read and Continue being pressed (addendum 3 C).
+   * The session payload still reports the standing acceptance -- it did when it was answered --
+   * and the POST refuses it, which is the fallback the Read screen has to make good.
+   */
+  consentNoLongerStanding(scenario: Scenario, position?: number): void {
+    const record = records.get(tokenFor(scenario, position));
+    if (record !== undefined) {
+      record.standingHonoured = false;
+    }
+  },
+
   /** What the host backend does after re-authenticating the user: POST /v1/sessions/{id}/reauth. */
-  attestReauth(scenario: Scenario = "clinician"): void {
-    const record = records.get(tokenFor(scenario));
+  attestReauth(scenario: Scenario = "clinician", position?: number): void {
+    const record = records.get(tokenFor(scenario, position));
     if (record !== undefined) {
       record.reauthAt = serverNow();
       record.reauthValidUntil = record.reauthAt + REAUTH_MAX_AGE_MS;
@@ -304,16 +382,16 @@ export const mockDb = {
    * The attestation runs out where the real one does: on the server, between a session being read
    * and a signature being sent. The UI's cached session still says the signer is covered.
    */
-  lapseReauth(scenario: Scenario): void {
-    const record = records.get(tokenFor(scenario));
+  lapseReauth(scenario: Scenario, position?: number): void {
+    const record = records.get(tokenFor(scenario, position));
     if (record !== undefined) {
       record.reauthValidUntil = serverNow() - 1;
     }
   },
 
   /** What the host does with `POST /v1/users/{id}/adopted-signature/revoke`. */
-  hostRevokedSignature(scenario: Scenario): void {
-    const record = records.get(tokenFor(scenario));
+  hostRevokedSignature(scenario: Scenario, position?: number): void {
+    const record = records.get(tokenFor(scenario, position));
     if (record !== undefined) {
       revokeSavedSignature(record, "host");
     }
@@ -323,39 +401,76 @@ export const mockDb = {
    * Another signer on the same envelope signs, so the current revision moves on. Nothing about
    * this signer changes -- which is the point: what they read is no longer what they would sign.
    */
-  otherSignerSigned(scenario: Scenario): void {
-    const record = records.get(tokenFor(scenario));
+  otherSignerSigned(scenario: Scenario, position?: number): void {
+    const record = records.get(tokenFor(scenario, position));
     if (record !== undefined) {
       record.revisions += 1;
     }
   },
 
-  expireSession(scenario: Scenario): void {
-    const record = records.get(tokenFor(scenario));
+  expireSession(scenario: Scenario, position?: number): void {
+    const record = records.get(tokenFor(scenario, position));
     if (record !== undefined) {
       record.sessionExpiresAt = 0;
     }
   },
 
-  peek(scenario: Scenario): MockRecord | undefined {
-    return records.get(tokenFor(scenario));
+  peek(scenario: Scenario, position?: number): MockRecord | undefined {
+    return records.get(tokenFor(scenario, position));
   },
 };
 
 // --------------------------------------------------------------------------- shape of each story
 
+/** The one-page orders a signing queue is made of, and the screens that stand in for one. */
+const isOrder = (scenario: Scenario) =>
+  scenario === "queue" ||
+  scenario === "reauth-press" ||
+  scenario === "reauth-timeout" ||
+  scenario === "reauth-lapsed";
 const isClinician = (scenario: Scenario) =>
   scenario === "clinician" ||
   scenario === "span-valid" ||
   scenario === "span-saved" ||
-  scenario === "span-expired";
+  scenario === "span-expired" ||
+  isOrder(scenario);
 const isProcedure = (scenario: Scenario) =>
-  scenario === "multi" || scenario === "initials-only" || isClinician(scenario);
+  scenario === "multi" ||
+  scenario === "initials-only" ||
+  (isClinician(scenario) && !isOrder(scenario));
 const roleOf = (scenario: Scenario) => (isClinician(scenario) ? "clinician" : "patient");
 /** Who has a signature on file from an earlier session. The kiosk patient does too: a shared
  * tablet must never be offered it, and the only way to prove that is for one to exist. */
 const hasSavedSignature = (scenario: Scenario) =>
-  scenario === "saved-signature" || scenario === "kiosk" || scenario === "span-saved";
+  scenario === "saved-signature" ||
+  scenario === "kiosk" ||
+  scenario === "span-saved" ||
+  scenario === "standing-consent" ||
+  scenario === "consent-lapsed" ||
+  isOrder(scenario);
+/** Who already agreed to sign electronically, for an earlier document in the same sitting. */
+const hasStandingConsent = (scenario: Scenario) =>
+  scenario === "standing-consent" ||
+  scenario === "consent-lapsed" ||
+  scenario === "queue" ||
+  scenario === "reauth-press" ||
+  scenario === "reauth-timeout" ||
+  scenario === "reauth-lapsed";
+
+/**
+ * How long ago the earlier document's confirmation of identity happened. The three queue-shaped
+ * order scenarios arrive covered (or not) exactly as a real span would leave them.
+ */
+function spanAuthAge(scenario: Scenario): number | null {
+  if (scenario === "span-valid" || scenario === "span-saved" || scenario === "span-expired") {
+    return SPAN_AUTH_AGE_MS[scenario];
+  }
+  if (scenario === "queue" || scenario === "reauth-lapsed") {
+    return 20_000;
+  }
+  // `reauth-press` and `reauth-timeout` have nothing to lean on: the press has to ask for it.
+  return null;
+}
 
 export const SAVED_SIGNATURE_ID = "9a1e5d2c-7b3f-4e8a-9c0d-1f2e3a4b5c6d";
 
@@ -381,7 +496,11 @@ const usableReauthUntil = (record: MockRecord): number | null =>
     : null;
 
 export function fieldsFor(record: MockRecord): MockField[] {
-  const all = isProcedure(record.scenario) ? procedureFields : hipaaFields;
+  const all = isOrder(record.scenario)
+    ? orderFields
+    : isProcedure(record.scenario)
+      ? procedureFields
+      : hipaaFields;
   const mine = all.filter((field) => field.role === roleOf(record.scenario));
   // A template can ask a signer for initials and nothing else. The signature they adopt would
   // land nowhere -- initials go over as their own typed text -- so there is nothing to save, and
@@ -392,10 +511,16 @@ export function fieldsFor(record: MockRecord): MockField[] {
 }
 
 export function pageCountFor(record: MockRecord): number {
+  if (isOrder(record.scenario)) {
+    return 1;
+  }
   return isProcedure(record.scenario) ? 3 : 2;
 }
 
 export function documentFor(record: MockRecord, sealed = false): Uint8Array {
+  if (isOrder(record.scenario)) {
+    return orderPdf(sealed);
+  }
   if (isProcedure(record.scenario)) {
     return procedurePdf({ earlierSigned: record.scenario === "clinician", sealed });
   }
@@ -406,6 +531,26 @@ const iso = (ms: number) => new Date(ms).toISOString();
 
 export const ENVELOPE_ID = "6f1c1a52-4a0e-4c59-9d7e-0a4d5f6b7c81";
 export const SIGNER_ID = "0b9d7f3e-2c41-4f7a-8a55-3e1f2d4c5b6a";
+/** The envelope a standing acceptance was given for: an earlier document, already signed. */
+export const EARLIER_ENVELOPE_ID = "1d2c3b4a-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+/**
+ * Each queue position is its own envelope. Every other scenario is a single document and keeps
+ * the id the tests have always named.
+ */
+function envelopeIdFor(token: string): string {
+  const position = /^est_mock_queue-([1-9])$/.exec(token)?.[1];
+  return position === undefined ? ENVELOPE_ID : `6f1c1a52-4a0e-4c59-9d7e-0a4d5f6b7c8${position}`;
+}
+
+/** Which of the host's orders this token is, 1-based, or null outside a queue. */
+export function queuePositionOf(record: MockRecord): number | null {
+  if (record.scenario !== "queue") {
+    return null;
+  }
+  const last = record.envelopeId.slice(-1);
+  return /[1-9]/.test(last) ? Number(last) : 1;
+}
 
 export function sessionBody(record: MockRecord) {
   const clinician = isClinician(record.scenario);
@@ -424,14 +569,21 @@ export function sessionBody(record: MockRecord) {
         : [];
   const reauthUntil = usableReauthUntil(record);
   const saved = kiosk ? null : liveSavedSignature(record);
+  const position = queuePositionOf(record);
   return {
     envelope: {
-      id: ENVELOPE_ID,
+      id: record.envelopeId,
       status: record.envelopeStatus,
-      document_type: isProcedure(record.scenario) ? "procedure_consent" : "hipaa_acknowledgement",
-      title: isProcedure(record.scenario)
-        ? "Consent to procedure"
-        : "Privacy notice acknowledgement",
+      document_type: isOrder(record.scenario)
+        ? "imaging_order"
+        : isProcedure(record.scenario)
+          ? "procedure_consent"
+          : "hipaa_acknowledgement",
+      title: isOrder(record.scenario)
+        ? (QUEUE_TITLES[(position ?? 1) - 1] ?? "Order for imaging")
+        : isProcedure(record.scenario)
+          ? "Consent to procedure"
+          : "Privacy notice acknowledgement",
       page_count: pageCountFor(record),
       expires_at: iso(record.createdAt + 7 * 86_400_000),
     },
@@ -454,7 +606,19 @@ export function sessionBody(record: MockRecord) {
     })),
     // Copies: a caller that pokes at the body it was handed (a schema test corrupting a field to
     // prove it is rejected) must not leave the mock's own disclosure broken for everyone after it.
-    consent: { ...CONSENT },
+    //
+    // `standing` is addendum 3 C. It is reported whether or not the span is still good at this
+    // instant: that is the whole point of the 409 the UI has to fall back from.
+    consent: {
+      ...CONSENT,
+      standing:
+        record.standingConsent === null || kiosk
+          ? null
+          : {
+              accepted_at: iso(record.standingConsent.acceptedAt),
+              envelope_id: record.standingConsent.envelopeId,
+            },
+    },
     session: {
       id: "5c4b3a29-1d8e-4f70-9b61-2a3c4d5e6f70",
       expires_at: iso(record.sessionExpiresAt),
@@ -518,6 +682,7 @@ export function recordConsent(
   version: unknown,
   accepted: unknown,
   locale: unknown,
+  reliesOn?: unknown,
 ): void {
   assertLive(record);
   if (record.signerStatus === "pending") {
@@ -525,6 +690,30 @@ export function recordConsent(
   }
   if (version !== CONSENT.version || accepted !== true) {
     throw invalid("The consent version is not current.");
+  }
+  /**
+   * Addendum 3 C. Leaning on an earlier acceptance is re-checked here and not taken on trust:
+   * the client names the envelope, the server decides whether that acceptance is the signer's
+   * own, matches this version and locale, and is still inside the span. Anything else is 409
+   * `consent_not_standing`, and the UI asks for the tick instead.
+   */
+  if (reliesOn !== undefined && reliesOn !== null) {
+    const standing = record.standingConsent;
+    const usable =
+      record.scenario !== "kiosk" &&
+      record.standingHonoured &&
+      standing !== null &&
+      reliesOn === standing.envelopeId;
+    if (!usable) {
+      throw new MockHttpError(
+        409,
+        "consent_not_standing",
+        "That agreement does not cover this document.",
+      );
+    }
+    record.reliedOnEnvelopeId = standing.envelopeId;
+  } else {
+    record.reliedOnEnvelopeId = null;
   }
   // SPEC 9: `locale` is optional, and is the locale as shown in the session payload -- what the
   // server served. A client that echoes back a language it was never given is refused.
@@ -688,6 +877,12 @@ export function recordSign(
   }
   if (body.intent_confirmed !== true) {
     throw invalid("Intent must be confirmed.");
+  }
+  // The attestation that was live when the screen was read and is not live any more. The real
+  // service finds this under the envelope row lock, between the two requests.
+  if (record.lapseOnSign) {
+    record.lapseOnSign = false;
+    record.reauthValidUntil = serverNow() - 1;
   }
   if (isClinician(record.scenario) && usableReauthUntil(record) === null) {
     // The service's own code for it (`api/errors.py`): the UI tells a lapsed re-authentication

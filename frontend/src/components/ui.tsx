@@ -180,11 +180,15 @@ interface SheetProps {
   className?: string;
   /** No padding of its own: for lists whose rows run edge to edge. */
   flush?: boolean;
+  testId?: string;
 }
 
-export function Sheet({ children, className = "", flush = false }: SheetProps) {
+export function Sheet({ children, className = "", flush = false, testId }: SheetProps) {
   return (
-    <div className={`rounded-xl bg-sheet shadow-sheet ${flush ? "" : "p-5 sm:p-6"} ${className}`}>
+    <div
+      data-testid={testId}
+      className={`rounded-xl bg-sheet shadow-sheet ${flush ? "" : "p-5 sm:p-6"} ${className}`}
+    >
       {children}
     </div>
   );

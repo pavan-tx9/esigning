@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type FlowState, flowReducer, initialFlowState, placeFor } from "@/flow/machine";
+import { type FlowState, flowReducer, initialFlowState, placeFor, type Step } from "@/flow/machine";
 import type { SigningSession } from "@/lib/signing-api";
 import { mockDb, sessionBody, tokenFor } from "@/mocks/db";
 
@@ -16,16 +16,19 @@ function session(patch: {
   };
 }
 
-const active = (step: "review" | "consent" | "sign" | "confirm" | "done"): FlowState => ({
+const active = (step: Step): FlowState => ({
   phase: "active",
   step,
   declining: false,
 });
 
 describe("where the server says the signer is", () => {
+  // Addendum 3: `viewed` means the pages were seen but consent was not given, and consent now
+  // lives on the Read screen -- so it resumes there, with the document above it, rather than on a
+  // consent screen of its own that no longer exists.
   it.each([
-    ["pending", "review"],
-    ["viewed", "consent"],
+    ["pending", "read"],
+    ["viewed", "read"],
     ["consented", "sign"],
     ["signed", "done"],
   ] as const)("a %s signer resumes at %s", (status, step) => {
@@ -61,7 +64,7 @@ describe("the flow", () => {
   });
 
   it("a background refetch never drags the signer backwards or forwards mid-step", () => {
-    const state = active("confirm");
+    const state = active("sign");
     const next = flowReducer(state, {
       type: "SESSION_LOADED",
       session: session({ signer: { status: "consented" } }),
@@ -74,7 +77,7 @@ describe("the flow", () => {
       signer: { status: "signed" },
       envelope: { status: "completed_pending_seal" },
     });
-    expect(flowReducer(active("confirm"), { type: "SESSION_LOADED", session: signed })).toEqual(
+    expect(flowReducer(active("sign"), { type: "SESSION_LOADED", session: signed })).toEqual(
       active("done"),
     );
     const voided = session({ envelope: { status: "voided" } });
@@ -91,17 +94,15 @@ describe("the flow", () => {
   });
 
   it("kiosk sessions end on hand-back, whether signed or declined", () => {
-    expect(flowReducer(active("confirm"), { type: "SIGNED", kiosk: true })).toEqual({
+    expect(flowReducer(active("sign"), { type: "SIGNED", kiosk: true })).toEqual({
       phase: "handed_back",
       outcome: "signed",
     });
-    expect(flowReducer(active("consent"), { type: "DECLINED", kiosk: true })).toEqual({
+    expect(flowReducer(active("read"), { type: "DECLINED", kiosk: true })).toEqual({
       phase: "handed_back",
       outcome: "declined",
     });
-    expect(flowReducer(active("confirm"), { type: "SIGNED", kiosk: false })).toEqual(
-      active("done"),
-    );
+    expect(flowReducer(active("sign"), { type: "SIGNED", kiosk: false })).toEqual(active("done"));
   });
 
   it("expiry ends any live state, and nothing restarts a finished session", () => {

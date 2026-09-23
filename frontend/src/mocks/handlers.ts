@@ -1,7 +1,6 @@
 import { delay, HttpResponse, http } from "msw";
 import {
   documentFor,
-  ENVELOPE_ID,
   LOCALE_PATTERN,
   MockHttpError,
   type MockRecord,
@@ -55,7 +54,7 @@ function signerRoute(latency: number, handle: Handle) {
 /** Every signer POST answers ids and statuses only (SPEC section 9), the real shape exactly. */
 const ack = (record: MockRecord) =>
   HttpResponse.json({
-    envelope: { id: ENVELOPE_ID, status: record.envelopeStatus },
+    envelope: { id: record.envelopeId, status: record.envelopeStatus },
     signer: { id: SIGNER_ID, status: record.signerStatus },
   });
 
@@ -107,8 +106,15 @@ export function signerApiHandlers({ latency = 0 }: { latency?: number } = {}) {
           consent_version?: unknown;
           accepted?: unknown;
           locale?: unknown;
+          relies_on_envelope_id?: unknown;
         };
-        recordConsent(record, body.consent_version, body.accepted, body.locale);
+        recordConsent(
+          record,
+          body.consent_version,
+          body.accepted,
+          body.locale,
+          body.relies_on_envelope_id,
+        );
         return ack(record);
       }),
     ),

@@ -32,10 +32,32 @@ const localeSchema = z
   .max(35)
   .regex(/^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$/);
 
+/**
+ * Where this document sits in a run the host is driving (addendum 3 B). The host owns the queue
+ * and its tokens; all the UI does with this is say "3 of 8", name what comes next on the Done
+ * screen, and ask for it with `esign:next`. Anything malformed is dropped rather than guessed at:
+ * a host that sends junk here loses the counter, not the session.
+ *
+ * `next_title` is a document title the host chose to show, so it is treated as untrusted text --
+ * rendered, never interpreted -- and kept short enough not to break the screen.
+ */
+const queueSchema = z
+  .object({
+    index: z.number().int().min(1).max(999),
+    total: z.number().int().min(1).max(999),
+    next_title: z.string().min(1).max(120).optional().catch(undefined),
+  })
+  // "9 of 3" is not a position, it is a bug in the host page, and showing it would make the UI
+  // the liar. Dropping the whole queue leaves a plain single-document run, which is correct.
+  .refine((queue) => queue.index <= queue.total);
+
+export type QueuePosition = z.infer<typeof queueSchema>;
+
 const initSchema = z.object({
   type: z.literal("esign:init"),
   token: tokenSchema,
   locale: localeSchema.optional().catch(undefined),
+  queue: queueSchema.optional().catch(undefined),
 });
 
 const reauthDoneSchema = z.object({ type: z.literal("esign:reauth_done") });
@@ -49,6 +71,8 @@ export type OutboundMessage =
   | { type: "esign:sealed" }
   | { type: "esign:declined" }
   | { type: "esign:expired" }
+  /** "I am finished with this one; open the next." The host opens it into the same iframe. */
+  | { type: "esign:next"; envelope_id: string }
   | { type: "esign:resize"; height: number };
 
 function normaliseOrigin(value: string): string | null {

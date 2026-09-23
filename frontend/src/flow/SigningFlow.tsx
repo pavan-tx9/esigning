@@ -12,8 +12,6 @@ import { Button, Notice, useAnnounce } from "@/components/ui";
 import { type HostLink, HostLinkContext, useNow } from "@/flow/context";
 import { type Draft, emptyDraft, withoutAdopted } from "@/flow/draft";
 import { flowReducer, initialFlowState, STEPS, type Step } from "@/flow/machine";
-import { ConfirmStep } from "@/flow/steps/ConfirmStep";
-import { ConsentStep } from "@/flow/steps/ConsentStep";
 import { DeclineStep } from "@/flow/steps/DeclineStep";
 import { DoneStep } from "@/flow/steps/DoneStep";
 import {
@@ -25,10 +23,10 @@ import {
   LoadFailedScreen,
   UnavailableScreen,
 } from "@/flow/steps/EndScreens";
-import { ReviewStep } from "@/flow/steps/ReviewStep";
+import { ReadStep } from "@/flow/steps/ReadStep";
 import { SignStep } from "@/flow/steps/SignStep";
 import { hasSessionToken, setSessionToken } from "@/lib/api";
-import type { ParentChannel } from "@/lib/embed";
+import type { ParentChannel, QueuePosition } from "@/lib/embed";
 import {
   isNetworkError,
   type SigningSession,
@@ -40,10 +38,8 @@ export const CONNECT_TIMEOUT_MS = 15_000;
 const WARN_BEFORE_MS = 120_000;
 
 const STEP_LABELS: Record<Step, string> = {
-  review: "Read",
-  consent: "Agree",
-  sign: "Fill in",
-  confirm: "Sign",
+  read: "Read",
+  sign: "Sign",
   done: "Done",
 };
 
@@ -60,18 +56,38 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   /** The disclosure language the host asked for, validated by `embed.ts`. Chosen once, with the
    * token, and never changed afterwards: it decides which text the signer is shown and accepts. */
   const [locale, setLocale] = useState<string | null>(null);
+  /**
+   * Where this document sits in a run the host is driving (addendum 3 B). Like the locale, it
+   * arrives with the token and never changes: a new position means a new document, which means a
+   * new `esign:init` into a freshly loaded iframe.
+   */
+  const [queue, setQueue] = useState<QueuePosition | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
+  /**
+   * How far through the document the signer has got, and whether `POST /signing/viewed` has gone.
+   * Held here, not on the Read screen, because that screen is unmounted and remounted by things
+   * that change neither -- the paper-path sheet, chiefly -- and losing it would charge somebody
+   * another scroll through thirty pages for looking at the way out.
+   */
+  const [pagesSeen, setPagesSeen] = useState<ReadonlySet<number>>(() => new Set());
+  const [viewedPosted, setViewedPosted] = useState(false);
+  const markViewed = useCallback(() => setViewedPosted(true), []);
+  /** A fresh read: the document changed, so what was displayed before is not this document. */
+  const readFromScratch = useCallback(() => {
+    setPagesSeen(new Set());
+    setViewedPosted(false);
+  }, []);
   /**
    * Set when the server refused a signature because the document had moved on since this signer
    * read it (409 `not_viewed`). Their signer status is still `consented`, so nothing in
-   * `placeFor` would ever send them back to the review step; this does, and says why.
+   * `placeFor` would ever send them back to the read step; this does, and says why.
    */
   const [readAgain, setReadAgain] = useState(false);
   /**
    * Set when the server refused a signature because the saved signature applied to it is no
    * longer available (403 `adopted_signature_unavailable`): revoked by the host, or replaced from
-   * another session of this person's. Nothing about the signer has changed, so only this sends
-   * them back to choosing a signature, and it is what tells that step to say why.
+   * another session of this person's. Nothing about the signer has changed, so only this tells the
+   * signature panel to say why it is asking for a signature again.
    */
   const [signatureGone, setSignatureGone] = useState(false);
   const [submissionKeys] = useState(() => new SubmissionKeys());
@@ -98,8 +114,9 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
     setDraft(emptyDraft);
     setReadAgain(false);
     setSignatureGone(false);
+    readFromScratch();
     submissionKeys.reset();
-  }, [queryClient, submissionKeys]);
+  }, [queryClient, submissionKeys, readFromScratch]);
 
   // ------------------------------------------------------------------ messages from the host
   useEffect(() => {
@@ -115,6 +132,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
         }
         setSessionToken(message.token);
         setLocale(message.locale ?? null);
+        setQueue(message.queue ?? null);
         dispatch({ type: "TOKEN_RECEIVED" });
       } else {
         for (const listener of reauthListeners.current) {
@@ -243,46 +261,41 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   } else {
     const kiosk = session.session.kiosk;
     const steps: Record<Step, React.ReactNode> = {
-      review: (
-        <ReviewStep
+      read: (
+        <ReadStep
           session={session}
           changed={readAgain}
+          seen={pagesSeen}
+          onSeen={setPagesSeen}
+          viewedPosted={viewedPosted}
+          onViewedPosted={markViewed}
           onContinue={() => {
             setReadAgain(false);
-            go("consent");
+            go("sign");
           }}
-        />
-      ),
-      consent: (
-        <ConsentStep
-          session={session}
-          onContinue={() => go("sign")}
-          onPreferPaper={() => dispatch({ type: "DECLINE_OPENED" })}
         />
       ),
       sign: (
         <SignStep
           session={session}
-          draft={draft}
-          signatureGone={signatureGone}
-          onDraft={setDraft}
-          onContinue={() => {
-            setSignatureGone(false);
-            go("confirm");
-          }}
-        />
-      ),
-      confirm: (
-        <ConfirmStep
-          session={session}
           locale={locale}
           draft={draft}
           submissionKeys={submissionKeys}
-          onBack={() => go("sign")}
+          signatureGone={signatureGone}
+          onDraft={(next) => {
+            setDraft(next);
+            // The "your saved signature is gone" notice is answered by choosing another one,
+            // not by ticking a box further down the screen.
+            if (next.adopted !== null) {
+              setSignatureGone(false);
+            }
+          }}
           onReadAgain={() => {
             setReadAgain(true);
+            // These are the old document's pages. Nothing about them is a claim about this one.
+            readFromScratch();
             announce("The document has changed. Please read it again before you sign.");
-            go("review");
+            go("read");
           }}
           onSignatureUnavailable={() => {
             // The signature they chose is gone, so the marks made with it go too; everything
@@ -290,7 +303,6 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
             setDraft((current) => withoutAdopted(current));
             setSignatureGone(true);
             announce("Your saved signature is no longer available. Please choose a signature.");
-            go("sign");
           }}
           onSigned={() => {
             channel.post({ type: "esign:signed" });
@@ -300,22 +312,22 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
           }}
         />
       ),
-      done: <DoneStep session={session} locale={locale} />,
+      done: <DoneStep session={session} locale={locale} queue={queue} />,
     };
     body = steps[state.step];
   }
 
   const activeStep = state.phase === "active" && !state.declining ? state.step : null;
-  const showPaperPath =
-    session !== undefined &&
-    activeStep !== null &&
-    activeStep !== "done" &&
-    activeStep !== "consent";
+  const showPaperPath = session !== undefined && activeStep !== null && activeStep !== "done";
 
   return (
     <HostLinkContext.Provider value={hostLink}>
       <div ref={shell} className="flex flex-col">
-        <Masthead session={state.phase === "active" ? session : undefined} step={activeStep} />
+        <Masthead
+          session={state.phase === "active" ? session : undefined}
+          step={activeStep}
+          queue={queue}
+        />
         <main className="w-full px-4 pt-6 pb-10 sm:px-6 sm:pt-8">
           {state.phase === "active" && session !== undefined && activeStep !== "done" ? (
             <DeadlineWatch session={session} />
@@ -324,6 +336,8 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
           <div key={`${state.phase}:${activeStep ?? (state.phase === "active" ? "decline" : "")}`}>
             {body}
           </div>
+          {/* Visible on both screens before Done, as the addendum requires: the way out of an
+              electronic signature is never more than one quiet link away. */}
           {showPaperPath ? (
             <p className="mx-auto mt-10 max-w-xl border-edge border-t pt-5 text-center text-ink-700">
               Changed your mind?{" "}
@@ -332,7 +346,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
                 className="px-1"
                 onClick={() => dispatch({ type: "DECLINE_OPENED" })}
               >
-                Stop and sign on paper instead
+                I'd rather sign on paper
               </Button>
             </p>
           ) : null}
@@ -344,7 +358,15 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
 
 // --------------------------------------------------------------------------- masthead
 
-function Masthead({ session, step }: { session: SigningSession | undefined; step: Step | null }) {
+function Masthead({
+  session,
+  step,
+  queue,
+}: {
+  session: SigningSession | undefined;
+  step: Step | null;
+  queue: QueuePosition | null;
+}) {
   const index = step === null ? -1 : STEPS.indexOf(step);
   return (
     <header className="border-edge border-b bg-sheet px-4 py-3 sm:px-6">
@@ -352,6 +374,16 @@ function Masthead({ session, step }: { session: SigningSession | undefined; step
         <div className="min-w-0">
           <p className="flex items-center gap-2 font-semibold text-accent-600 text-sm tracking-wide">
             <Seal /> Secure document signing
+            {queue !== null ? (
+              <>
+                <span aria-hidden="true" className="text-edge-strong">
+                  ·
+                </span>
+                <span className="text-ink-700" data-testid="queue-progress">
+                  {queue.index} of {queue.total}
+                </span>
+              </>
+            ) : null}
           </p>
           {session ? (
             <>
@@ -414,8 +446,8 @@ function Seal() {
  *  - it never ends the flow. The deadline is server time; this is the device's clock, and a tablet
  *    whose clock runs half an hour fast would land a signer on "this session has ended" before
  *    they had read a word. Only the server's 401 (wired through `sessionGone`) may do that.
- *  - it does not scroll away. Review and consent are long scrollers, and the patient who needs
- *    this warning is the one who has been reading for two minutes, far below the top of the page.
+ *  - it does not scroll away. Read is a long scroller, and the patient who needs this warning is
+ *    the one who has been reading for two minutes, far below the top of the page.
  */
 function DeadlineWatch({ session }: { session: SigningSession }) {
   const now = useNow(5_000);

@@ -9,6 +9,8 @@ interface FieldCloseUpProps {
   pdf: LoadedPdf;
   field: SigningField;
   done: boolean;
+  /** How tall the window may be. Smaller in a list of fields than on a screen of its own. */
+  maxHeight?: number;
   /** What currently sits in the field: the applied signature, a tick, the typed text. */
   children?: ReactNode;
 }
@@ -17,13 +19,13 @@ interface FieldCloseUpProps {
  * The part of the page around one field, enlarged so the field is easy to see on a phone. The
  * signer sees exactly where on the real document their mark will go.
  */
-export function FieldCloseUp({ pdf, field, done, children }: FieldCloseUpProps) {
+export function FieldCloseUp({ pdf, field, done, maxHeight = 220, children }: FieldCloseUpProps) {
   const [measure, width] = useMeasuredWidth<HTMLDivElement>();
   const size = pdf.pages[field.page - 1];
   if (size === undefined) {
     return null;
   }
-  const view = width > 0 ? fieldWindow(field.rect, size, width, 220) : null;
+  const view = width > 0 ? fieldWindow(field.rect, size, width, maxHeight) : null;
   const box = rectToPercentBox(field.rect, size);
   return (
     <div ref={measure} aria-hidden="true" className="w-full" data-testid="field-closeup">
@@ -63,7 +65,7 @@ export function FieldCloseUp({ pdf, field, done, children }: FieldCloseUpProps) 
           </div>
         </div>
       ) : (
-        <div className="h-[220px]" />
+        <div style={{ height: `${maxHeight}px` }} />
       )}
     </div>
   );

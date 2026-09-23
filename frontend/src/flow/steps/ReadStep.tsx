@@ -1,12 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { DocumentViewer, type DocumentViewerHandle } from "@/components/DocumentViewer";
-import { Button, Dots, Notice, StepScreen, useAnnounce } from "@/components/ui";
+import {
+  Button,
+  Dots,
+  Notice,
+  prefersReducedMotion,
+  StepScreen,
+  useAnnounce,
+} from "@/components/ui";
+import { ConsentBlock } from "@/flow/steps/ConsentBlock";
 import {
   documentQueryOptions,
+  isConsentNotStanding,
   isNetworkError,
+  postConsent,
   postViewed,
   type SigningSession,
+  type StandingConsent,
   signingKeys,
 } from "@/lib/signing-api";
 import { usePdf } from "@/lib/use-pdf";
@@ -43,7 +54,7 @@ function listPages(pages: number[]): string {
   return `pages ${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`;
 }
 
-interface ReviewStepProps {
+interface ReadStepProps {
   session: SigningSession;
   /**
    * True when the signer is here for a second look because the document changed under them
@@ -51,37 +62,142 @@ interface ReviewStepProps {
    * have entered is lost: the fields they filled in are still in the draft.
    */
   changed?: boolean;
+  /**
+   * Which pages have been displayed, and whether the server has been told. Both are held by the
+   * flow rather than this screen, because this screen is unmounted by a detour that changes
+   * neither: opening the paper-path sheet and coming back must not make somebody scroll thirty
+   * pages again to reach a button they had already earned.
+   */
+  seen: ReadonlySet<number>;
+  onSeen: (seen: ReadonlySet<number>) => void;
+  viewedPosted: boolean;
+  onViewedPosted: () => void;
   onContinue: () => void;
 }
 
-export function ReviewStep({ session, changed = false, onContinue }: ReviewStepProps) {
+/**
+ * Screen 1 of 3 (addendum 3 A): the document, page by page, with the consent block directly under
+ * the last page in the same scroll, and one button out of here.
+ *
+ * What the server is told is unchanged. `POST /signing/viewed` goes the moment the last page has
+ * been displayed -- that claim is about the pages, not about the button -- and `POST
+ * /signing/consent` goes when Continue is pressed. Merging the two screens did not merge the two
+ * acts.
+ */
+export function ReadStep({
+  session,
+  changed = false,
+  seen,
+  onSeen,
+  viewedPosted,
+  onViewedPosted,
+  onContinue,
+}: ReadStepProps) {
   const pageCount = session.envelope.page_count;
   const queryClient = useQueryClient();
   const announce = useAnnounce();
   const viewer = useRef<DocumentViewerHandle>(null);
   const document_ = useQuery(documentQueryOptions());
   const pdf = usePdf(document_.data);
-  const [seen, setSeen] = useState<ReadonlySet<number>>(new Set());
   const [current, setCurrent] = useState(1);
   const [zoomIndex, setZoomIndex] = useState(0);
+  const [agreed, setAgreed] = useState(false);
   const [nudge, setNudge] = useState<string | null>(null);
   const [pageFailed, setPageFailed] = useState(false);
+  const [viewedFailed, setViewedFailed] = useState(false);
+  /**
+   * The standing acceptance this press may lean on. It starts as whatever the session reported
+   * and is dropped for good the moment the server says it is not standing after all, so the
+   * fallback is one tick rather than a loop through the same refusal.
+   */
+  const [standing, setStanding] = useState<StandingConsent | null>(
+    session.session.kiosk ? null : session.consent.standing,
+  );
   const zoom = ZOOMS[zoomIndex] ?? 1;
   const zoomReadout = useId();
+  const consentHint = useId();
 
-  const viewed = useMutation({
-    mutationFn: () => postViewed(pageCount),
+  /**
+   * `POST /signing/viewed`, sent once. The promise is held so that a Continue pressed while it is
+   * still in flight waits for it rather than sending a second one, and a failure clears it so the
+   * next press tries again: consent is refused until the server has been told the pages were seen.
+   */
+  /**
+   * Anything that went wrong with Continue is said here, below the consent block. The press that
+   * caused it happened in the sticky footer, which can be a long way from this, so the message
+   * comes to the signer rather than waiting to be found.
+   */
+  const problem = useRef<HTMLDivElement>(null);
+  const viewedOnce = useRef<Promise<unknown> | null>(null);
+  const sendViewed = useCallback(() => {
+    if (viewedPosted) {
+      return Promise.resolve(null);
+    }
+    viewedOnce.current ??= postViewed(pageCount).then(
+      (answer) => {
+        setViewedFailed(false);
+        onViewedPosted();
+        void queryClient.invalidateQueries({ queryKey: signingKeys.session });
+        return answer;
+      },
+      (error: unknown) => {
+        viewedOnce.current = null;
+        setViewedFailed(true);
+        throw error;
+      },
+    );
+    return viewedOnce.current;
+  }, [pageCount, queryClient, viewedPosted, onViewedPosted]);
+
+  const unseen = Array.from({ length: pageCount }, (_, i) => i + 1).filter((p) => !seen.has(p));
+  const allSeen = unseen.length === 0;
+  const consentGiven = standing !== null || agreed;
+
+  // The claim is about the pages, so it is made when the pages have been displayed.
+  useEffect(() => {
+    if (allSeen) {
+      void sendViewed().catch(() => {
+        // Said on screen when Continue is pressed, and retried by that press.
+      });
+    }
+  }, [allSeen, sendViewed]);
+
+  const consent = useMutation({
+    mutationFn: async () => {
+      await sendViewed();
+      const relied = standing?.envelope_id ?? null;
+      try {
+        return await postConsent(session.consent.version, session.consent.locale, relied);
+      } catch (error) {
+        // The reliance is no longer good (the span ran out, the version moved on). Ask plainly.
+        if (relied !== null && isConsentNotStanding(error)) {
+          setStanding(null);
+          setAgreed(false);
+          announce("Please confirm that you agree to sign this document electronically.");
+        }
+        throw error;
+      }
+    },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: signingKeys.session });
       onContinue();
     },
   });
 
-  const unseen = Array.from({ length: pageCount }, (_, i) => i + 1).filter((p) => !seen.has(p));
-  const allSeen = unseen.length === 0;
+  const failedToContinue = consent.isError || viewedFailed;
+  useEffect(() => {
+    if (failedToContinue) {
+      // Optional call: this is a convenience, and a runtime without it must not take the
+      // screen down on the one path where something has already gone wrong.
+      problem.current?.scrollIntoView?.({
+        block: "center",
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+    }
+  }, [failedToContinue]);
 
   const handleSeen = (next: ReadonlySet<number>) => {
-    setSeen(next);
+    onSeen(next);
     if (next.size >= pageCount) {
       setNudge(null);
       announce("You have seen every page. You can continue when you are ready.");
@@ -109,12 +225,19 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
     announce(`Page ${target} of ${pageCount}`);
   };
 
-  // Pressing Continue before every page has been displayed: say which pages are left and take the
-  // reader to the first of them. "I have looked at every page" is the claim the signature rests
-  // on, so this is a nudge rather than a dead button (SPEC section 6).
-  const nudgeUnseen = () => {
-    setNudge(`Please look at ${listPages(unseen)} before you continue.`);
-    viewer.current?.goToPage(unseen[0] ?? 1);
+  /**
+   * Pressing Continue before it can do anything. Two things can be missing and the button says
+   * which: unseen pages first (and it takes the reader to the first of them), because "I have
+   * looked at every page" is the claim the signature rests on and it is the one that needs the
+   * document scrolled, not a tick. This is the inert-button pattern, not a dead button.
+   */
+  const nudgeWhatIsMissing = () => {
+    if (!allSeen) {
+      setNudge(`Please look at ${listPages(unseen)} before you continue.`);
+      viewer.current?.goToPage(unseen[0] ?? 1);
+      return;
+    }
+    setNudge("To continue, tick the box to show you agree. Or choose to sign on paper instead.");
   };
 
   const failed = document_.isError || pdf.status === "failed" || pageFailed;
@@ -122,13 +245,16 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
   return (
     <StepScreen
       wide
-      testId="step-review"
+      testId="step-read"
       title="Read the document"
       lead={
         <>
           <p>
             {pageCount === 1 ? "There is one page." : `There are ${pageCount} pages.`} Take as long
-            as you need. You can continue once you've seen {pageCount === 1 ? "it" : "them all"}.
+            as you need. You can continue once you've seen {pageCount === 1 ? "it" : "them all"}
+            {/* Nothing is asked of a signer whose agreement already covers this document, so
+                nothing is promised to them either. */}
+            {standing === null ? ", and agreed to sign on a screen" : ""}.
           </p>
           <p className="mt-2 text-base">
             Would you rather read this on paper? A member of staff can give you a printed copy.
@@ -223,21 +349,49 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
             onCurrentPage={setCurrent}
             onPageFailed={() => setPageFailed(true)}
           />
+
+          {/* Directly under the last page, in the same scroll: what is being agreed to is still
+              on the screen above it. */}
+          <ConsentBlock
+            consent={session.consent}
+            standing={standing}
+            agreed={agreed}
+            onAgreed={(next) => {
+              setAgreed(next);
+              setNudge(null);
+            }}
+            invalid={nudge !== null && allSeen && !consentGiven}
+            hintId={consentHint}
+          />
         </>
       )}
 
-      {viewed.isError ? (
-        <Notice tone="error" alert className="mt-5">
-          {isNetworkError(viewed.error)
-            ? "We couldn't reach the server. Check the connection and press Continue again."
-            : "We couldn't record that you've read the document. Scroll through every page once more, then press Continue again."}
-        </Notice>
-      ) : null}
+      <div ref={problem}>
+        {failedToContinue ? (
+          <Notice tone="error" alert className="mt-5">
+            {viewedFailed && !consent.isError ? (
+              "We couldn't record that you've read the document. Press Continue to try again."
+            ) : isNetworkError(consent.error) ? (
+              "We couldn't reach the server. Check the connection and press Continue to sign again."
+            ) : isConsentNotStanding(consent.error) ? (
+              <>
+                <p className="font-semibold">Please agree once more.</p>
+                <p className="mt-1">
+                  The agreement you gave earlier no longer covers this document, so we need it again
+                  for this one. Tick the box above, then press Continue to sign.
+                </p>
+              </>
+            ) : (
+              "We couldn't record your choice. Please try again, or ask a member of staff for help."
+            )}
+          </Notice>
+        ) : null}
+      </div>
 
       {failed ? null : (
         <div className="sticky bottom-0 z-10 -mx-4 mt-6 border-edge border-t bg-paper/95 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-sm sm:-mx-6 sm:px-6">
           {nudge ? (
-            <p role="alert" className="mb-2 font-medium text-danger-600">
+            <p id={consentHint} role="alert" className="mb-2 font-medium text-danger-600">
               {nudge}
             </p>
           ) : null}
@@ -276,12 +430,12 @@ export function ReviewStep({ session, changed = false, onContinue }: ReviewStepP
             ) : null}
             <Button
               className="w-full sm:w-auto"
-              inert={!allSeen}
-              onInertClick={nudgeUnseen}
-              busy={viewed.isPending}
-              onClick={() => viewed.mutate()}
+              inert={!allSeen || !consentGiven}
+              onInertClick={nudgeWhatIsMissing}
+              busy={consent.isPending}
+              onClick={() => consent.mutate()}
             >
-              Continue
+              Continue to sign
             </Button>
           </div>
         </div>

@@ -5,7 +5,7 @@
  */
 
 import "@/styles.css";
-import { SCENARIOS, type Scenario, tokenFor } from "@/mocks/db";
+import { QUEUE_TITLES, QUEUE_TOTAL, SCENARIOS, type Scenario, tokenFor } from "@/mocks/db";
 
 const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -45,7 +45,38 @@ function send(message: Record<string, unknown>) {
   note("out", String(message.type));
 }
 
+const latency = params.get("latency");
+const frameSrc = () =>
+  `./sign.html${latency === null ? "" : `?latency=${encodeURIComponent(latency)}`}`;
+
+/**
+ * The host's side of a signing queue (addendum 3 B). The host owns the run: it knows how many
+ * documents there are, what the next one is called, and which token opens it. The UI is told only
+ * its position, and asks for the next one with `esign:next`.
+ */
+const queued = scenario === "queue";
+let position = Math.min(QUEUE_TOTAL, Math.max(1, Number(params.get("position") ?? "1")));
+
+const queueInit = () =>
+  queued
+    ? {
+        index: position,
+        total: QUEUE_TOTAL,
+        ...(position < QUEUE_TOTAL ? { next_title: QUEUE_TITLES[position] } : {}),
+      }
+    : undefined;
+
 let initialised = false;
+
+/** Open the next document: a new session, a new token, a fresh iframe, the same frame. */
+function openNext() {
+  if (!queued || position >= QUEUE_TOTAL) {
+    return;
+  }
+  position += 1;
+  initialised = false;
+  frame.src = frameSrc();
+}
 
 window.addEventListener("message", (event) => {
   // The same rules a real host should apply: right frame, right origin.
@@ -66,8 +97,9 @@ window.addEventListener("message", (event) => {
     // should ask the API for it and then declare whatever the API actually served.
     send({
       type: "esign:init",
-      token: tokenFor(scenario),
+      token: tokenFor(scenario, queued ? position : undefined),
       locale: params.get("locale") ?? "en-US",
+      ...(queued ? { queue: queueInit() } : {}),
     });
     return;
   }
@@ -79,11 +111,14 @@ window.addEventListener("message", (event) => {
     reauth.hidden = false;
     byId<HTMLButtonElement>("reauth-ok").focus();
   }
+  if (data.type === "esign:next") {
+    openNext();
+  }
 });
 
 byId("reauth-ok").addEventListener("click", () => {
   // Host backend: POST /v1/sessions/{id}/reauth. Then the page tells the UI it is done.
-  frame.contentWindow?.__esignMock?.attestReauth(scenario);
+  frame.contentWindow?.__esignMock?.attestReauth(scenario, queued ? position : undefined);
   reauth.hidden = true;
   send({ type: "esign:reauth_done" });
 });
@@ -91,5 +126,4 @@ byId("reauth-ignore").addEventListener("click", () => {
   reauth.hidden = true;
 });
 
-const latency = params.get("latency");
-frame.src = `./sign.html${latency === null ? "" : `?latency=${encodeURIComponent(latency)}`}`;
+frame.src = frameSrc();

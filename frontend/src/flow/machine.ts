@@ -2,12 +2,17 @@
  * The flow as a pure state machine. Where the signer stands is decided by the server's view of
  * them (so a reload, or a second tablet, resumes in the right place) plus the few things only
  * this page knows: whether the token has arrived, and whether the decline sheet is open.
+ *
+ * Addendum 3: three steps, not five. Consent moved onto Read and the confirm screen was folded
+ * into Sign, so the server's `signers.status` progression (`pending -> viewed -> consented ->
+ * signed`) now maps onto fewer places: `viewed` still means "read it, has not agreed yet", which
+ * is the Read screen, and `consented` is the Sign screen.
  */
 
 import type { SigningSession } from "@/lib/signing-api";
 
-export type Step = "review" | "consent" | "sign" | "confirm" | "done";
-export const STEPS: readonly Step[] = ["review", "consent", "sign", "confirm", "done"];
+export type Step = "read" | "sign" | "done";
+export const STEPS: readonly Step[] = ["read", "sign", "done"];
 
 export type UnavailableReason = "voided" | "declined_by_other" | "expired_envelope";
 
@@ -55,10 +60,12 @@ export function placeFor(session: SigningSession): FlowState {
       return { phase: "active", step: "done", declining: false };
     case "consented":
       return { phase: "active", step: "sign", declining: false };
+    // `viewed` means the pages were displayed but consent was not given, and consent is now part
+    // of the Read screen: that is where the signer belongs, with the document above it.
     case "viewed":
-      return { phase: "active", step: "consent", declining: false };
+      return { phase: "active", step: "read", declining: false };
     default:
-      return { phase: "active", step: "review", declining: false };
+      return { phase: "active", step: "read", declining: false };
   }
 }
 

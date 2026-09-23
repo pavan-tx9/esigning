@@ -11,11 +11,15 @@ import { signerApiHandlers } from "@/mocks/handlers";
 declare global {
   interface Window {
     __esignMock?: {
-      attestReauth: (scenario: Scenario) => void;
-      expireSession: (scenario: Scenario) => void;
+      attestReauth: (scenario: Scenario, position?: number) => void;
+      expireSession: (scenario: Scenario, position?: number) => void;
       /** Another signer on the same envelope signs: the current revision moves on. */
-      otherSignerSigned: (scenario: Scenario) => void;
-      peek: (scenario: Scenario) => unknown;
+      otherSignerSigned: (scenario: Scenario, position?: number) => void;
+      /** The host takes this person's saved signature off the file mid-flow. */
+      hostRevokedSignature: (scenario: Scenario, position?: number) => void;
+      /** The consent span runs out between the session being read and Continue being pressed. */
+      consentNoLongerStanding: (scenario: Scenario, position?: number) => void;
+      peek: (scenario: Scenario, position?: number) => unknown;
     };
   }
 }
@@ -32,10 +36,13 @@ await worker.start({
 });
 
 window.__esignMock = {
-  attestReauth: (scenario) => mockDb.attestReauth(scenario),
-  expireSession: (scenario) => mockDb.expireSession(scenario),
-  otherSignerSigned: (scenario) => mockDb.otherSignerSigned(scenario),
-  peek: (scenario) => mockDb.peek(scenario),
+  attestReauth: (scenario, position) => mockDb.attestReauth(scenario, position),
+  expireSession: (scenario, position) => mockDb.expireSession(scenario, position),
+  otherSignerSigned: (scenario, position) => mockDb.otherSignerSigned(scenario, position),
+  hostRevokedSignature: (scenario, position) => mockDb.hostRevokedSignature(scenario, position),
+  consentNoLongerStanding: (scenario, position) =>
+    mockDb.consentNoLongerStanding(scenario, position),
+  peek: (scenario, position) => mockDb.peek(scenario, position),
 };
 
 await import("@/main");
