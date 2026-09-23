@@ -896,7 +896,7 @@ describe("a saved signature revoked before the signature lands", () => {
     await click("Next");
     await click("Sign here");
     await click("Check your answers");
-    expect(screen.getByTestId("step-sign-summary")).toHaveTextContent("✓ Ticked");
+    expect(screen.getByTestId("step-sign-summary")).toHaveTextContent("Ticked");
   }, 30_000);
 
   it("still treats a re-authentication that lapses at the last moment as one", async () => {

@@ -219,6 +219,29 @@ export function Notice({
   );
 }
 
+// --------------------------------------------------------------------------- icons
+
+/**
+ * A check mark that sits on the text's centre line, unlike the ✓ glyph, which sits on the
+ * baseline and looks dropped next to a label. Decorative: pair it with words.
+ */
+export function CheckIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`inline-block size-[1.1em] shrink-0 align-[-0.18em] ${className}`}
+    >
+      <path d="M4 10.5l4 4 8-9" />
+    </svg>
+  );
+}
+
 // --------------------------------------------------------------------------- form rows
 
 interface CheckRowProps {

@@ -1,7 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useId, useRef, useState } from "react";
 import { FieldCloseUp } from "@/components/FieldCloseUp";
-import { Button, CheckRow, Notice, Sheet, StepScreen, useAnnounce } from "@/components/ui";
+import {
+  Button,
+  CheckIcon,
+  CheckRow,
+  Notice,
+  Sheet,
+  StepScreen,
+  useAnnounce,
+} from "@/components/ui";
 import {
   type AdoptedSignature,
   actionableFields,
@@ -253,7 +261,7 @@ function FieldScreen({
         context="page"
       />
     ) : value?.type === "checkbox" && value.checked ? (
-      <span className="font-bold text-page-ink leading-none">✓</span>
+      <CheckIcon className="text-page-ink" />
     ) : value?.type === "text" ? (
       <span className="line-clamp-2 self-start px-1 text-left text-[0.7rem] text-page-ink leading-tight">
         {value.text}
@@ -288,8 +296,8 @@ function FieldScreen({
         {isMarkField(field) ? (
           applied ? (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-accent-wash px-4 py-3">
-              <p className="font-semibold text-ink-900">
-                <span aria-hidden="true">✓ </span>
+              <p className="inline-flex items-center gap-2 font-semibold text-ink-900">
+                <CheckIcon className="text-accent-600" />
                 {field.type === "initials"
                   ? "Your initials are in place"
                   : "Your signature is in place"}
@@ -444,7 +452,16 @@ function SummaryScreen({
                         context="card"
                       />
                     ) : value?.type === "checkbox" ? (
-                      <p className="text-ink-900">{value.checked ? "✓ Ticked" : "Not ticked"}</p>
+                      <p className="text-ink-900">
+                        {value.checked ? (
+                          <>
+                            <CheckIcon className="mr-1.5 text-accent-600" />
+                            Ticked
+                          </>
+                        ) : (
+                          "Not ticked"
+                        )}
+                      </p>
                     ) : value?.type === "text" ? (
                       <p className="whitespace-pre-line text-ink-900">{value.text}</p>
                     ) : (

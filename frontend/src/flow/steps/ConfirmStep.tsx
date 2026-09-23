@@ -1,6 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { Button, CheckRow, Dots, Notice, Sheet, StepScreen, useAnnounce } from "@/components/ui";
+import {
+  Button,
+  CheckIcon,
+  CheckRow,
+  Dots,
+  Notice,
+  Sheet,
+  StepScreen,
+  useAnnounce,
+} from "@/components/ui";
 import { useHostLink, useNow } from "@/flow/context";
 import { buildSignRequest, type Draft } from "@/flow/draft";
 import { ApiError } from "@/lib/api";
@@ -256,8 +265,8 @@ export function ConfirmStep({
             </div>
           ) : verified && confirmedHere ? (
             <p className="mt-2 text-ink-700" data-testid="reauth-verified">
-              <span aria-hidden="true">✓ </span>Confirmed, thank you. For security this lasts about
-              two minutes, so please sign now.
+              <CheckIcon className="mr-1.5 text-accent-600" />
+              Confirmed, thank you. For security this lasts about two minutes, so please sign now.
               {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
             </p>
           ) : verified ? (
@@ -270,7 +279,7 @@ export function ConfirmStep({
                 data-testid="reauth-verified"
                 data-reauth-scope={signer.reauth_scope ?? undefined}
               >
-                <span aria-hidden="true">✓ </span>
+                <CheckIcon className="mr-1.5 text-accent-600" />
                 {confirmedAt !== null
                   ? `You confirmed your identity at ${confirmedAt}`
                   : "You've already confirmed your identity"}
