@@ -565,24 +565,33 @@ two workers holding the same job still seal once.
 
 ## 11. Frontend
 
-One flow, six states, all reachable by keyboard and screen reader, all usable at 360px wide and on
-a tablet held by a patient in a clinic:
+One flow, four states, all reachable by keyboard and screen reader, all usable at 360px wide and on
+a tablet held by a patient in a clinic. Addendum 3 A (section 16) merged what were five signing
+screens onto three; the acts are the same acts, and it is normative for their arrangement:
 
 1. **Connecting**: waiting for the token. Clear failure if it never arrives.
-2. **Review**: the PDF rendered with pdf.js, page by page, with progress ("Page 2 of 3"). The
-   continue action unlocks when every page has been displayed. A text alternative explains that
-   staff can provide a paper copy.
-3. **Consent**: the disclosure text, an unchecked checkbox, agree, and an equally visible "I'd
-   rather sign on paper" that leads to decline.
-4. **Sign**: guided through this signer's fields in order. Adopt a signature once per session by
-   drawing, typing, or choosing click-to-sign, then apply it to each field with an explicit action
-   per field. Show how many remain. Review screen before submitting.
-5. **Confirm**: for re-auth roles, hand off to the host and wait. Then a final, plainly worded
-   intent confirmation and submit. Disable double submission; send an `Idempotency-Key`; survive a
-   retry after a network failure.
-6. **Done**: confirmation and the signed copy. While sealing is pending, say so honestly and poll.
-   If other signers remain, say the copy will be available when everyone has signed. Decline,
-   expired and error states each have their own screen with a next step.
+2. **Read**: the PDF rendered with pdf.js, page by page, with progress ("Page 2 of 3"). Directly
+   under the last page, in the same scroll, the consent block: the disclosure collapsed to its
+   opening lines and expanding in place, and an unchecked checkbox — or, where an acceptance
+   already stands (section 16 C), a line saying when it was given. One button, **Continue to
+   sign**, inert until every page has been displayed and the consent condition is met, and saying
+   which of the two is missing when pressed. `POST /signing/viewed` goes when the last page has
+   been displayed, `POST /signing/consent` when the button is pressed. A text alternative explains
+   that staff can provide a paper copy.
+3. **Sign**: the signature panel at the top (the one on file, with "Change", or the
+   draw / type / click-to-sign chooser inline), then this signer's fields as a list, each applied
+   by an explicit action of its own, with how many remain. One primary button, "Sign as <name>",
+   inert until every required field is done: **that press is the intent confirmation**, and it is
+   what `intent_confirmed: true` means. For a re-auth role with nothing live, the press hands off
+   to the host and waits inline, then sends the signature itself when the server vouches — no
+   second press. Disable double submission; send an `Idempotency-Key`; survive a retry after a
+   network failure.
+4. **Done**: confirmation and the signed copy. While sealing is pending, say so honestly and poll.
+   If other signers remain, say the copy will be available when everyone has signed. In a run the
+   host is driving (section 16 B), say what is next, count down, and ask for it with `esign:next`.
+   Decline, expired and error states each have their own screen with a next step.
+
+An equally visible "I'd rather sign on paper", leading to decline, is on every screen before Done.
 
 Conventions: `fetch` only in `src/lib/api.ts`, every response parsed with Zod, all server state in
 TanStack Query, no hand-rolled fetch state. Token in memory only. Kiosk mode (from the session

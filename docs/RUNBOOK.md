@@ -353,6 +353,8 @@ rather than silent. Request and response bodies are never logged; the access lin
       `APPROVED_DOCUMENT_TYPES` (see `docs/COMPLIANCE-CHECKLIST.md`)
 - [ ] `REAUTH_SPAN_SECONDS` is `0`, or compliance has recorded a decision to turn it on and
       `REAUTH_MAX_AGE_SECONDS` was set with it (§7, "The re-authentication span")
+- [ ] `CONSENT_SPAN_SECONDS` is `0`, or compliance has recorded a decision to turn it on and the
+      window is the length of a sitting, not of a shift (§7, "The consent span")
 - [ ] If paper archives will be filed: the records rule for the scanned **originals** is written
       down and matches the `original_disposition` values staff will send (§4, C11)
 
@@ -1090,6 +1092,43 @@ words, so nothing here depends on the query being run.
 **Turning it off** is setting it back to `0` and restarting: nothing is migrated, nothing already
 signed changes, and every past signature keeps its recorded scope. Do that first and investigate
 afterwards if the span is ever implicated in an incident.
+
+### The consent span
+
+`CONSENT_SPAN_SECONDS` is the same shape of decision for the other thing a queue asks for twice.
+At `0` (the default) the ESIGN disclosure is displayed before every agreement, on every envelope.
+Above zero, an acceptance by the same `(host_id, host_user_id)`, of the same disclosure version and
+locale, stands for that person's other documents on the same host for that many seconds: they see
+"You agreed to sign electronically at 09:12" instead of the checkbox. Like the re-authentication
+span it needs a recorded decision from compliance (`docs/COMPLIANCE-CHECKLIST.md` C12) before it is
+set, and it is validated at startup (`0 ≤ span ≤ 3600`).
+
+**What does not change.** Every envelope still records its own `consent.accepted`, still sets the
+signer's `consent_text_id` and `consented_at`, and no signature is accepted without them. What the
+span changes is whether the notice was put in front of the signer again — and the record says which
+it was: the event names the acceptance relied on and when it was given, the certificate prints
+"(given for an earlier document in the same sitting)", and `esign verify` re-reads that earlier
+envelope's own hash-chained trail rather than trusting the pointer. A kiosk session never has
+standing consent, in either direction.
+
+Pick the window from how long a sitting lasts — a patient at one desk, a clinician's queue of
+orders — not from how long somebody is logged in. `make demo` uses 900 seconds. A signature that
+stood on an agreement older than the `3600`-second cap describes something this service could not
+have produced, and verification says so whatever the configuration was at the time.
+
+**Auditing it afterwards**, the same way the span above is audited:
+
+```sql
+SELECT date_trunc('day', occurred_at) AS day,
+       (data->>'relied_on_envelope_id' IS NOT NULL) AS stood_on_an_earlier_one,
+       count(*)
+FROM audit_events
+WHERE event_type = 'consent.accepted'
+GROUP BY 1, 2 ORDER BY 1 DESC, 2;
+```
+
+**Turning it off** is setting it back to `0` and restarting. Nothing already recorded changes: the
+acceptances that stood on an earlier one keep saying so.
 
 ### Rolling out a new consent disclosure
 

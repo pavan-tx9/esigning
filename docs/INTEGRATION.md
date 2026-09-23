@@ -305,10 +305,11 @@ The full contract:
 | Direction | Message | Meaning |
 |---|---|---|
 | UI → host | `esign:ready` | the iframe has loaded and wants a token |
-| host → UI | `esign:init {token, locale?}` | the token, by `postMessage` only |
+| host → UI | `esign:init {token, locale?, queue?}` | the token, by `postMessage` only; `queue {index, total, next_title?}` when this document is one of a run (§9) |
 | UI → host | `esign:reauth_required {session_id}` | this role must re-authenticate before signing |
 | host → UI | `esign:reauth_done` | your backend has attested it |
 | UI → host | `esign:signed`, `esign:sealed`, `esign:declined`, `esign:expired` | the outcome |
+| UI → host | `esign:next {envelope_id}` | "I am finished with this one; open the next" (§9) |
 | UI → host | `esign:resize {height}` | how tall the content is |
 
 **Treat `esign:resize` as a maximum, not an instruction.** If the frame is made as tall as its
@@ -611,6 +612,45 @@ queue, as the `reauth_valid_until` above shows. `make demo` exports `REAUTH_SPAN
 `REAUTH_MAX_AGE_SECONDS=300` for this reason. The default is off, and turning it on is a compliance
 decision, not an engineering one: it weakens per-document proof that the clinician re-authenticated
 for *that* document (`COMPLIANCE-CHECKLIST.md` C10, `RUNBOOK.md` §7).
+
+### Opening them one after another
+
+A queue is the host's: the service has no idea there is one, and the signing UI never fetches the
+next document or holds a second token. What it can do is say when it is finished with this one.
+
+Send the position on `esign:init`:
+
+```js
+frame.contentWindow.postMessage(
+  { type: "esign:init", token, locale: "en-US",
+    queue: { index: 3, total: 8, next_title: "Order for R. P." } },
+  serviceOrigin,
+);
+```
+
+The UI then shows "3 of 8" in its header, and on the Done screen names what is coming, counts down
+for a few seconds (cancellable with "Stay here") and posts `esign:next {envelope_id}`. That message
+means one thing: *this* document is done with. What comes next is yours to decide — check the
+envelope id against the document you opened for that person, create the next envelope and session,
+and post a fresh `esign:init` into the same iframe. Send no `queue` at all and nothing changes.
+
+`next_title` is shown to the signer, so it is a title, never a name or a record number; the UI
+renders it as text and nothing else. A position that cannot be one ("9 of 3") is dropped rather
+than displayed. `demo-host/` implements the whole of this in about forty lines of `static/embed.js`
+and one route (`POST /queue/next`).
+
+### Agreeing to sign electronically, once per sitting (`CONSENT_SPAN_SECONDS`)
+
+There is a second thing a queue asks for twice. With `CONSENT_SPAN_SECONDS` above zero (default
+`0`, at most `3600`) an acceptance of the ESIGN disclosure by the same `(host_id, host_user_id)`,
+for the same disclosure version and language, stands for that person's other documents for that
+long: `GET /v1/signing/session` reports it as `consent.standing {accepted_at, envelope_id}` and the
+UI shows "You agreed to sign electronically at 09:12" instead of the checkbox. Nothing in the
+record changes — every envelope still writes its own `consent.accepted`, still sets the signer's
+`consent_text_id` and `consented_at`, and the event names the acceptance it stood on so the
+certificate and `esign verify` can re-read it from that envelope's own trail. A kiosk session never
+has it, in either direction. There is nothing for a host to call: it is configuration, and turning
+it on is a compliance decision (`COMPLIANCE-CHECKLIST.md` C12).
 
 ## 10. Reading the record back
 
