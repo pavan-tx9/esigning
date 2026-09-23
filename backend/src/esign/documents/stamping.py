@@ -43,6 +43,7 @@ from esign.documents.fonts import (
     fit_font_size,
     line_height,
     shrink_to_width,
+    text_width,
     truncate_to_width,
 )
 from esign.documents.geometry import PageGeometry
@@ -81,22 +82,22 @@ class _Band:
     caption: Rect
 
 
-def _caption_height(size: float = _CAPTION_SIZE) -> float:
-    """Ink height of the caption block at ``size``, measured from the face rather than guessed."""
+def _caption_height(size: float = _CAPTION_SIZE, lines: int = _CAPTION_LINES) -> float:
+    """Ink height of a ``lines``-line caption at ``size``, measured from the face rather than guessed."""
     ink = line_height(PLAIN_FONT, size)
-    return ink + (_CAPTION_LINES - 1) * ink * _CAPTION_LEADING
+    return ink + (lines - 1) * ink * _CAPTION_LEADING
 
 
-def _caption_size_for(height: float) -> float:
-    """The largest caption size whose three lines fit in ``height``, floored at the minimum."""
-    full = _caption_height()
+def _caption_size_for(height: float, lines: int) -> float:
+    """The largest caption size whose lines fit in ``height``, floored at the minimum."""
+    full = _caption_height(lines=lines)
     if height >= full:
         return _CAPTION_SIZE
     ratio = height / full if full > 0 else 1.0
     return max(_CAPTION_MIN_SIZE, _CAPTION_SIZE * ratio)
 
 
-def _split(rect: Rect) -> _Band:
+def _split(rect: Rect, caption_lines: int) -> _Band:
     """The mark on top, the caption along the bottom, both inside the rect.
 
     Nothing is ever drawn outside the rectangle the template or host declared. The space just
@@ -109,14 +110,14 @@ def _split(rect: Rect) -> _Band:
     upstream. The caption shrinks before the mark does: an illegible signature is still a
     signature, a missing caption is missing evidence.
     """
-    caption_h = _caption_height()
+    caption_h = _caption_height(lines=caption_lines)
     band = caption_h + _CAPTION_GAP
     if rect.h - band >= _MIN_MARK_HEIGHT:
         return _Band(
             mark=Rect(x=rect.x, y=rect.y + band, w=rect.w, h=rect.h - band),
             caption=Rect(x=rect.x, y=rect.y, w=rect.w, h=caption_h),
         )
-    tight = _caption_height(_CAPTION_MIN_SIZE) + _CAPTION_GAP
+    tight = _caption_height(_CAPTION_MIN_SIZE, caption_lines) + _CAPTION_GAP
     caption_band = min(tight, max(1.0, rect.h - _MIN_MARK_HEIGHT))
     return _Band(
         mark=Rect(x=rect.x, y=rect.y + caption_band, w=rect.w, h=max(1.0, rect.h - caption_band)),
@@ -181,38 +182,57 @@ def _caption_lines(stamp: SignerStamp) -> tuple[str, str, str]:
     return who, f"Signed {when}", f"Signer {stamp.signer_id}"
 
 
-def _draw_caption(canvas: Canvas, rect: Rect, stamp: SignerStamp) -> None:
+def _caption_layout(stamp: SignerStamp, width: float) -> tuple[str, ...]:
+    """Two lines when the field is wide enough for who and when to share one, otherwise three.
+
+    The caption and the mark split the same rectangle, so every line the caption gives up is
+    height the signature gets back. Nothing is abbreviated to make the join fit: a field too
+    narrow for it simply keeps three lines.
+    """
     ensure_fonts_registered()
-    lines = _caption_lines(stamp)
+    who, when, signer = _caption_lines(stamp)
+    joined = f"{who}  ·  {when}"
+    if text_width(joined, PLAIN_FONT, _CAPTION_SIZE) <= width:
+        return joined, signer
+    return who, when, signer
+
+
+def _draw_caption(canvas: Canvas, rect: Rect, lines: tuple[str, ...]) -> None:
+    ensure_fonts_registered()
     canvas.saveState()
     _clip(canvas, rect)
     canvas.setFillColorRGB(*_CAPTION_INK)
-    size = _caption_size_for(rect.h)
+    size = _caption_size_for(rect.h, len(lines))
     ink = line_height(PLAIN_FONT, size)
     leading = ink * _CAPTION_LEADING
     top = rect.y + rect.h - ink
     for index, line in enumerate(lines):
         line_size = shrink_to_width(line, PLAIN_FONT, size, rect.w, min_size=_CAPTION_MIN_SIZE)
         # Only the name line may be abbreviated. The time and the signer id are the evidence.
-        text = truncate_to_width(line, PLAIN_FONT, line_size, rect.w) if index == 0 else line
+        # (When the name shares its line with the time, the join only happens if it fits whole.)
+        text = truncate_to_width(line, PLAIN_FONT, line_size, rect.w) if index == 0 and len(lines) == 3 else line
         canvas.setFont(PLAIN_FONT, line_size)
         canvas.drawString(rect.x, baseline_for_centre(PLAIN_FONT, line_size, top - index * leading, ink), text)
     canvas.restoreState()
 
 
 def _draw_image(canvas: Canvas, rect: Rect, png: bytes) -> None:
-    """Scale to fit, preserving aspect ratio, centred in the rect."""
+    """Scale to fit, preserving aspect ratio, against the left edge like a signature on a line.
+
+    Left-aligned rather than centred: the caption under it starts at the left edge, and a mark
+    floating in the middle of a wide field reads as misplaced next to it.
+    """
     reader = ImageReader(io.BytesIO(png))
     source_w, source_h = reader.getSize()
     if source_w <= 0 or source_h <= 0:  # pragma: no cover - sanitisation rejects these first
         raise ValidationFailed("signature image has no extent", code="signature_image_undecodable")
     scale = min(rect.w / source_w, rect.h / source_h)
     width, height = source_w * scale, source_h * scale
-    x = rect.x + (rect.w - width) / 2
+    x = rect.x
     y = rect.y + (rect.h - height) / 2
     canvas.saveState()
     _clip(canvas, rect)
-    canvas.drawImage(reader, x, y, width=width, height=height, mask="auto", preserveAspectRatio=True, anchor="c")
+    canvas.drawImage(reader, x, y, width=width, height=height, mask="auto", preserveAspectRatio=True, anchor="sw")
     canvas.restoreState()
 
 
@@ -480,7 +500,8 @@ def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp:
         )
         return
 
-    band = _split(field.rect)
+    caption = _caption_layout(stamp, field.rect.w)
+    band = _split(field.rect, len(caption))
     # An ``adopted`` capture (Addendum 1 B) is drawn exactly as the signature it saved: the stored
     # PNG, or the stored text in the script face. Its kind is recorded, not its appearance.
     if capture.kind in ("drawn", "adopted") and capture.image_png:
@@ -491,4 +512,4 @@ def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp:
     else:  # click-to-sign: the signer's name in the plain face, never the script one
         text = _initials(stamp.display_name) if field.type == "initials" else stamp.display_name
         _draw_text_block(canvas, band.mark, text, font=PLAIN_FONT, size=band.mark.h * 0.55, multiline=False)
-    _draw_caption(canvas, band.caption, stamp)
+    _draw_caption(canvas, band.caption, caption)

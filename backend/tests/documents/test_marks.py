@@ -72,7 +72,7 @@ def test_a_drawn_signature_keeps_its_aspect_ratio(documents: DocumentService, st
 def test_the_caption_stays_inside_the_rect_below_the_mark(documents: DocumentService, stamp: SignerStamp) -> None:
     """Forms print their own label under the signing line; nothing of ours may land on it."""
     out = documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], stamp)
-    captions = [run for run in placed_text(out) if run.text.startswith("Signed 2026-03-17")]
+    captions = [run for run in placed_text(out) if "Signed 2026-03-17" in run.text]
     assert captions
     box = captions[0].box(PLAIN_FONT)
     assert box.inside(SIG_RECT)
@@ -86,7 +86,7 @@ def test_a_field_at_the_very_bottom_still_gets_its_caption_on_the_page(
 ) -> None:
     rect = Rect(x=100, y=2, w=220, h=60)
     out = documents.apply_signer_marks(make_pdf(), [sig_field(rect=rect)], [typed()], stamp)
-    captions = [run for run in placed_text(out) if run.text.startswith("Signed 2026-03-17")]
+    captions = [run for run in placed_text(out) if "Signed 2026-03-17" in run.text]
     assert captions
     box = captions[0].box(PLAIN_FONT)
     assert box.y0 >= 0
@@ -420,7 +420,7 @@ def test_a_rect_too_small_for_both_bands_keeps_everything_inside_it(
     rect = Rect(x=100, y=4, w=220, h=20)
     out = documents.apply_signer_marks(make_pdf(), [sig_field(rect=rect)], [typed()], stamp)
     for run in placed_text(out):
-        if run.text in {"Ada Lovelace", "Ada Lovelace (self)"} or run.text.startswith(("Signed 2026", "Signer ")):
+        if run.text.startswith("Ada Lovelace") or ("Signed 2026" in run.text or run.text.startswith("Signer ")):
             font = SCRIPT_FONT if run.text == "Ada Lovelace" else PLAIN_FONT
             assert run.box(font).inside(rect, tolerance=1.5), run.text
 
