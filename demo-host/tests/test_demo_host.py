@@ -610,10 +610,10 @@ def test_the_queue_confirms_once_on_the_first_documents_session_and_keeps_it(
     sign_in(client, "priya")
     page = client.get("/queue")
     assert page.status_code == 200
-    # Everything she signs as a clinician: the three orders, and the procedure consent that is
+    # Everything she signs as a clinician: the five orders, and the procedure consent that is
     # still waiting on the patient and the witness, which is listed but not ready.
-    assert page.text.count('data-testid="queue-task"') == 4
-    assert page.text.count('data-testid="queue-sign"') == 3
+    assert page.text.count('data-testid="queue-task"') == 6
+    assert page.text.count('data-testid="queue-sign"') == 5
     assert 'data-testid="queue-confirmed"' not in page.text
 
     confirmed = client.post("/queue/reauth", data={"password": "demo1234"}, follow_redirects=False)
@@ -647,6 +647,109 @@ def test_the_queue_is_for_clinicians_and_needs_the_password(client: TestClient, 
     assert not [c for c in service.calls if c[1].endswith("/reauth")]
     sign_in(client, "maria")
     assert client.get("/queue").status_code == 403
+
+
+# --------------------------------------------------------------------------- Addendum 3 B: the run
+
+
+def orders(store: Store) -> list[Task]:
+    """Priya's queue, in the order it opens: the order sign-offs, not the consent still waiting."""
+    return [t for t in store.queue_for(store.users["u-priya"]) if t.template_key == "clinical_order"]
+
+
+def start_run(client: TestClient, store: Store) -> list[Task]:
+    sign_in(client, "priya")
+    queue = orders(store)
+    opened = client.post(f"/tasks/{queue[0].id}/open", data={"return_to": "/queue"}, follow_redirects=False)
+    assert opened.status_code == 303
+    return queue
+
+
+def test_opening_a_document_from_the_queue_tells_the_frame_where_it_is_in_the_run(
+    client: TestClient, store: Store
+) -> None:
+    queue = start_run(client, store)
+
+    page = client.get(f"/sign/{queue[0].id}?return_to=/queue").text
+    assert 'data-queue-index="1"' in page
+    assert 'data-queue-total="5"' in page
+    assert f'data-queue-next-title="{queue[1].title}"' in page
+    assert 'data-testid="queue-run"' in page
+
+    # The same document opened from the worklist is one document, not a run: no counter, no next.
+    client.post(f"/tasks/{queue[0].id}/open", data={"return_to": "/worklist"}, follow_redirects=False)
+    alone = client.get(f"/sign/{queue[0].id}").text
+    assert "data-queue-total" not in alone
+
+
+def test_the_run_opens_each_document_in_turn_and_then_says_it_is_done(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    queue = start_run(client, store)
+    sessions_before = service.sessions_created
+
+    for position, task in enumerate(queue[:-1], start=1):
+        answer = client.post("/queue/next", json={"after": task.id, "envelope_id": ENVELOPE_ID})
+        assert answer.status_code == 200
+        body = answer.json()
+        assert body["done"] is False
+        assert body["task_id"] == queue[position].id
+        assert body["title"] == queue[position].title
+        assert (body["index"], body["total"]) == (position + 1, 5)
+        assert body["next_title"] == (queue[position + 1].title if position + 1 < len(queue) else None)
+        # Each document is its own envelope and its own session, exactly as opening it would be.
+        assert answer.headers["cache-control"] == "no-store"
+    assert service.sessions_created == sessions_before + 4
+
+    done = client.post("/queue/next", json={"after": queue[-1].id, "envelope_id": ENVELOPE_ID})
+    assert done.status_code == 200
+    assert done.json() == {"done": True, "total": 5}
+    # The run is over, so the frame cannot walk it again.
+    assert client.post("/queue/next", json={"after": queue[-1].id}).status_code == 409
+
+
+def test_what_the_frame_says_it_finished_is_checked_against_what_this_host_opened(
+    client: TestClient, store: Store
+) -> None:
+    queue = start_run(client, store)
+
+    wrong_envelope = client.post(
+        "/queue/next", json={"after": queue[0].id, "envelope_id": "00000000-0000-4000-8000-000000000999"}
+    )
+    assert wrong_envelope.status_code == 409
+    assert wrong_envelope.json()["error"] == "envelope_mismatch"
+
+    # A document further down the run is not the one open, and a document in nobody's run is not
+    # in this one. Neither moves it on.
+    not_open = client.post("/queue/next", json={"after": queue[2].id, "envelope_id": ENVELOPE_ID})
+    assert not_open.status_code == 409 and not_open.json()["error"] == "not_in_this_run"
+    assert client.post("/queue/next", json={"after": "no-such-task"}).status_code == 409
+
+    still_first = client.get(f"/sign/{queue[0].id}?return_to=/queue").text
+    assert 'data-queue-index="1"' in still_first
+
+
+def test_a_run_belongs_to_the_person_whose_cookie_is_on_the_request(client: TestClient, store: Store) -> None:
+    queue = start_run(client, store)
+    sign_in(client, "tomas")
+    assert client.post("/queue/next", json={"after": queue[0].id, "envelope_id": ENVELOPE_ID}).status_code == 409
+    client.post("/logout", follow_redirects=False)
+    assert client.post("/queue/next", json={"after": queue[0].id}).status_code == 401
+
+
+def test_reports_are_never_part_of_a_run(client: TestClient, store: Store) -> None:
+    """The queue exists for short, near-identical sign-offs. A thirty-page report is read."""
+    queue = start_run(client, store)
+    run = store.queue_runs["u-priya"]
+    assert len(run.tasks) == 5
+    assert all(store.tasks[task_id].source == "template" for task_id in run.tasks)
+    assert report(store, "RPT-2291").id not in run.tasks
+
+    opened = client.post(f"/tasks/{report(store, 'RPT-2291').id}/open", data={"return_to": "/reports"})
+    assert opened.status_code == 200
+    assert "data-queue-total" not in client.get(f"/sign/{report(store, 'RPT-2291').id}?return_to=/reports").text
+    # Opening it did not disturb the run the clinician is part-way through.
+    assert store.queue_runs["u-priya"].current == queue[0].id
 
 
 # --------------------------------------------------------------------------- Addendum 1: saved signatures
@@ -781,7 +884,7 @@ def test_reports_are_for_clinicians_and_are_not_on_the_worklist_or_in_the_queue(
     # A report is read, not run through: the worklist and the signing queue are unchanged.
     assert "Annual care summary" not in client.get("/worklist").text
     assert "Annual care summary" not in client.get("/queue").text
-    assert client.get("/queue").text.count('data-testid="queue-task"') == 4
+    assert client.get("/queue").text.count('data-testid="queue-task"') == 6
     # Tomas sees only the one he co-signs, and it is waiting on the consultant.
     sign_in(client, "tomas")
     his = client.get("/reports").text

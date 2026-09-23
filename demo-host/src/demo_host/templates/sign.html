@@ -5,15 +5,25 @@
      id="esign"
      data-frame-src="{{ frame_src }}"
      data-origin="{{ esign_origin }}"
-     data-token-url="/sign/{{ task.id }}/token"
-     data-reauth-url="/sign/{{ task.id }}/reauth"
-     data-status-url="/sign/{{ task.id }}/status"
      data-return-url="{{ return_url }}"
      data-return-label="{{ return_label }}"
+     data-task-id="{{ task.id }}"
+     {% if queue %}
+     data-queue-index="{{ queue.index }}"
+     data-queue-total="{{ queue.total }}"
+     data-queue-next-title="{{ queue.next_title or '' }}"
+     {% endif %}
      data-kiosk="{{ 'true' if kiosk else 'false' }}">
 
   <section class="card">
-    <h1>{{ task.title }}</h1>
+    {% if queue %}
+      <p class="fine" data-testid="queue-run">
+        Document <span id="queue-index">{{ queue.index }}</span> of {{ queue.total }} in this run.
+        When one is signed the next opens here by itself; nothing goes back to the list until they
+        are done.
+      </p>
+    {% endif %}
+    <h1 id="doc-title" data-testid="sign-title">{{ task.title }}</h1>
     <p class="lead" data-testid="who-is-signing">
       {% if kiosk %}
         Clinic tablet. {{ patient.name }} is signing in front of {{ user.display_name }}; identity
@@ -55,6 +65,16 @@
       </div>
       <p class="notice error" id="reauth-error" role="alert" hidden></p>
     </form>
+  </section>
+
+  <!-- Addendum 3 B: the end of a run. The list is what a clinician came from, not what they -->
+  <!-- are sent back to after every document. -->
+  <section class="card outcome" id="queue-finished" hidden data-testid="queue-all-signed">
+    <h2 id="queue-finished-title"></h2>
+    <p id="queue-finished-detail"></p>
+    <div class="actions" id="queue-finished-actions">
+      <a class="button" href="/queue" data-testid="queue-back">Back to the signing queue</a>
+    </div>
   </section>
 
   <section class="card outcome" id="outcome" hidden>

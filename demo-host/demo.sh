@@ -14,9 +14,11 @@
 #   DEMO_QUIET       (unset)  no banner; used by the end-to-end runner
 #
 # The demo runs the service with a five-minute re-authentication span (REAUTH_SPAN_SECONDS=300 and
-# REAUTH_MAX_AGE_SECONDS=300, both exported below unless already set) so the clinician's signing
-# queue can be shown. The service's default is 0 -- one re-authentication per document -- and
-# demo-host/README.md says why it should stay that way unless compliance has agreed otherwise.
+# REAUTH_MAX_AGE_SECONDS=300) and a fifteen-minute consent span (CONSENT_SPAN_SECONDS=900), all
+# exported below unless already set, so the clinician's signing queue can be shown: one
+# confirmation of identity and one agreement to sign electronically, covering the run. Both
+# default to 0 in the service -- one of each per document -- and demo-host/README.md says why they
+# should stay that way unless compliance has agreed otherwise.
 
 set -euo pipefail
 
@@ -101,6 +103,13 @@ fi
 export REAUTH_SPAN_SECONDS="${REAUTH_SPAN_SECONDS:-300}"
 export REAUTH_MAX_AGE_SECONDS="${REAUTH_MAX_AGE_SECONDS:-300}"
 
+# Addendum 3 C: consent once per run. Also off by default in the service; on for the demo, so a
+# clinician working the queue reads the disclosure on the first order and the rest show when she
+# agreed instead of asking again. Every envelope still records its own acceptance, naming the one
+# it stood on. Fifteen minutes is longer than the re-authentication span on purpose: agreeing to
+# do business electronically is not the same claim as "this is me, now".
+export CONSENT_SPAN_SECONDS="${CONSENT_SPAN_SECONDS:-900}"
+
 # Addendum 2: the demo host generates clinical reports and supplies them as the document itself.
 # The service will not take a document type nobody approved, whoever rendered the PDF, so the
 # clinic's list gets `clinical_report` on it -- the four defaults plus the one this demo adds.
@@ -110,7 +119,7 @@ export REAUTH_MAX_AGE_SECONDS="${REAUTH_MAX_AGE_SECONDS:-300}"
 # (`enable_decoding=False`), so a deployment can spell it either way and so can this.
 export APPROVED_DOCUMENT_TYPES="${APPROVED_DOCUMENT_TYPES:-patient_consent,hipaa_acknowledgement,procedure_consent,clinical_order,clinical_report}"
 
-step "starting the API on ${API_PORT} (re-authentication span ${REAUTH_SPAN_SECONDS}s)"
+step "starting the API on ${API_PORT} (re-authentication span ${REAUTH_SPAN_SECONDS}s, consent span ${CONSENT_SPAN_SECONDS}s)"
 # `esign serve` rather than uvicorn directly: it drops uvicorn's log config, so its own loggers
 # propagate to the allowlisted structured handler instead of writing straight to stdout.
 (
@@ -206,9 +215,10 @@ if [ -z "${DEMO_QUIET:-}" ]; then
     ${BOLD}ben${RESET}     the witness on the procedure consent. His turn comes after Maria's.
     ${BOLD}priya${RESET}   the clinician on it. Signing in a professional capacity, so she is asked
               for her password again before the signature is taken. Also has a queue of
-              order sign-offs: "Signing queue" confirms her identity once for all of them,
-              and "Reports", where a thirty-page summary this system generates is signed
-              as a host document -- no template anywhere.
+              five order sign-offs: "Signing queue" confirms her identity once for all of
+              them, and from the first one they open in turn -- three taps each, and a
+              final "All 5 signed". And "Reports", where a thirty-page summary this system
+              generates is signed as a host document -- no template anywhere.
     ${BOLD}tomas${RESET}   the other clinician, with a queue of his own. Save a signature on the
               first order and the second offers it back. He co-signs Priya's case review
               from his own "Reports" page, after she has signed it.

@@ -5,14 +5,17 @@
   <section class="card">
     <h1>Signing queue</h1>
     <p class="lead">
-      Orders waiting on your sign-off. Confirm your identity once, then sign each one in turn.
+      Orders waiting on your sign-off. Confirm your identity once, then open the first one: from
+      there they open one after another, and you come back here when they are done.
     </p>
     <p class="fine">
       Every one of these is a clinical signature, so the signing service needs a fresh confirmation
       of who you are before each is taken. This clinic has told the service to let one confirmation
-      cover a queue for five minutes (<code>REAUTH_SPAN_SECONDS=300</code>). Each document is still
-      reviewed, consented to and signed on its own, and the record of each signature says which
-      confirmation it rests on and how old that confirmation was.
+      cover a queue for five minutes (<code>REAUTH_SPAN_SECONDS=300</code>), and to let your
+      agreement to sign electronically stand for fifteen (<code>CONSENT_SPAN_SECONDS=900</code>).
+      Each document is still read, agreed to and signed on its own, and each record says which
+      confirmation that signature rests on, how old it was, and which earlier agreement it
+      stood on.
     </p>
     {% if problem_code %}
       <p class="notice error" role="alert" data-testid="queue-problem">

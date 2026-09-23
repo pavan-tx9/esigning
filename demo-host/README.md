@@ -33,12 +33,12 @@ uv run python -m demo_host
 | `DEMO_HOST_PORT` | `8100` | Port |
 | `DEMO_PASSWORD` | `demo1234` | The one password everybody here has |
 
-`demo.sh` also exports `REAUTH_SPAN_SECONDS=300` and `REAUTH_MAX_AGE_SECONDS=300` to the service
-it starts (unless they are already set), for the signing queue below, and adds `clinical_report`
-to `APPROVED_DOCUMENT_TYPES` for the reports. Approved document types are a compliance decision
-and the service enforces them whoever rendered the PDF, so a generated report is refused
-(`document_type_not_approved`) until somebody has said that kind of document may be signed
-electronically.
+`demo.sh` also exports `REAUTH_SPAN_SECONDS=300`, `REAUTH_MAX_AGE_SECONDS=300` and
+`CONSENT_SPAN_SECONDS=900` to the service it starts (unless they are already set), for the signing
+queue below, and adds `clinical_report` to `APPROVED_DOCUMENT_TYPES` for the reports. Approved
+document types are a compliance decision and the service enforces them whoever rendered the PDF,
+so a generated report is refused (`document_type_not_approved`) until somebody has said that kind
+of document may be signed electronically.
 
 ## What it covers
 
@@ -66,6 +66,17 @@ electronically.
   here, then attested server to server against the *first* document's signing session -- and the
   clinician signs each document in turn without being asked again, because the service is running
   with a re-authentication span.
+
+  Addendum 3 B made it a **run**. Opening the first order fixes the order of the rest; the signing
+  UI is told where it is (`esign:init` carries `queue {index, total, next_title}`), counts down on
+  its Done screen and says `esign:next {envelope_id}` when it is finished. This host decides what
+  that means: `POST /queue/next` checks that the envelope named is the one it opened for the
+  document it has open for that person, creates the next envelope and session, and reloads the
+  same iframe, which asks for its token exactly as the first one did. The list is not returned to
+  in between, and the run ends on an "All 5 signed" panel. Reports stay out of it (below), and so
+  does anything waiting on another signer. With the consent span on as well, each order after the
+  first shows "You agreed to sign electronically at 09:12" instead of the checkbox -- three taps
+  per document: continue, place the signature, sign.
 - **Reports** (`/reports`, clinicians). Addendum 2: a document this system generates rather than
   one the service renders. "Generate and sign" renders a report for that patient with
   `reportlab` -- thirty pages of their own record for the annual summary, twenty-five for the case
@@ -89,7 +100,7 @@ electronically.
   (`POST /v1/users/{id}/adopted-signature/revoke`). There is no host call to create or read one, so
   staff cannot make a doctor's signature and this page cannot say whether anybody has one.
 
-### Why the re-authentication span is off by default
+### Why both spans are off by default
 
 The developer guide asks for per-document proof that a clinician re-authenticated for *that*
 document, and the service's default (`REAUTH_SPAN_SECONDS=0`) gives exactly that: one attestation
@@ -101,6 +112,22 @@ was -- but it is still weaker, and whether the trade is acceptable is a complian
 an engineering one. The demo turns it on so the queue can be seen working; a deployment should
 leave it at zero until compliance has agreed in writing, and set both settings together when it
 does (the queue's window is the smaller of the two).
+
+`CONSENT_SPAN_SECONDS` (Addendum 3 C) is the same shape of trade and is off by default for the
+same reason. The service's default displays the ESIGN disclosure before every agreement, which is
+the plainest reading of the requirement. With the span on, an agreement made by the same person on
+the same host, for the same disclosure version and language, stands for their other documents for
+that long: the later ones show when it was given instead of asking again. What does **not** change
+is what is recorded -- every envelope still writes its own `consent.accepted`, still sets
+`signers.consent_text_id` and `consented_at`, and the event, the certificate and `esign verify`
+all name the earlier acceptance and re-read it from that envelope's own trail. What changes is
+whether the notice was put in front of the signer a second time. ESIGN consent is consent to doing
+business electronically rather than to one form, so standing consent is defensible -- but whether
+it is acceptable here, and for how long, is compliance's decision (C12 in the checklist), not a
+default anybody should inherit. A shared tablet never has it in either direction: the person in
+front of a kiosk may not be the person who agreed. The demo sets it to 900 seconds, longer than
+the re-authentication span, because "I agree to do this on a screen" is a weaker claim to carry
+forward than "this is me, right now".
 
 ## What it deliberately does not do
 

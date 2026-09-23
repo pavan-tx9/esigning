@@ -30,6 +30,7 @@ __all__ = [
     "Login",
     "Patient",
     "QueueReauth",
+    "QueueRun",
     "Store",
     "Task",
     "TaskSigner",
@@ -189,6 +190,29 @@ class QueueReauth:
     session_id: str
 
 
+@dataclass
+class QueueRun:
+    """A clinician working through their queue (Addendum 3 B).
+
+    The host owns the queue and its tokens, so the host owns the order too: the list is fixed when
+    the run starts, and ``position`` walks it. Fixing it is the point -- a list recomputed after
+    each signature would shrink as documents left it, and "3 of 8" would count down towards
+    "1 of 1" while the clinician was still working.
+    """
+
+    #: Task ids, in the order they will open. Only documents that were ready when the run started.
+    tasks: tuple[str, ...]
+    #: Which of them is open now, zero-based.
+    position: int = 0
+
+    @property
+    def current(self) -> str | None:
+        return self.tasks[self.position] if 0 <= self.position < len(self.tasks) else None
+
+    def index_of(self, task_id: str) -> int | None:
+        return self.tasks.index(task_id) if task_id in self.tasks else None
+
+
 @dataclass(frozen=True)
 class WebhookRecord:
     received_at: datetime
@@ -222,6 +246,8 @@ class Store:
         self.documents: dict[str, ChartDocument] = {}
         self.archives: dict[str, ArchiveFiling] = {}
         self.queue_reauth: dict[str, QueueReauth] = {}
+        #: user id -> the run they are part-way through, if any (Addendum 3 B).
+        self.queue_runs: dict[str, QueueRun] = {}
         self.webhooks: list[WebhookRecord] = []
         self._seen_deliveries: set[str] = set()
 
@@ -487,6 +513,8 @@ def build_store() -> Store:
                 (maria, "ORD-4471", "Physiotherapy, right knee: eight weeks, twice weekly, review at the end."),
                 (sam, "ORD-4472", "Ankle X-ray, left, two views, before the physiotherapy review."),
                 (maria, "ORD-4473", "Pre-operative bloods: full blood count, clotting screen, group and save."),
+                (sam, "ORD-4474", "Physiotherapy, left ankle: six weeks, weekly, with a home programme."),
+                (maria, "ORD-4475", "Knee brace, right, off-the-shelf, to be fitted at the next appointment."),
             ),
         ),
         *_orders(

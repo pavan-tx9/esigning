@@ -38,6 +38,7 @@ from demo_host.store import (
     ArchiveFiling,
     ChartDocument,
     QueueReauth,
+    QueueRun,
     Store,
     Task,
     TaskSigner,
@@ -351,6 +352,10 @@ def create_app(
             return RedirectResponse(f"{back}?problem_code={exc.code}", status_code=303)
         if started is None:
             return RedirectResponse(f"{back}?problem_code=no_signer", status_code=303)
+        if back == "/queue":
+            # Addendum 3 B: opening a document from the queue starts a run through it. From here
+            # the documents open one after another in the same frame; the list is not come back to.
+            start_queue_run(user, task)
         return RedirectResponse(
             f"/sign/{task.id}" + (f"?return_to={back}" if back != "/worklist" else ""), status_code=303
         )
@@ -475,6 +480,101 @@ def create_app(
         )
         return RedirectResponse("/queue", status_code=303)
 
+    # ------------------------------------------------------------ the run through it (Addendum 3 B)
+
+    def still_to_sign(task: Task, user: User) -> bool:
+        """Is this document still waiting for this person? Asked of the service, not remembered."""
+        signer = signer_for(task, user)
+        if signer is None:
+            return False
+        refresh(task)
+        status = task.signer_status.get(signer.role_key, "pending")
+        return status not in {"signed", "declined"} and not task.is_finished and waiting_for(task, signer) is None
+
+    def start_queue_run(user: User, task: Task) -> None:
+        """Fix the order of a run, starting at the document being opened.
+
+        Fixed on purpose. A list recomputed after each signature would shrink as documents left
+        it, and the counter the signing UI shows would walk from "3 of 5" towards "1 of 1" while
+        the clinician was still working. Reports are not in it, because they are not in the queue.
+        """
+        ready = [row["task"].id for row in queue_rows(user)[0] if row["ready"]]
+        if task.id not in ready:
+            state.queue_runs.pop(user.id, None)
+            return
+        state.queue_runs[user.id] = QueueRun(tasks=tuple(ready), position=ready.index(task.id))
+
+    def queue_position(user: User, task: Task) -> dict[str, Any] | None:
+        """What the signing UI is told about the run: where this document sits and what follows.
+
+        Just a counter and a title. The UI never fetches the next document itself -- it asks, with
+        ``esign:next``, and this host decides what that means.
+        """
+        run = state.queue_runs.get(user.id)
+        at = None if run is None else run.index_of(task.id)
+        if run is None or at is None:
+            return None
+        run.position = at
+        following = state.tasks.get(run.tasks[at + 1]) if at + 1 < len(run.tasks) else None
+        return {
+            "index": at + 1,
+            "total": len(run.tasks),
+            "next_title": None if following is None else following.title,
+        }
+
+    @app.post("/queue/next")
+    async def queue_next(request: Request, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
+        """``esign:next``: the signer has finished one document and the host opens the next.
+
+        The frame is asking, so nothing it says is taken on trust: the document it claims to have
+        finished has to be the one this host has open in this person's run, and the envelope id it
+        names has to be the envelope this host created for it. The next document gets an envelope
+        and a session of its own here, exactly as opening it from the list would have.
+        """
+        user = current_user(demo_session)
+        if user is None:
+            return JSONResponse({"error": "not_signed_in"}, status_code=401)
+        body = await request.json()
+        run = state.queue_runs.get(user.id)
+        finished = state.tasks.get(str(body.get("after", "")))
+        if run is None or finished is None or run.current != finished.id:
+            return JSONResponse({"error": "not_in_this_run"}, status_code=409)
+        claimed = body.get("envelope_id")
+        if claimed is not None and str(claimed) != (finished.envelope_id or ""):
+            return JSONResponse({"error": "envelope_mismatch"}, status_code=409)
+
+        # The next one still waiting on this person. Anything signed elsewhere, withdrawn, or now
+        # waiting on somebody else is stepped over rather than opened on a stale idea of the list.
+        following: Task | None = None
+        for position in range(run.position + 1, len(run.tasks)):
+            candidate = state.tasks.get(run.tasks[position])
+            if candidate is not None and still_to_sign(candidate, user):
+                run.position, following = position, candidate
+                break
+        if following is None:
+            state.queue_runs.pop(user.id, None)
+            return JSONResponse({"done": True, "total": len(run.tasks)}, headers={"Cache-Control": "no-store"})
+
+        try:
+            ensure_envelope(following)
+            started = start_session(following, user, demo_session)
+        except EsignApiError as exc:
+            return JSONResponse({"error": exc.code}, status_code=502)
+        if started is None:
+            return JSONResponse({"error": "no_signer"}, status_code=409)
+        after_that = state.tasks.get(run.tasks[run.position + 1]) if run.position + 1 < len(run.tasks) else None
+        return JSONResponse(
+            {
+                "done": False,
+                "task_id": following.id,
+                "title": following.title,
+                "index": run.position + 1,
+                "total": len(run.tasks),
+                "next_title": None if after_that is None else after_that.title,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     # ------------------------------------------------------------------ reports (Addendum 2)
 
     @app.get("/reports", response_class=HTMLResponse)
@@ -578,6 +678,8 @@ def create_app(
                 "frame_src": settings.signing_ui_src,
                 "return_url": back,
                 "return_label": RETURN_URLS[back],
+                # Addendum 3 B: present only while this document is part of a run through the queue.
+                "queue": queue_position(user, task) if back == "/queue" else None,
             },
         )
 

@@ -8,7 +8,13 @@
  *   UI  -> host   esign:reauth_required    go and prove who this person is, then tell us
  *   host -> UI    esign:reauth_done        our *backend* has attested it to the service
  *   UI  -> host   esign:signed | esign:sealed | esign:declined | esign:expired
+ *   UI  -> host   esign:next {envelope_id} "I am done with this one; open the next"
  *   UI  -> host   esign:resize {height}    so the iframe is as tall as its content
+ *
+ * `esign:init` may carry a `queue {index, total, next_title}` when this document is one of a run
+ * (Addendum 3 B). The host owns the queue and its tokens; all the UI does with it is show "3 of 8",
+ * name what is coming on its Done screen, and ask for it. What "the next one" means is decided
+ * here, by our backend, against our list -- never by the frame.
  *
  * Three rules keep it safe, and all three are one line each:
  *   - only believe a message whose `source` is our iframe and whose `origin` is the service;
@@ -33,6 +39,20 @@
   let sessionId = null;
   let signed = false;
   let reportedHeight = 0;
+
+  // Which document this frame is on. It changes as a queue advances, so every URL that names a
+  // task is built from it rather than read once out of the markup.
+  let taskId = root.dataset.taskId;
+  let loads = 1;
+  const queue =
+    root.dataset.queueTotal === undefined
+      ? null
+      : {
+          index: Number(root.dataset.queueIndex),
+          total: Number(root.dataset.queueTotal),
+          next_title: root.dataset.queueNextTitle || undefined,
+        };
+  const onTask = (suffix) => `/sign/${encodeURIComponent(taskId)}/${suffix}`;
 
   /*
    * How tall to make the frame. This looks like a detail and is not.
@@ -90,7 +110,7 @@
 
   // --------------------------------------------------------------------- the token
   async function sendToken() {
-    const response = await fetch(root.dataset.tokenUrl, {
+    const response = await fetch(onTask("token"), {
       method: "POST",
       headers: { Accept: "application/json" },
       credentials: "same-origin",
@@ -102,7 +122,14 @@
     }
     const body = await response.json();
     sessionId = body.session_id;
-    post({ type: "esign:init", token: body.token, locale: "en-US" });
+    const init = { type: "esign:init", token: body.token, locale: "en-US" };
+    if (queue !== null) {
+      init.queue = { index: queue.index, total: queue.total };
+      if (queue.next_title !== undefined) {
+        init.queue.next_title = queue.next_title;
+      }
+    }
+    post(init);
   }
 
   // --------------------------------------------------------------------- re-authentication
@@ -121,7 +148,7 @@
     const password = document.getElementById("reauth-password").value;
     // Our backend does the server-to-server call. The browser never holds the API key, and the
     // signing service only believes a re-authentication that arrives with it.
-    const response = await fetch(root.dataset.reauthUrl, {
+    const response = await fetch(onTask("reauth"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
@@ -146,13 +173,16 @@
   });
 
   // --------------------------------------------------------------------- after the signature
-  async function watchForFiling() {
+  async function watchForFiling(render = outcome) {
+    // The task this started on: a queue may have moved the frame on by the time it answers, and
+    // a filing belongs to the document it was asked about.
+    const asked = onTask("status");
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      const response = await fetch(root.dataset.statusUrl, { credentials: "same-origin" });
+      const response = await fetch(asked, { credentials: "same-origin" });
       if (response.ok) {
         const status = await response.json();
         if (status.filed) {
-          outcome(
+          render(
             kiosk ? "Signed, sealed and filed" : "Your signature is recorded",
             "The sealed document arrived by webhook and has been filed in the chart.",
             [{ href: status.document_url, label: "See it in the chart", testid: "filed-link" }, back],
@@ -160,7 +190,7 @@
           return;
         }
         if (status.envelope_status === "in_progress") {
-          outcome(
+          render(
             "Signed",
             "The other signers still have to sign. The sealed copy is filed when everyone has.",
             [back],
@@ -170,7 +200,68 @@
       }
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    outcome("Signed", "The sealed copy has not arrived yet. It will be filed when it does.", [back]);
+    render("Signed", "The sealed copy has not arrived yet. It will be filed when it does.", [back]);
+  }
+
+  // --------------------------------------------------------------------- the run (Addendum 3 B)
+
+  /** The end of a run: every document in it signed, and the list not returned to in between. */
+  function finishRun(detail, extra = []) {
+    document.getElementById("queue-finished-title").textContent = `All ${queue.total} signed`;
+    document.getElementById("queue-finished-detail").textContent = detail;
+    const holder = document.getElementById("queue-finished-actions");
+    for (const action of extra) {
+      const link = document.createElement("a");
+      link.className = "button";
+      link.href = action.href;
+      link.textContent = action.label;
+      link.dataset.testid = action.testid ?? "";
+      holder.prepend(link);
+    }
+    document.getElementById("queue-finished").hidden = false;
+  }
+
+  /**
+   * `esign:next`. The frame is not asking for a document -- it is saying it has finished with
+   * this one. Which document comes next is our backend's answer, against our list, for the person
+   * whose cookie is on the request; the frame's `envelope_id` is checked there against the
+   * envelope we opened, and a mismatch is refused rather than followed.
+   */
+  async function advance(envelope) {
+    const response = await fetch("/queue/next", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ after: taskId, envelope_id: envelope ?? null }),
+    });
+    if (!response.ok) {
+      outcome("We could not open the next document", "Open it from the signing queue instead.", [
+        { href: "/queue", label: "Back to the signing queue", testid: "back-link" },
+      ]);
+      return;
+    }
+    const body = await response.json();
+    if (body.done) {
+      finishRun("Every one of them was read, agreed to and signed on its own.");
+      return;
+    }
+
+    taskId = body.task_id;
+    queue.index = body.index;
+    queue.total = body.total;
+    queue.next_title = body.next_title ?? undefined;
+    document.getElementById("doc-title").textContent = body.title;
+    document.getElementById("queue-index").textContent = String(body.index);
+    frame.title = `Sign ${body.title}`;
+
+    // A new session in the same frame. Reloading it starts the handshake again from
+    // `esign:ready`, and the token for the next document is fetched then, as the first one was.
+    initialised = false;
+    signed = false;
+    sessionId = null;
+    loads += 1;
+    const src = root.dataset.frameSrc;
+    frame.src = `${src}${src.includes("?") ? "&" : "?"}n=${loads}`;
   }
 
   // --------------------------------------------------------------------- messages
@@ -214,7 +305,24 @@
       if (kiosk) {
         outcome("Thank you", "Please hand the tablet back to the front desk.", []);
       }
+      if (queue !== null && queue.index < queue.total) {
+        // The frame is counting down to the next one. Saying "your signature is recorded" over
+        // the top of that, with a link back to the list, would be arguing with it.
+        return;
+      }
+      if (queue !== null) {
+        finishRun("Every one of them was read, agreed to and signed on its own.");
+        void watchForFiling((title, detail, actions) => finishRun(detail, actions));
+        return;
+      }
       void watchForFiling();
+      return;
+    }
+    if (data.type === "esign:next") {
+      if (queue === null) {
+        return; // nothing was said about a queue, so there is no next document to open
+      }
+      void advance(typeof data.envelope_id === "string" ? data.envelope_id : null);
       return;
     }
     if (data.type === "esign:declined") {
