@@ -14,6 +14,11 @@ electronic envelope, where the host's backend supplies the PDF over its API key 
 a published template version. Its types and methods are marked ``Addendum 2``; migration
 ``0800_addendum_2.sql`` is their schema. Everything downstream of revision 1 is unchanged.
 
+Addendum 3 (docs/SPEC-ADDENDUM-3.md) shortened the signing flow and made consent to sign
+electronically standing for the length of a sitting. Its types and methods are marked
+``Addendum 3``. There is no migration: standing consent is *found* in the ``signers`` and
+``signing_sessions`` rows that are already written, never stored a second time.
+
 Conventions:
 - All hashes are raw 32-byte SHA-256 digests (``bytes``), hex only at API and log boundaries.
 - All datetimes are timezone-aware UTC. Time comes from ``Clock``, never from ``datetime.now``.
@@ -329,6 +334,13 @@ class CertificateSigner:
     # saved signature adopted on <date>".
     adopted_signature_id: UUID | None = None
     adopted_at: datetime | None = None
+    #: Addendum 3 C. True when this signer's consent was recorded against an acceptance they had
+    #: already given for an earlier document in the same sitting (``consent.accepted`` carries
+    #: ``relied_on_envelope_id``). ``consented_at`` is still this envelope's own acceptance; what
+    #: this adds is that the person read and agreed to the disclosure a little earlier, on another
+    #: document, which is a thing a reader of the certificate must be told rather than left to
+    #: infer from two identical-looking timestamps.
+    consent_relied_on: bool = False
 
 
 #: Addendum 1 A. What the attesting staff member says about the scan. ``true_copy`` is the only
@@ -1137,6 +1149,24 @@ class SigningFieldView:
 
 
 @dataclass(frozen=True)
+class StandingConsent:
+    """Addendum 3 C: an acceptance of *this* disclosure that this signer already gave.
+
+    The same person (``host_id``, ``host_user_id``) accepted the same consent text -- same version,
+    same locale -- on an earlier envelope of the same host, within ``CONSENT_SPAN_SECONDS``. It is
+    a *found* fact, not a stored one: the acceptance lives in that envelope's ``signers`` row and
+    its trail, and this names it so the UI can say "You agreed to sign electronically at 09:12"
+    and so ``accept_consent`` can be asked to record this envelope's own acceptance against it.
+
+    Never offered to a kiosk session, and never found from one: a shared tablet in a waiting room
+    is the one place "the same person is still sitting here" cannot be assumed.
+    """
+
+    envelope_id: UUID
+    accepted_at: datetime
+
+
+@dataclass(frozen=True)
 class SigningView:
     """Everything the signing UI needs for one session (SPEC section 9, ``GET /v1/signing/session``)."""
 
@@ -1157,6 +1187,12 @@ class SigningView:
     #: so the UI can say "you confirmed your identity at HH:MM" rather than infer it. ``None``
     #: exactly when ``reauth_valid_until`` is.
     reauth_at: datetime | None = None
+    #: Addendum 3 C: this signer's standing acceptance of the disclosure the view was built for,
+    #: or ``None``. The session payload carries it as ``consent.standing`` beside the version,
+    #: locale and body the same lookup was made with, because "standing" is a fact about one
+    #: disclosure in one language and means nothing detached from it. ``None`` whenever the span
+    #: is off, the session is a kiosk one, or the person has not accepted this text recently.
+    consent_standing: StandingConsent | None = None
 
 
 WebhookEvent = Literal[
@@ -1269,16 +1305,40 @@ class EnvelopeService(Protocol):
     def present(self, db: Session, session: SessionInfo, ctx: RequestContext) -> bytes:
         """Returns the current revision bytes and records document.presented with its hash."""
 
-    def signing_view(self, db: Session, session: SessionInfo) -> SigningView: ...
+    def signing_view(self, db: Session, session: SessionInfo, *, locale: str | None = None) -> SigningView:
+        """Addendum 3 C: ``locale`` is the language the disclosure will be shown in (the default
+        locale when omitted), because ``consent_standing`` is a fact about one consent text and
+        the UI may ask for another language. It changes nothing else in the view."""
 
     def record_viewed(self, db: Session, session: SessionInfo, pages_viewed: int, ctx: RequestContext) -> None:
         """``pages_viewed`` must equal the page count of the bytes this session was served."""
 
     def accept_consent(
-        self, db: Session, session: SessionInfo, consent_version: str, ctx: RequestContext, *, locale: str | None = None
+        self,
+        db: Session,
+        session: SessionInfo,
+        consent_version: str,
+        ctx: RequestContext,
+        *,
+        locale: str | None = None,
+        relies_on_envelope_id: UUID | None = None,
     ) -> None:
         """``locale`` is the language the signer read the disclosure in; the consent recorded is
-        the current text for that locale (falling back to the default locale)."""
+        the current text for that locale (falling back to the default locale).
+
+        Addendum 3 C: ``relies_on_envelope_id`` is the earlier envelope whose acceptance the
+        signer is standing on -- what the UI sends when it showed "You agreed to sign
+        electronically at 09:12" instead of the checkbox. The acceptance is still *recorded here*:
+        ``signers.consent_text_id`` and ``consented_at`` are set on this envelope exactly as they
+        are without it, and ``consent.accepted`` is appended to this envelope's stream, carrying
+        ``relied_on_envelope_id`` and ``relied_on_accepted_at`` so the shortcut is evidence rather
+        than an absence. What it is not is an assertion the client gets to make: the server
+        re-finds the standing acceptance under the same rules that offered it (the signer's own
+        ``(host_id, host_user_id)``, the same consent text, inside ``CONSENT_SPAN_SECONDS``,
+        neither session a kiosk one, and a different envelope of the same host), and anything that
+        does not match is Conflict (``consent_not_standing``) -- on which the UI falls back to the
+        checkbox and posts again without it. Omitted, this method behaves exactly as it did before
+        the addendum, whatever the span is set to."""
 
     def sign(self, db: Session, session: SessionInfo, captures: list[Capture], ctx: RequestContext) -> EnvelopeView:
         """Requires viewed + consented, and a fresh re-authentication when the role demands it.

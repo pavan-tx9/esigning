@@ -1,11 +1,12 @@
-"""Addendum 1, end to end over the real HTTP app: the five stories the features exist for.
+"""The addenda, end to end over the real HTTP app: the stories the features exist for.
 
 Each feature has its own test package (``tests/archives``, ``tests/adopted_signatures``,
-``tests/reauth_span``) that takes it apart rule by rule. These are the stories told whole, the way
-the demo host tells them: a member of staff files a scan and somebody later swaps it on disk; a
-clinician saves a signature on one order and is offered it on the next; a queue confirmed once and
-signed three times with the span lapsing in between; a shared tablet that is never offered what
-the patient saved; a host that takes a saved signature away.
+``tests/reauth_span``, ``tests/consent_span``) that takes it apart rule by rule. These are the
+stories told whole, the way the demo host tells them: a member of staff files a scan and somebody
+later swaps it on disk; a clinician saves a signature on one order and is offered it on the next;
+a queue confirmed once and signed three times with the span lapsing in between; a shared tablet
+that is never offered what the patient saved; a host that takes a saved signature away; and
+(Addendum 3 C) a patient at the front desk who reads the disclosure once and signs three forms.
 """
 
 from __future__ import annotations
@@ -275,3 +276,105 @@ def test_a_host_revoke_removes_the_saved_signature_from_the_next_session(ehr: Eh
     assert again.status_code == 200 and again.json() == {"revoked": False}
     stranger = world.host("Another EHR").post("/users/pt-100482/adopted-signature/revoke", {})
     assert stranger.status_code == 200 and stranger.json() == {"revoked": False}
+
+
+# --------------------------------------------------------------------------- D. one sitting, three forms
+
+#: What the front desk runs with: long enough for the forms one patient signs at one visit.
+SITTING_SECONDS = 900
+
+
+@pytest.fixture
+def sitting_world(e2e_settings: Settings, clock: FixedClock, app_engine: Engine, db_factory: Sessions) -> World:
+    """The whole stack with consent standing for fifteen minutes (Addendum 3 C)."""
+    return build_world(
+        e2e_settings.model_copy(update={"consent_span_seconds": SITTING_SECONDS}), clock, app_engine, db_factory
+    )
+
+
+@pytest.fixture
+def sitting_ehr(sitting_world: World) -> Ehr:
+    host = sitting_world.host(webhook=True)
+    host.publish_template("hipaa_acknowledgement")
+    return host
+
+
+def read_and_sign(ehr: Ehr, envelope: dict[str, Any], *, key: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One form, exactly as the UI does it (Addendum 3 A): read every page, agree -- relying on the
+    standing acceptance when the payload offers one -- and sign.
+
+    Returns the session payload, which is where the standing line comes from, and this envelope's
+    own ``consent.accepted`` event.
+    """
+    signer = ehr.open_session(envelope, "patient")
+    payload = signer.session()
+    assert signer.get("/document").status_code == 200
+    assert signer.post("/viewed", {"pages_viewed": payload["envelope"]["page_count"]}).status_code == 200
+    body: dict[str, Any] = {"consent_version": payload["consent"]["version"], "accepted": True}
+    standing = payload["consent"]["standing"]
+    if standing is not None:
+        body["relies_on_envelope_id"] = standing["envelope_id"]
+    agreed = signer.post("/consent", body)
+    assert agreed.status_code == 200, agreed.text
+    assert signer.sign(payload, key=key).status_code == 200
+    consent = next(e for e in ehr.audit(envelope["id"]) if e["event_type"] == "consent.accepted")
+    return payload, consent
+
+
+def test_a_patient_reads_the_disclosure_once_and_signs_three_forms(
+    sitting_world: World, sitting_ehr: Ehr, clock: FixedClock
+) -> None:
+    with sitting_world.client:
+        ehr = sitting_ehr
+        # 1. The first form: the disclosure is displayed and agreed to, as it always is.
+        first = ehr.create_envelope("hipaa_acknowledgement")
+        agreed_at = clock.now()
+        payload, consent = read_and_sign(ehr, first, key="s-1")
+        assert payload["consent"]["standing"] is None
+        assert consent["data"]["relied_on_envelope_id"] is None
+
+        # 2 and 3. The rest of the forms: the notice is still there to re-read, but the agreement
+        # already given stands, and each form records which one it stood on -- the most recent,
+        # which is the previous form once there is one.
+        stood_on, stood_at = str(first["id"]), agreed_at
+        for index, minutes in enumerate((2, 5), start=2):
+            clock.advance(timedelta(minutes=minutes))
+            form = ehr.create_envelope("hipaa_acknowledgement")
+            payload, consent = read_and_sign(ehr, form, key=f"s-{index}")
+            standing = payload["consent"]["standing"]
+            assert standing is not None
+            assert standing["envelope_id"] == stood_on
+            assert datetime.fromisoformat(standing["accepted_at"]).astimezone(UTC) == stood_at
+            assert consent["data"]["relied_on_envelope_id"] == stood_on
+            stood_on, stood_at = str(form["id"]), clock.now()
+            # The acceptance is recorded on this form too: the signer is `consented` here.
+            assert [s["status"] for s in ehr.envelope(form["id"])["signers"]] == ["signed"]
+            # ...and the sealed copy says where the agreement came from.
+            certificate = pdf_text(ehr.get(f"/envelopes/{form['id']}/document").content)
+            assert "given for an earlier document in the same sitting" in certificate
+            report = ehr.verification(form["id"])
+            assert report["complete"] is True, (report["problems"],)
+
+        # 4. Back in the afternoon: the sitting is over -- a second past the span, counted from
+        # the most recent agreement -- and the notice is shown again.
+        clock.advance(timedelta(seconds=SITTING_SECONDS + 1))
+        later = ehr.create_envelope("hipaa_acknowledgement")
+        signer = ehr.open_session(later, "patient")
+        payload = signer.session()
+        assert payload["consent"]["standing"] is None
+        assert signer.get("/document").status_code == 200
+        assert signer.post("/viewed", {"pages_viewed": payload["envelope"]["page_count"]}).status_code == 200
+        refused = signer.post(
+            "/consent",
+            {
+                "consent_version": payload["consent"]["version"],
+                "accepted": True,
+                "relies_on_envelope_id": str(first["id"]),
+            },
+        )
+        assert refused.status_code == 409
+        assert refused.json()["error"]["code"] == "consent_not_standing"
+        assert (
+            signer.post("/consent", {"consent_version": payload["consent"]["version"], "accepted": True}).status_code
+            == 200
+        )

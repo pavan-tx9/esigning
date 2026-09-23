@@ -30,6 +30,12 @@ DEFAULT_RETENTION_YEARS = 10
 #: an attestation older than this.
 REAUTH_SPAN_MAX_SECONDS = 900
 
+#: Addendum 3 C: the hard ceiling on ``consent_span_seconds``, one hour. A property of the code in
+#: the same way :data:`REAUTH_SPAN_MAX_SECONDS` is, so verification can re-check years later that a
+#: standing acceptance this service accepted was inside a window a sitting could plausibly be: no
+#: consent recorded here ever relied on an acceptance older than this.
+CONSENT_SPAN_MAX_SECONDS = 3600
+
 _REPO_BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 
@@ -117,6 +123,11 @@ class Settings(BaseSettings):
     #: Capped at :data:`REAUTH_SPAN_MAX_SECONDS` by validation, and still subordinate to
     #: ``reauth_max_age_seconds`` (an attestation older than that covers nothing, span or no span).
     reauth_span_seconds: int = Field(default=0, ge=0, le=REAUTH_SPAN_MAX_SECONDS)
+    #: Addendum 3 C. For how long, after it was given, one acceptance of the ESIGN disclosure also
+    #: stands for the same person's *other* documents on the same host. ``0`` (the default) means
+    #: it never does: consent is collected once per envelope, as the base spec has it. Capped at
+    #: :data:`CONSENT_SPAN_MAX_SECONDS` by validation.
+    consent_span_seconds: int = Field(default=0, ge=0, le=CONSENT_SPAN_MAX_SECONDS)
     #: Proxies whose X-Forwarded-For may be believed. Everything else uses the peer address.
     trusted_proxy_cidrs: tuple[str, ...] = ()
     default_locale: str = "en-US"

@@ -223,11 +223,24 @@ class DocumentViewedData(EventData):
 
 
 class ConsentAcceptedData(EventData):
+    """This signer accepted this disclosure, on this envelope.
+
+    Addendum 3 C: the two ``relied_on_*`` fields are set together when the acceptance was recorded
+    against one the same person had already given for an earlier document in the same sitting.
+    The envelope id and the time it was given, and nothing else: the earlier envelope's own
+    ``consent.accepted`` is the record of *what* was agreed, and pointing at it is what makes the
+    shortcut checkable -- by the certificate, which says so in words, and by verification, which
+    goes and reads that trail. Both ``null`` for an acceptance given here and now, which is every
+    acceptance while the span is off.
+    """
+
     signer_id: UUID
     consent_text_id: UUID
     consent_version: VersionLabel
     locale: Locale
     body_sha256: Sha256
+    relied_on_envelope_id: UUID | None = None
+    relied_on_accepted_at: Timestamp | None = None
 
 
 class ReauthAttestedData(EventData):

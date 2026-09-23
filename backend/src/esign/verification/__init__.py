@@ -26,7 +26,7 @@ import io
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Final, Literal
 from uuid import UUID
 
@@ -36,7 +36,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from esign.audit.canonical import archive_attested_detail_digest, host_document_roles_digest
-from esign.config import REAUTH_SPAN_MAX_SECONDS
+from esign.config import CONSENT_SPAN_MAX_SECONDS, REAUTH_SPAN_MAX_SECONDS
 from esign.contracts import (
     Actor,
     AuditEvent,
@@ -232,6 +232,7 @@ class Verifier:
 
         self._check_envelope_row_against_trail(db, run, events, envelope_id, kind, source)
         self._check_signer_rows_against_trail(db, run, events, envelope_id)
+        self._check_consent_relied_on(db, run, events, envelope_id)
         self._check_reauth_attestations(db, run, events, envelope_id)
         blobs_checked += self._check_capture_images(db, run, events, envelope_id)
         self._check_sealed_pages_match_final_revision(run, fetched, status, kind)
@@ -901,6 +902,77 @@ class Verifier:
                 problems.append(f"{signer_id}: a borrowed attestation is older than the maximum span")
         run.expect("reauth_attestations_match_trail", not problems, "; ".join(sorted(set(problems))))
 
+    def _check_consent_relied_on(self, db: Session, run: _Run, events: list[AuditEvent], envelope_id: UUID) -> None:
+        """An acceptance recorded against an earlier one must be in that envelope's trail too.
+
+        Addendum 3 C lets a signer's consent on this document rest on the consent they gave a few
+        minutes earlier on another: ``consent.accepted`` then names the envelope and the time.
+        That is the whole of the shortcut's evidence, and until it is followed it is a pair of
+        values this envelope's own trail cannot contradict -- a forged pointer at an envelope that
+        never had an acceptance, or an acceptance of a different disclosure, or one from a year
+        ago, would all sit there looking exactly like a real one.
+
+        So this goes and reads the other envelope's trail, which is hash-chained on its own, and
+        requires four things of what it finds: the same disclosure (``consent_text_id``), the same
+        person (the actor id both events record, on the same host), the time this event claims
+        (within the row/event tolerance, since the recorded time came from the earlier signer's
+        row), and a gap no larger than :data:`esign.config.CONSENT_SPAN_MAX_SECONDS`. The cap is
+        the one part of the span that is a property of the code rather than of configuration
+        nobody wrote down: an acceptance this service relied on can never have been older, however
+        consistent the rest of the event is -- the same reasoning ``reauth_attestations_match_trail``
+        applies to a borrowed attestation.
+        """
+        relying = [
+            e
+            for e in events
+            if e.event_type == EventType.CONSENT_ACCEPTED and e.data.get("relied_on_envelope_id") is not None
+        ]
+        if not relying:
+            # Passed, not skipped: the check ran. Most envelopes collect their own consent.
+            run.passed("consent_relied_on_matches_trail", "no acceptance rests on an earlier one")
+            return
+        host_id = _text(
+            db.execute(text("SELECT host_id FROM envelopes WHERE id = :id"), {"id": envelope_id}).scalar_one_or_none()
+        )
+        problems: list[str] = []
+        for event in relying:
+            signer_id = _text(event.data.get("signer_id"))
+            earlier_id = _uuid(event.data.get("relied_on_envelope_id"))
+            accepted_at = _timestamp(event.data.get("relied_on_accepted_at"))
+            if earlier_id is None or accepted_at is None:
+                problems.append(f"{signer_id}: consent.accepted does not say which acceptance it relied on")
+                continue
+            earlier_host = _text(
+                db.execute(
+                    text("SELECT host_id FROM envelopes WHERE id = :id"), {"id": earlier_id}
+                ).scalar_one_or_none()
+            )
+            if earlier_host is None:
+                problems.append(f"{signer_id}: the envelope its consent relied on is not in the database")
+                continue
+            if earlier_host != host_id:
+                # Reported, and not followed: another host's stream is not this report's to read,
+                # and an acceptance found there could not have been standing anyway.
+                problems.append(f"{signer_id}: its consent relied on an envelope of another host")
+                continue
+            gap = event.occurred_at - accepted_at
+            if gap < timedelta(0) or gap > timedelta(seconds=CONSENT_SPAN_MAX_SECONDS):
+                problems.append(f"{signer_id}: the acceptance it relied on is outside the maximum consent span")
+            match = next(
+                (
+                    e
+                    for e in self._audit.list(db, "envelope", earlier_id)
+                    if e.event_type == EventType.CONSENT_ACCEPTED
+                    and _text(e.data.get("consent_text_id")) == _text(event.data.get("consent_text_id"))
+                    and _text(e.actor.user_id) == _text(event.actor.user_id)
+                    and abs(e.occurred_at - accepted_at) <= _ROW_EVENT_TOLERANCE
+                ),
+                None,
+            )
+            if match is None:
+                problems.append(f"{signer_id}: no matching acceptance is in the trail of the envelope it relied on")
+        run.expect("consent_relied_on_matches_trail", not problems, "; ".join(sorted(set(problems))))
+
     def _check_sealed_pages_match_final_revision(
         self, run: _Run, fetched: dict[str, list[bytes]], status: str, kind: str = "electronic"
     ) -> None:
@@ -1123,6 +1195,21 @@ def _attested_detail_digest(attestation: Mapping[str, Any], paper_signed_on: dat
         ],
         paper_signed_on=paper_signed_on.isoformat(),
     ).hex()
+
+
+def _timestamp(value: Any) -> datetime | None:
+    """An instant read back out of stored audit ``data``, or ``None`` when it is not one.
+
+    ``data`` is canonical JSON, so a timestamp comes back as RFC 3339 UTC. Anything else was not
+    written by this service, and the caller reports that rather than computing with it.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _uuid(value: Any) -> UUID | None:

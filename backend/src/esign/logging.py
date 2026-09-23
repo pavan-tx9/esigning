@@ -94,6 +94,9 @@ LOGGABLE_KEYS: Final[frozenset[str]] = frozenset(
         "reauth_method",
         "identity_check",
         "consent_version",
+        # Addendum 3 C: the envelope whose acceptance a consent was recorded against. An id, like
+        # every other id here, and the one fact about a standing consent worth a log line.
+        "relied_on_envelope_id",
         "locale",
         "reason_code",
         "decline_reason_code",

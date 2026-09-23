@@ -121,7 +121,11 @@ def get_session(
         # Cheap-looking but not cheap: ``signing_view`` fetches and parses the current revision to
         # count its pages.
         _limit(rt, "present", session, ctx)
-        view = rt.envelopes.signing_view(db, session)
+        # The locale goes into the view too (Addendum 3 C): whether this signer already has a
+        # standing acceptance is a question about the very disclosure this payload carries, and
+        # answering it against the default locale while showing another language would offer a
+        # shortcut for a text the signer never read.
+        view = rt.envelopes.signing_view(db, session, locale=locale)
         consent = rt.identity.current_consent(db, locale or rt.settings.default_locale)
         adopted = _adopted_signature(rt, db, session)
     return JSONResponse(signing_session_json(view, consent, session, adopted))
@@ -155,11 +159,27 @@ def post_viewed(request: Request, body: ViewedBody) -> JSONResponse:
 
 @router.post("/consent")
 def post_consent(request: Request, body: ConsentBody) -> JSONResponse:
+    """Record this signer's acceptance of the disclosure on this envelope.
+
+    ``relies_on_envelope_id`` (Addendum 3 C) says the signer is standing on an acceptance they
+    gave a few minutes ago, on another document of the same sitting -- what the session payload's
+    ``consent.standing`` offered. The acceptance is still recorded here, on this envelope, with
+    the earlier one named in its audit event; the server re-finds that earlier one and refuses
+    with 409 ``consent_not_standing`` if it cannot, on which the UI shows the checkbox and posts
+    again without it.
+    """
     rt = runtime_of(request)
     with rt.transaction() as db:
         session, ctx = authenticate_signer(request, rt, db)
         _limit(rt, "consent", session, ctx)
-        rt.envelopes.accept_consent(db, session, body.consent_version, ctx, locale=body.locale)
+        rt.envelopes.accept_consent(
+            db,
+            session,
+            body.consent_version,
+            ctx,
+            locale=body.locale,
+            relies_on_envelope_id=body.relies_on_envelope_id,
+        )
         ack = _signer_ack(rt, db, session)
     return JSONResponse(ack)
 

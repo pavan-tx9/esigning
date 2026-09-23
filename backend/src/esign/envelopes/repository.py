@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Final
 from uuid import UUID
 
 from sqlalchemy import text
@@ -38,6 +38,7 @@ from esign.contracts import (
 )
 
 __all__ = [
+    "ConsentAcceptance",
     "EnvelopeRow",
     "SessionAttestation",
     "SignerRow",
@@ -66,6 +67,7 @@ __all__ = [
     "seal_job_attempts",
     "session_attestation",
     "set_session_presented",
+    "standing_consent",
     "superseded_by",
     "update_envelope",
     "update_signer",
@@ -737,6 +739,86 @@ def session_attestation(db: Session, *, signer_id: UUID, at_or_before: datetime 
         auth_method=str(row.auth_method),
         kiosk_staff_user_id=None if row.kiosk_staff_user_id is None else str(row.kiosk_staff_user_id),
         kiosk_identity_check=None if row.kiosk_identity_check is None else str(row.kiosk_identity_check),
+    )
+
+
+@dataclass(frozen=True)
+class ConsentAcceptance:
+    """Addendum 3 C: one acceptance of a disclosure, found on another envelope of the same host.
+
+    Only what standing consent is allowed to be built from: which envelope it was given on, by
+    which signer row, and when. Not the disclosure body, not a name -- the earlier envelope's own
+    ``consent.accepted`` is the record of what was agreed, and this is the pointer to it.
+    """
+
+    envelope_id: UUID
+    signer_id: UUID
+    consented_at: datetime
+
+
+#: Everything an acceptance must satisfy to stand for another document (Addendum 3 C), as SQL.
+#: The same predicate answers both questions the feature asks -- "is there one?" for the session
+#: payload and "is *this* one still good?" for ``accept_consent`` -- because two spellings of
+#: "standing" would be two chances to offer a shortcut the recording side then refuses, or worse,
+#: to record one the offering side would never have shown.
+#:
+#: ``consent_text_id`` carries version *and* locale: ``consent_texts`` is unique on the pair, so
+#: matching the id is matching both, and a disclosure that rolled over or a signer who read
+#: another language simply finds nothing. The kiosk clause is about the *earlier* session: a
+#: consent given on a shared tablet never stands for a later document, however the person reaches
+#: it. (The asking session's own kiosk flag is the service's check, before it ever gets here.)
+_STANDING_CONSENT_SQL: Final = (
+    "SELECT s.envelope_id AS envelope_id, s.id AS signer_id, s.consented_at AS consented_at "
+    "FROM signers s JOIN envelopes e ON e.id = s.envelope_id "
+    "WHERE e.host_id = :host "
+    "  AND s.host_user_id = :user "
+    "  AND s.consent_text_id = :consent "
+    "  AND s.consented_at IS NOT NULL "
+    "  AND s.consented_at >= :since "
+    "  AND s.consented_at <= :now "
+    "  AND s.envelope_id <> :asking "
+    "  AND NOT EXISTS ("
+    "    SELECT 1 FROM signing_sessions ss WHERE ss.signer_id = s.id AND ss.kiosk_staff_user_id IS NOT NULL"
+    "  ) "
+)
+_STANDING_CONSENT_ORDER: Final = "ORDER BY s.consented_at DESC, s.envelope_id LIMIT 1"
+
+
+def standing_consent(
+    db: Session,
+    *,
+    host_id: UUID,
+    host_user_id: str,
+    consent_text_id: UUID,
+    since: datetime,
+    now: datetime,
+    asking_envelope_id: UUID,
+    envelope_id: UUID | None = None,
+) -> ConsentAcceptance | None:
+    """The most recent acceptance of this disclosure that stands for this document, or ``None``.
+
+    ``since`` is ``now - CONSENT_SPAN_SECONDS``; ``asking_envelope_id`` is the envelope being
+    signed, which never stands for itself. ``envelope_id``, when given, narrows the search to the
+    one envelope the client said it was relying on -- so the answer to "may this signer rely on
+    that acceptance?" is the same query as "is there one to offer?", with one more equality.
+    """
+    clause = "AND s.envelope_id = :relied " if envelope_id is not None else ""
+    row = db.execute(
+        text(_STANDING_CONSENT_SQL + clause + _STANDING_CONSENT_ORDER),
+        {
+            "host": host_id,
+            "user": host_user_id,
+            "consent": consent_text_id,
+            "since": since,
+            "now": now,
+            "asking": asking_envelope_id,
+            "relied": envelope_id,
+        },
+    ).one_or_none()
+    if row is None:
+        return None
+    return ConsentAcceptance(
+        envelope_id=_uuid(row.envelope_id), signer_id=_uuid(row.signer_id), consented_at=_utc(row.consented_at)
     )
 
 

@@ -10,8 +10,9 @@ show who signed, what they saw, that they meant to sign, and that nothing change
 two designs are otherwise equal, pick the one that produces better evidence.
 
 The contract lives in four files that module authors must not edit. They were revised once, at
-integration, from the module hand-off reports, and again for Addendum 1 (section 14) and
-Addendum 2 (section 15); every such revision is listed in section 13:
+integration, from the module hand-off reports, and again for Addendum 1 (section 14), Addendum 2
+(section 15) and Addendum 3 (section 16, which adds no migration); every such revision is listed
+in section 13:
 
 - `backend/src/esign/contracts.py`: every cross-module type and interface
 - `backend/migrations/0001_schema.sql`: the full schema
@@ -130,7 +131,14 @@ the state change.
    `document.presented` with the hash of the bytes it served. The UI reports `viewed` once every
    page has been displayed. The server refuses consent and signing before that.
 4. **Consent**: the signer accepts the current ESIGN disclosure. The version and body hash are
-   stored. There is always a visible decline/paper path.
+   stored. There is always a visible decline/paper path. With `CONSENT_SPAN_SECONDS` above zero
+   (section 16 C; default 0, at most 3600) an acceptance the same `(host_id, host_user_id)` gave
+   for the same consent text within the span is **standing**: the UI shows when it was given
+   instead of the checkbox and posts `relies_on_envelope_id`, and this envelope records its own
+   `consent.accepted` naming that earlier acceptance and its time. The row is set exactly as it is
+   without the span, so every envelope still carries its own consent; what the span changes is
+   whether the disclosure was displayed again, and the trail, the certificate and verification all
+   say which. Never for a kiosk session, in either direction.
 5. **Re-authenticate** (roles with `requires_reauth`): the UI asks the host page to re-authenticate
    the user; the host backend then calls `POST /v1/sessions/{id}/reauth`. Signing requires an
    attestation younger than `REAUTH_MAX_AGE_SECONDS` (default 120). By default the attestation
@@ -283,6 +291,15 @@ the paper original and the attesting staff member, and the cover page and the ce
   `template_version` and `template_version_id` became optional, and are all null together on a
   `host_document` envelope: there is no published version to name, and the `document.supplied`
   that follows says where the document did come from.
+- Section 16 adds no event type and two fields. `consent.accepted` gained
+  `relied_on_envelope_id` and `relied_on_accepted_at`, set together when the acceptance was
+  recorded against a standing one (section 16 C) and `null` together otherwise -- which is every
+  acceptance while `CONSENT_SPAN_SECONDS` is zero. The envelope id and the time, and nothing
+  else: the earlier envelope's own `consent.accepted` is the record of *what* was agreed, and
+  pointing at it is what makes the shortcut checkable by the certificate and by verification
+  (`consent_relied_on_matches_trail`, which reads that other stream). A `consent.accepted`
+  written before this is reported by `verify` as `data keys do not match` -- the same consequence
+  Addendum 1's `signer.signed` change had.
 - `signer.signed` gained `reauth_attestation_id`, `reauth_scope` and `reauth_age_seconds`, set
   together whenever `reauth_used`, and `adopted_signature_id` when an `adopted` capture was
   applied. Capture kinds in the trail are `drawn | typed | click | adopted | checkbox | text`.
@@ -329,7 +346,10 @@ the paper original and the attesting staff member, and the cover page and the ce
 - Embed fonts. Output must contain no JavaScript, no form fields, no annotations that can be edited.
 - Certificate of completion: envelope id, document type, template key and version, hashes, and per
   signer: name, role, capacity, authentication method, re-authentication method, consent version,
-  viewed/consented/signed times, IP, user agent, kiosk details. Plus the audit event count and head
+  viewed/consented/signed times, IP, user agent, kiosk details. Section 16 C: where the acceptance
+  was recorded against a standing one, the Consented line says so in words -- "09:12 (given for an
+  earlier document in the same sitting)" -- so a reader is never left to infer from two nearby
+  timestamps that the disclosure was displayed twice. Plus the audit event count and head
   hash, the seal profile, and a line on how to verify. No chart data.
 - Ship three sample templates in `templates/` with definitions: a patient consent form (patient,
   optional guardian capacity), a HIPAA acknowledgement (patient), and a procedure consent needing
@@ -387,6 +407,16 @@ the paper original and the attesting staff member, and the cover page and the ce
   attributed to the patient (or guardian), never to the staff member.
 - Consent texts are versioned, immutable, and seeded by migration-independent `esign consent add`.
   A default US English ESIGN disclosure ships in `backend/src/esign/identity/consent/`.
+- Standing consent (section 16 C): with `CONSENT_SPAN_SECONDS` above zero (default 0, at most
+  `config.CONSENT_SPAN_MAX_SECONDS` = 3600), an acceptance stands for that user's other documents
+  on the same host for that long. It is *found*, never stored a second time: the lookup is over
+  the `signers` and `signing_sessions` rows that are already there -- same `(host_id,
+  host_user_id)`, same `consent_text_id` (`consent_texts` is unique on version and locale, so one
+  id is both), `consented_at` inside the span and not in the future, a different envelope from the
+  one being signed, and no kiosk session on the signer whose acceptance it is. The session asking
+  must not be a kiosk session either. `EnvelopeService` owns the lookup because it owns the
+  `signers` rows, and one definition answers both "is there one to offer?" and "is the one this
+  request names still good?", so offering and recording cannot drift.
 - Rate limits (in-memory sliding window behind the `RateLimiter` protocol): per session and per IP
   on sign, consent and token failures; per host on session creation and reauth.
 
@@ -426,7 +456,7 @@ sounds like "upload a PDF" is exactly what a signer-side upload would reach for.
 | `GET /v1/signing/session` | everything the UI needs, shape below. `?locale=` picks the disclosure language |
 | `GET /v1/signing/document` | current revision PDF; records `document.presented` |
 | `POST /v1/signing/viewed` | `{pages_viewed: int}` must equal the page count |
-| `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?}` (`locale` as shown in the session payload; default locale when omitted) |
+| `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?, relies_on_envelope_id?}` (`locale` as shown in the session payload; default locale when omitted). Section 16 C: `relies_on_envelope_id` is the envelope named by `consent.standing` in the session payload. The server re-finds that acceptance under the same rule that offered it and refuses with 409 `consent_not_standing` otherwise, on which the UI shows the checkbox and posts again without it. Omitted, the route behaves exactly as it did before the addendum |
 | `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...], save_adopted_signature?: bool}` + `Idempotency-Key`. `save_adopted_signature: true` (section 14 B) saves the drawn or typed signature just applied, after the signature succeeds and in the same transaction; what is saved is the first such capture landing on a **signature** field, never an initials one (initials are the signer's own typed text and a template may ask for them first); refused (422 `no_signature_to_save`) when the request has no such capture, and always (403) from a kiosk session |
 | `POST /v1/signing/adopted-signature/revoke` | section 14 B: the signer removes their own saved signature (`reason: user`). No body. 200 `{"revoked": bool}` whether or not there was one. Refused (403 `adoption_not_allowed`) from a kiosk session, as saving is: a shared tablet is not shown this signature and may not destroy it either, and the revocation is irreversible and would be recorded as the person's own request |
 | `POST /v1/signing/decline` | `{reason_code}` from a fixed list including `prefers_paper` |
@@ -451,7 +481,8 @@ refused (422) rather than ignored.
   "fields": [{"id": "patient_sig", "type": "signature", "page": 3,
               "rect": {"x": 72, "y": 120, "w": 220, "h": 48}, "required": true,
               "label": "Patient signature"}],
-  "consent": {"version": "2026-09", "locale": "en-US", "body": "..."},
+  "consent": {"version": "2026-09", "locale": "en-US", "body": "...",
+              "standing": {"accepted_at": "...", "envelope_id": "..."}},
   "session": {"id": "...", "expires_at": "...", "kiosk": false},
   "adopted_signature": null,
   "decline_reasons": [{"code": "prefers_paper", "label": "I would rather sign on paper"}]
@@ -464,6 +495,12 @@ HH:MM" rather than infer it. The three are `null` together.
 `adopted_signature` (section 14 B) is `{id, kind, image_png_base64 | typed_text, created_at}` or
 `null`: the signer's own live saved signature, served only to a session with the same
 `(host_id, host_user_id)`, and always `null` on a kiosk session.
+`consent.standing` (section 16 C) is `{accepted_at, envelope_id}` or `null`: an acceptance of
+*this* version in *this* locale that this signer already gave, within `CONSENT_SPAN_SECONDS`.
+Inside the consent block rather than beside it, because standing is a fact about one disclosure in
+one language and says nothing read apart from them -- `?locale=` therefore decides it too.
+`null` whenever the span is off and on every kiosk session. The body is served with it either way:
+the UI offers "Read the full notice" on both paths.
 
 Capture shapes: `{"field_id", "kind": "drawn", "image_png_base64"}`, `{"field_id", "kind":
 "typed", "typed_text"}`, `{"field_id", "kind": "click"}`, `{"field_id", "kind": "adopted",
@@ -881,6 +918,42 @@ changes", plus the few things it did not name that the listed ones need:
   feature, in `PdfDocumentService`, `EnvelopeServiceImpl` and the envelope tests'
   `FakeDocumentService`, so the tree stays green until each builder replaces its own.
 
+Addendum 3 (section 16), made once by the architecture step for section C of the addendum, the
+only one of its three sections that reaches the contract. Sections A and B are the signing UI's
+and the demo host's; the server side of them is unchanged, which is the point of them:
+
+- **`contracts.py`**: `StandingConsent` (the found acceptance: `envelope_id`, `accepted_at`);
+  `SigningView.consent_standing`, which the session payload serves as `consent.standing`;
+  `SigningView` and `signing_view` gained a `locale` keyword, because whether an acceptance stands
+  is a question about one consent text and the UI may ask for another language -- the same
+  parameter, with the same meaning, `accept_consent` already had; `accept_consent` gained
+  `relies_on_envelope_id`; `CertificateSigner.consent_relied_on`. Nothing else: standing consent
+  is a way of *arriving at* an acceptance, and everything downstream of one is untouched.
+- **No schema change.** The acceptance is found in the `signers` and `signing_sessions` rows that
+  are already written (section 8). A second store of it would be a second place for it to disagree
+  with the trail, and the trail is what the certificate and verification are built from. The
+  envelopes module did add one migration in its own range, as "Migrations" above allows and asks
+  to be reported: `0503_standing_consent_lookup.sql`, a partial index on
+  `signers (host_user_id, consent_text_id, consented_at DESC)`. It stores nothing and changes no
+  grant; it exists because the lookup runs on every load of the signing UI while the span is on,
+  and `signers` had no index for it.
+- **`config.py`**: `consent_span_seconds` (0, validated `0..CONSENT_SPAN_MAX_SECONDS`, the named
+  constant verification also re-checks). `check_production_settings` refuses nothing new;
+  `.env.example` and `docs/CONFIGURATION.md` say why the span is off by default.
+- **Audit allowlist**: `ConsentAcceptedData` gained `relied_on_envelope_id` and
+  `relied_on_accepted_at` (section 4). `audit/README.md`'s worked vector is over `signer.signed`
+  and still stands.
+- **Verification** gained `consent_relied_on_matches_trail`, which follows the pointer into the
+  other envelope's stream. Without it, `relied_on_envelope_id` would be a pair of values this
+  envelope's own hash chain cannot contradict -- and the borrowing envelope verifies clean while
+  the acceptance it rests on is rewritten out of the other one's trail, which is exactly what its
+  tests do.
+- **Recorded as designed, not changed**: the standing lookup returns the *most recent* matching
+  acceptance, so a queue of five forms stands on the fourth rather than on the first, and each
+  one's trail names the document the signer had most recently agreed on. `accept_consent` is
+  still legal for a signer who is already `consented` and still keeps the first acceptance in the
+  row (section 13, fourth round); an envelope never stands for itself.
+
 ## 14. Addendum 1: paper archives, adopted signatures, re-authentication span
 
 `docs/SPEC-ADDENDUM-1.md` adds three features to this spec and is normative for them:
@@ -968,3 +1041,50 @@ Its contract and schema changes were made once, up front (section 13, "Addendum 
 `contracts.py`, `0800_addendum_2.sql`, `config.py` and this document; the sections above that
 changed say so inline. The addendum's Documents module, Demo host and Tests headings apply to
 sections 6, 11 and 12 without restating them here.
+
+## 16. Addendum 3: a shorter signing flow, and a faster queue
+
+`docs/SPEC-ADDENDUM-3.md` shortens the signing flow and is normative for it. Nothing that produces
+evidence is removed; steps are merged onto fewer screens, and the acts that matter stay explicit.
+Every page displayed before signing is still possible, consent is still given explicitly, there is
+still one explicit act per field and one explicit act that signs the document, re-authentication
+still happens for the roles that need it, and the decline-to-paper path is still visible on every
+screen. What goes is duplication: a checkbox that restates what the button says, a summary screen
+that repeats what the signer just did, a separate adopt screen.
+
+- **A. Read → Sign → Done**: the flow becomes three screens. The consent block sits under the last
+  page of the document (screen 1); the signature panel, the fields and the sign button sit on one
+  screen (screen 2); re-authentication happens on the press rather than on a screen of its own.
+  This is entirely the signing UI's: `POST /signing/viewed`, `POST /signing/consent` and
+  `POST /signing/sign` are sent at the same points, carrying the same things, and the server's
+  `signers.status` progression (`pending → viewed → consented → signed`) is unchanged, so a reload
+  still lands where the record says the signer is. The button press is what `intent_confirmed:
+  true` now means, and `docs/COMPLIANCE-CHECKLIST.md` records that for counsel.
+- **B. Queue auto-advance**: `esign:init` gains an optional `queue {index, total, next_title}` and
+  the UI posts `esign:next {envelope_id}` when a document is done. The host owns the queue and the
+  tokens; the UI never fetches the next document itself. Nothing server-side changes.
+- **C. Consent once per run**: consent to sign electronically is consent to doing business
+  electronically, and with `CONSENT_SPAN_SECONDS` above zero (default 0, at most 3600) one
+  acceptance stands for the same person's other documents on the same host for that long
+  (sections 3 step 4, 4, 6, 8, 9). Every envelope still records its own `consent.accepted` and
+  still sets `signers.consent_text_id` and `consented_at`; what the span changes is whether the
+  disclosure was displayed again, and the trail says which by naming the acceptance relied on and
+  when it was given. The certificate says it in words and verification re-checks it against the
+  earlier envelope's trail. A kiosk session never has standing consent, in either direction: a
+  shared tablet is the one place "the same person is still sitting here" cannot be assumed.
+
+**What this weakens.** One thing, and only in section C: a signer on the second document of a
+sitting is not shown the disclosure again before agreeing. The containment is the same shape as
+Addendum 1 C's: off by default, capped by a constant in the code rather than by configuration
+(`config.CONSENT_SPAN_MAX_SECONDS`, one hour) so verification can re-check it years later, never
+available to a kiosk session, recorded on every envelope it is used on, printed on the certificate
+in words, and re-derived from the other envelope's own hash-chained trail by `esign verify`. The
+checklist gains an item for counsel, as the re-authentication span did. Sections A and B weaken
+nothing: they remove a checkbox that duplicated the button beneath it and a screen that repeated
+what the signer had just done, neither of which was evidence of anything the trail does not hold.
+
+Everything in sections 1 to 15 still applies; where the addendum is silent, this document decides.
+Its contract changes were made once, up front (section 13, "Addendum 3"), in `contracts.py`,
+`config.py` and this document; the sections above that changed say so inline. There is no
+migration: standing consent is found in rows the base schema already writes. The addendum's
+Frontend, Demo host and Tests headings apply to sections 11 and 12 without restating them here.

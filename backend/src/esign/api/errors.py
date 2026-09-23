@@ -35,6 +35,9 @@ _BY_CODE: Final[dict[str, str]] = {
     "not_viewed": "The document has changed. Please look through every page again before you sign.",
     "not_presented": "Please open the document before you continue.",
     "consent_version_stale": "The disclosure has been updated. Please read it again before you continue.",
+    # Addendum 3 C. The signer is not being refused: they are being asked to agree here, on this
+    # document, because the earlier agreement the page was showing no longer stands.
+    "consent_not_standing": "Please agree to sign this document electronically before you continue.",
     "signer_finished": "This signer has already finished; there is nothing left to re-authenticate for.",
     "reauth_not_required": "This signer's role does not need re-authentication.",
     "envelope_not_live": "This document is no longer being signed.",

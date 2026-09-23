@@ -51,6 +51,7 @@ from esign.contracts import (
     CertificateSummary,
     ChainReport,
     Conflict,
+    ConsentText,
     DocumentService,
     EnvelopeNotifier,
     EnvelopeView,
@@ -78,6 +79,7 @@ from esign.contracts import (
     SignerView,
     SigningFieldView,
     SigningView,
+    StandingConsent,
     TemplatePdfInfo,
     ValidationFailed,
     WebhookEvent,
@@ -570,9 +572,13 @@ class EnvelopeServiceImpl:
         envelope = repo.load_envelope(db, signer.envelope_id)
         return envelope is not None and envelope.status in ("completed_pending_seal", "sealed")
 
-    def signing_view(self, db: Session, session: SessionInfo) -> SigningView:
+    def signing_view(self, db: Session, session: SessionInfo, *, locale: str | None = None) -> SigningView:
         """What the signing UI shows. Read-only: no lock, no event. Other signers appear by role
-        label and status only -- one signer never learns another's name from this service."""
+        label and status only -- one signer never learns another's name from this service.
+
+        Addendum 3 C: ``locale`` is the language the disclosure will be shown in, because whether
+        this signer already has a standing acceptance is a question about one consent text.
+        """
         loaded = self._load(db, session.envelope_id, host=None, lock=False)
         signer = self._signer_of(loaded, session.signer_id)
         fields = self._fields_of(loaded)
@@ -594,6 +600,11 @@ class EnvelopeServiceImpl:
             # when it was made, so it can say so in the signer's own words.
             reauth_scope=None if fresh is None else fresh.scope,
             reauth_at=None if fresh is None else fresh.auth_time,
+            # Addendum 3 C: the acceptance this signer already gave for the same disclosure, in
+            # the same sitting. The UI shows a line naming its time in place of the checkbox, and
+            # sends the envelope id back when the signer continues, so what it relied on is
+            # recorded rather than assumed.
+            consent_standing=self._standing_consent_for(db, loaded, signer, session, locale=locale),
             other_signers=tuple(
                 (loaded.roles[s.role_key].label if s.role_key in loaded.roles else s.role_key, s.status)
                 for s in sorted(loaded.signers, key=lambda s: (s.order_index, s.role_key))
@@ -726,7 +737,14 @@ class EnvelopeServiceImpl:
         log.info("document.viewed", envelope_id=loaded.envelope.id, signer_id=signer.id, session_id=session.id)
 
     def accept_consent(
-        self, db: Session, session: SessionInfo, consent_version: str, ctx: RequestContext, *, locale: str | None = None
+        self,
+        db: Session,
+        session: SessionInfo,
+        consent_version: str,
+        ctx: RequestContext,
+        *,
+        locale: str | None = None,
+        relies_on_envelope_id: UUID | None = None,
     ) -> None:
         loaded, signer = self._load_for_session(db, session)
         transition = self._decide(loaded, Command.CONSENT, signer.id)
@@ -738,6 +756,19 @@ class EnvelopeServiceImpl:
             # They agreed to a disclosure that is no longer current. Make them read the new one
             # rather than recording consent to text they were not shown.
             raise Conflict("the consent disclosure has changed", code="consent_version_stale")
+
+        # Addendum 3 C. The client may say "I agreed to this a few minutes ago, on that document",
+        # and the server goes and looks rather than believing it: the same lookup that offered the
+        # standing line, narrowed to the envelope named. A stale tab, another patient's envelope,
+        # a disclosure that has since rolled over, a span that was turned off, a kiosk session --
+        # every one of them lands here as ``consent_not_standing``, and the UI shows the checkbox.
+        standing: StandingConsent | None = None
+        if relies_on_envelope_id is not None:
+            standing = self._standing_consent_for(
+                db, loaded, signer, session, locale=locale, consent=current, envelope_id=relies_on_envelope_id
+            )
+            if standing is None:
+                raise Conflict("that acceptance does not stand for this document", code="consent_not_standing")
 
         self._apply_envelope_transition(db, loaded, transition, now=now)
         repo.update_signer(
@@ -767,6 +798,10 @@ class EnvelopeServiceImpl:
                 "consent_version": current.version,
                 "locale": current.locale,
                 "body_sha256": current.body_sha256,
+                # Addendum 3 C: where this acceptance came from, when it came from earlier in the
+                # sitting. Both null otherwise, which is every acceptance while the span is off.
+                "relied_on_envelope_id": None if standing is None else standing.envelope_id,
+                "relied_on_accepted_at": None if standing is None else standing.accepted_at,
             },
         )
         log.info(
@@ -775,6 +810,7 @@ class EnvelopeServiceImpl:
             signer_id=signer.id,
             consent_version=current.version,
             locale=current.locale,
+            relied_on_envelope_id=None if standing is None else standing.envelope_id,
         )
 
     def sign(self, db: Session, session: SessionInfo, captures: list[Capture], ctx: RequestContext) -> EnvelopeView:
@@ -1599,6 +1635,11 @@ class EnvelopeServiceImpl:
             adopted_signature_id=adopted_id,
             adopted_at=adopted_at,
             consent_version=consent.version,
+            # Addendum 3 C: whether this acceptance was recorded against one the signer had
+            # already given, earlier in the same sitting. Read from the append-only event, never
+            # from configuration: what the span was set to that afternoon is not recoverable, and
+            # the certificate has to be able to say this years later.
+            consent_relied_on=consented.data.get("relied_on_envelope_id") is not None,
             viewed_at=viewed.occurred_at,
             consented_at=consented.occurred_at,
             signed_at=signed.occurred_at,
@@ -1934,6 +1975,49 @@ class EnvelopeServiceImpl:
         if fresh.scope == "span":
             window = min(window, self._settings.reauth_span_seconds)
         return fresh.auth_time + timedelta(seconds=window)
+
+    def _standing_consent_for(
+        self,
+        db: Session,
+        loaded: _Loaded,
+        signer: repo.SignerRow,
+        session: SessionInfo,
+        *,
+        locale: str | None,
+        consent: ConsentText | None = None,
+        envelope_id: UUID | None = None,
+    ) -> StandingConsent | None:
+        """The acceptance of this disclosure that already stands for this signer (Addendum 3 C).
+
+        One definition, used twice: to offer the standing line in the session payload, and to
+        re-check the envelope a consent request says it relied on (``envelope_id``). Offering and
+        recording therefore cannot drift, which matters more here than the query costs -- a UI
+        that shows "you already agreed" against a rule the server does not share is a signer told
+        they have consented when the record will say they have not.
+
+        Two refusals happen here rather than in SQL, because each is about *this* session: the
+        span being off, in which case nothing is ever standing and no row is read at all, and a
+        kiosk session, because a shared tablet is not a sitting -- the next person to hold it is
+        somebody else. The rest -- same person, same host, same disclosure, inside the span, not
+        given from a kiosk session, not this envelope -- is ``repo.standing_consent``.
+        """
+        if self._settings.consent_span_seconds <= 0 or session.kiosk is not None:
+            return None
+        current = consent or self._identity.current_consent(db, locale or self._settings.default_locale)
+        now = self._clock.now()
+        found = repo.standing_consent(
+            db,
+            host_id=loaded.envelope.host_id,
+            host_user_id=signer.host_user_id,
+            consent_text_id=current.id,
+            since=now - timedelta(seconds=self._settings.consent_span_seconds),
+            now=now,
+            asking_envelope_id=loaded.envelope.id,
+            envelope_id=envelope_id,
+        )
+        if found is None:
+            return None
+        return StandingConsent(envelope_id=found.envelope_id, accepted_at=found.consented_at)
 
     def _require_fresh_reauth(
         self, db: Session, loaded: _Loaded, signer: repo.SignerRow, session: SessionInfo

@@ -312,6 +312,12 @@ class ConsentBody(_Body):
     consent_version: str = Field(max_length=64)
     accepted: Literal[True]  # there is no way to post "I do not agree": that is the decline path
     locale: str | None = Field(default=None, max_length=35)
+    #: Addendum 3 C: the earlier envelope whose acceptance the signer is standing on, as the
+    #: session payload's ``consent.standing`` named it. Omitted -- which is every request while
+    #: the span is off -- this route behaves exactly as it always has. Sent, it is a claim the
+    #: server re-checks against the same rule that offered the line, never a value it records on
+    #: the client's word: a mismatch is 409 ``consent_not_standing`` and the UI shows the checkbox.
+    relies_on_envelope_id: UUID | None = None
 
 
 class CaptureBody(_Body):
@@ -539,7 +545,24 @@ def signing_session_json(
             }
             for f in view.fields
         ],
-        "consent": {"version": consent.version, "locale": consent.locale, "body": consent.body},
+        "consent": {
+            "version": consent.version,
+            "locale": consent.locale,
+            "body": consent.body,
+            # Addendum 3 C: an acceptance of *this* disclosure that this signer already gave, for
+            # an earlier document in the same sitting, or ``null``. Inside the consent block
+            # rather than beside it, because standing is a fact about one version in one
+            # language: read apart from them it says nothing. ``null`` whenever the span is off
+            # and on every kiosk session.
+            "standing": (
+                None
+                if view.consent_standing is None
+                else {
+                    "accepted_at": timestamp(view.consent_standing.accepted_at),
+                    "envelope_id": str(view.consent_standing.envelope_id),
+                }
+            ),
+        },
         "session": {
             "id": str(session.id),
             "expires_at": timestamp(session.expires_at),

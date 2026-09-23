@@ -185,6 +185,11 @@ def test_consent_stores_the_text_it_was_given(bench: Bench, db: Session) -> None
         "consent_version": consent_version,
         "locale": "en-US",
         "body_sha256": current.body_sha256.hex(),
+        # Addendum 3 C: this acceptance was given here, so it relies on nothing. The keys are
+        # still written -- every declared field always is -- which is what lets a reader tell an
+        # acceptance that stood on an earlier one from an event that predates the question.
+        "relied_on_envelope_id": None,
+        "relied_on_accepted_at": None,
     }
 
 

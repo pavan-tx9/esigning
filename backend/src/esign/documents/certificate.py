@@ -187,6 +187,21 @@ def _reauthentication(signer: CertificateSigner) -> str:
     return f"{signer.reauth_method}, at {when} for this document"
 
 
+def _consented(signer: CertificateSigner) -> str:
+    """When this signer agreed to sign electronically, and whether they agreed here (Addendum 3 C).
+
+    Consent to do business electronically may be given once for a sitting: the person read the
+    disclosure on the first document and the rest of the queue recorded that acceptance rather
+    than asking again (SPEC section 16 C). The acceptance on *this* document is real and is timed
+    here; what a reader must not be left to infer is that the disclosure was displayed again. So
+    the line says so, in the same breath as the time.
+    """
+    when = _when(signer.consented_at)
+    if signer.consent_relied_on:
+        return f"{when} (given for an earlier document in the same sitting)"
+    return when
+
+
 def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> None:
     cursor.ensure(150)
     canvas = cursor.canvas
@@ -212,7 +227,7 @@ def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> Non
         _row(cursor, "Saved signature", f"signed with a saved signature adopted on {_day(signer.adopted_at)}")
     _row(cursor, "Consent version", signer.consent_version)
     _row(cursor, "Viewed", _when(signer.viewed_at))
-    _row(cursor, "Consented", _when(signer.consented_at))
+    _row(cursor, "Consented", _consented(signer))
     _row(cursor, "Signed", _when(signer.signed_at))
     _row(cursor, "IP address", signer.ip or "not recorded")
     _row(cursor, "User agent", signer.user_agent or "not recorded")
