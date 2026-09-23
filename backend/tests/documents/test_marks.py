@@ -69,13 +69,16 @@ def test_a_drawn_signature_keeps_its_aspect_ratio(documents: DocumentService, st
     assert drawn_ratio == pytest.approx(source_w / source_h, rel=0.02)
 
 
-def test_the_caption_is_below_the_rect_when_there_is_room(documents: DocumentService, stamp: SignerStamp) -> None:
+def test_the_caption_stays_inside_the_rect_below_the_mark(documents: DocumentService, stamp: SignerStamp) -> None:
+    """Forms print their own label under the signing line; nothing of ours may land on it."""
     out = documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], stamp)
     captions = [run for run in placed_text(out) if run.text.startswith("Signed 2026-03-17")]
     assert captions
     box = captions[0].box(PLAIN_FONT)
-    assert box.y1 <= SIG_RECT.y
-    assert box.y0 >= 0
+    assert box.inside(SIG_RECT)
+    marks = [run for run in placed_text(out) if run.text == "Ada Lovelace"]
+    assert marks
+    assert marks[0].box(SCRIPT_FONT).y0 >= box.y1
 
 
 def test_a_field_at_the_very_bottom_still_gets_its_caption_on_the_page(

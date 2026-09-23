@@ -97,24 +97,20 @@ def _caption_size_for(height: float) -> float:
 
 
 def _split(rect: Rect) -> _Band:
-    """Put the caption under the rect when there is room, otherwise inside its bottom.
+    """The mark on top, the caption along the bottom, both inside the rect.
 
-    Either way both bands stay on the page and never overlap, so a field near the bottom edge
-    still gets its caption instead of quietly losing it.
+    Nothing is ever drawn outside the rectangle the template or host declared. The space just
+    under a signing line is where forms print their own label ("Signature", "Date"), and a caption
+    put there lands on top of it; a generated report the host supplies is the same, and worse,
+    because nobody here has seen what is printed under its box. The rect is the whole claim.
+
+    ``validate_definitions`` keeps signature fields tall enough for this to be comfortable, but an
+    older template version could be smaller, so the split is clamped here rather than assumed
+    upstream. The caption shrinks before the mark does: an illegible signature is still a
+    signature, a missing caption is missing evidence.
     """
     caption_h = _caption_height()
     band = caption_h + _CAPTION_GAP
-    if rect.y >= band:
-        return _Band(
-            mark=rect,
-            caption=Rect(x=rect.x, y=rect.y - band, w=rect.w, h=caption_h),
-        )
-
-    # No room below: both bands go inside the rect, and neither may leave it.
-    # ``validate_definitions`` keeps signature fields tall enough for this to be comfortable, but an
-    # older template version could be smaller, so the split is clamped here rather than assumed
-    # upstream. The caption shrinks before the mark does: an illegible signature is still a
-    # signature, a missing caption is missing evidence.
     if rect.h - band >= _MIN_MARK_HEIGHT:
         return _Band(
             mark=Rect(x=rect.x, y=rect.y + band, w=rect.w, h=rect.h - band),
