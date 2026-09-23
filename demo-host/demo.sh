@@ -49,6 +49,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# A port already in use is the one failure this script cannot see afterwards: the process that
+# owns it answers /healthz, `wait_for` is satisfied, and the demo is driven against whatever was
+# already running -- an older build, another checkout -- while its own logs fill with "address
+# already in use". So it is checked before anything is started, and named.
+require_free() {  # require_free <port> <what>
+  if lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; then
+    fail "port $1 is already in use, so $2 cannot start there.
+Something is still running from an earlier demo (or another checkout). Stop it and try again:
+  lsof -nP -iTCP:$1 -sTCP:LISTEN"
+  fi
+}
+
 wait_for() {  # wait_for <url> <seconds> <what>
   local url="$1" limit="$2" what="$3" waited=0
   until curl -fsS -o /dev/null "$url" 2>/dev/null; do
@@ -59,6 +71,9 @@ wait_for() {  # wait_for <url> <seconds> <what>
     sleep 1
   done
 }
+
+require_free "$API_PORT" "the API"
+require_free "$DEMO_PORT" "the demo host"
 
 # ------------------------------------------------------------------ 1. database
 step "starting Postgres on 54329"
