@@ -13,6 +13,7 @@ import {
   TEXT_FIELD_MAX,
   withAdopted,
   withoutAdopted,
+  withoutInitialsMarks,
   withValue,
 } from "@/flow/draft";
 import type { SigningField } from "@/lib/signing-api";
@@ -56,15 +57,45 @@ describe("the signing draft", () => {
   });
 
   it("an optional field is never in the way; a required text needs real text", () => {
-    expect(isFieldComplete(field({ id: "n", type: "text", required: false }), undefined)).toBe(
-      true,
-    );
-    expect(isFieldComplete(field({ id: "n", type: "text" }), { type: "text", text: "   " })).toBe(
-      false,
-    );
-    expect(isFieldComplete(field({ id: "n", type: "text" }), { type: "text", text: "Yes" })).toBe(
-      true,
-    );
+    expect(
+      isFieldComplete(field({ id: "n", type: "text", required: false }), undefined, emptyDraft),
+    ).toBe(true);
+    expect(
+      isFieldComplete(field({ id: "n", type: "text" }), { type: "text", text: "   " }, emptyDraft),
+    ).toBe(false);
+    expect(
+      isFieldComplete(field({ id: "n", type: "text" }), { type: "text", text: "Yes" }, emptyDraft),
+    ).toBe(true);
+  });
+
+  /**
+   * An initials mark stands for the typed initials and nothing else (`buildCaptures` sends them
+   * as the capture's `typed_text`), so an emptied box leaves the mark standing for nothing. It
+   * used to count as done: the button signed, and the server refused the empty text with a 422
+   * whose advice -- choose your signature again -- named the wrong box.
+   */
+  it("initials are not in place when the initials box is empty", () => {
+    const initials = field({ id: "init", type: "initials" });
+    let draft = withAdopted(emptyDraft, { kind: "click" }, "MA");
+    draft = withValue(draft, "init", { type: "mark" });
+    expect(isFieldComplete(initials, draft.values.init, draft)).toBe(true);
+
+    const cleared = { ...draft, initials: "  " };
+    expect(isFieldComplete(initials, cleared.values.init, cleared)).toBe(false);
+    expect(remainingRequired([initials], cleared).map((f) => f.id)).toEqual(["init"]);
+    // ...and nothing empty goes over the wire even if a mark survives somewhere.
+    expect(buildCaptures([initials], cleared)).toEqual([]);
+  });
+
+  it("clearing the initials box un-places the marks that stood for them", () => {
+    let draft = withAdopted(emptyDraft, { kind: "click" }, "MA");
+    draft = withValue(draft, "init", { type: "mark" });
+    draft = withValue(draft, "sig", { type: "mark" });
+    draft = withValue(draft, "ack", { type: "checkbox", checked: true });
+    expect(withoutInitialsMarks(draft, fields).values).toEqual({
+      sig: { type: "mark" },
+      ack: { type: "checkbox", checked: true },
+    });
   });
 
   it("builds exactly the SPEC 9 capture shapes and nothing else", () => {

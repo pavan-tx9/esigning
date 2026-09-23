@@ -309,6 +309,75 @@ def test_the_most_recent_acceptance_is_the_one_that_stands(standing: Standing, d
     assert found.accepted_at == clock.now() - timedelta(seconds=60)
 
 
+def test_a_chain_of_acceptances_does_not_renew_the_span_one_document_at_a_time(
+    standing: Standing, db: Session, clock: FixedClock
+) -> None:
+    """The span bounds how long the disclosure may go undisplayed, not how far apart two documents
+    may be.
+
+    Each hop here is inside the span -- 840 seconds of a 900-second sitting -- so a rule that only
+    looked at the acceptance being relied on would let the queue run for ever: document 3 stands on
+    2, which stood on 1, and the notice was displayed once. What decides is the moment it *was*
+    displayed, so the third document asks again.
+    """
+    span = 900
+    hop = 840
+    bench = standing(span)
+    host = practice(bench, db)
+    bench.consent(db)
+    root = already_agreed(bench, db, host)
+
+    clock.advance(hop)
+    second = open_document(bench, db, host)
+    found = standing_of(bench, db, second)
+    assert found is not None, "one hop inside the span still stands"
+    assert found.envelope_id == root.envelope.id
+    bench.service.accept_consent(db, second.session, CONSENT_VERSION, CTX, relies_on_envelope_id=root.envelope.id)
+
+    clock.advance(hop)
+    third = open_document(bench, db, host)
+    assert standing_of(bench, db, third) is None
+    # ...and asking anyway is refused, whichever link of the chain is named.
+    refuses(bench, db, third, second.envelope.id)
+    refuses(bench, db, third, root.envelope.id)
+
+
+def test_a_standing_acceptance_carries_the_time_the_disclosure_was_displayed(
+    standing: Standing, db: Session, clock: FixedClock
+) -> None:
+    """The root travels with the chain, so it is read once and never recomputed by walking back.
+
+    ``accepted_at`` is what the UI shows ("you agreed at 09:12"); ``root_accepted_at`` is what the
+    span is measured against, and on the third document the two are different facts.
+    """
+    bench = standing(SITTING_SECONDS)
+    host = practice(bench, db)
+    bench.consent(db)
+    displayed_at = clock.now()
+    root = already_agreed(bench, db, host)
+
+    clock.advance(120)
+    second = open_document(bench, db, host)
+    bench.service.accept_consent(db, second.session, CONSENT_VERSION, CTX, relies_on_envelope_id=root.envelope.id)
+    agreed_again_at = clock.now()
+
+    clock.advance(120)
+    third = open_document(bench, db, host)
+    found = standing_of(bench, db, third)
+    assert found is not None
+    assert found.envelope_id == second.envelope.id, "the most recent acceptance is still the one relied on"
+    assert found.accepted_at == agreed_again_at
+    assert found.root_accepted_at == displayed_at
+
+    bench.service.accept_consent(db, third.session, CONSENT_VERSION, CTX, relies_on_envelope_id=second.envelope.id)
+    data = bench.event_data(db, third.envelope.id, "consent.accepted")
+    assert data["relied_on_envelope_id"] == str(second.envelope.id)
+    assert data["relied_on_accepted_at"] == canonical_value(agreed_again_at)
+    assert data["relied_on_root_accepted_at"] == canonical_value(displayed_at)
+    # The document the notice was displayed on names no root at all: it is one.
+    assert bench.event_data(db, root.envelope.id, "consent.accepted")["relied_on_root_accepted_at"] is None
+
+
 def test_the_consent_text_the_row_keeps_is_this_envelopes_own(standing: Standing, db: Session) -> None:
     """Standing consent changes where the *agreement* came from, not what this envelope records:
     the row, the event and the certificate all still name this envelope's disclosure."""

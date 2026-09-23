@@ -73,11 +73,23 @@ export function initialsFrom(displayName: string): string {
     .slice(0, 4);
 }
 
-export function isFieldComplete(field: SigningField, value: FieldValue | undefined): boolean {
+/**
+ * Whether this field is done. The draft is part of the question, not decoration: an initials mark
+ * stands for the signer's typed initials (`buildCaptures` sends them as the capture's typed text),
+ * so an initials box that has been emptied leaves the mark standing for nothing. Without this the
+ * screen counted it as done, the button signed, and the server refused the empty text with a 422
+ * whose advice -- choose your signature again -- pointed at the wrong box entirely.
+ */
+export function isFieldComplete(
+  field: SigningField,
+  value: FieldValue | undefined,
+  draft: Draft,
+): boolean {
   switch (field.type) {
     case "signature":
-    case "initials":
       return value?.type === "mark" || !field.required;
+    case "initials":
+      return (value?.type === "mark" && draft.initials.trim() !== "") || !field.required;
     case "checkbox":
       return !field.required || (value?.type === "checkbox" && value.checked);
     case "text":
@@ -89,8 +101,21 @@ export function isFieldComplete(field: SigningField, value: FieldValue | undefin
 
 export function remainingRequired(fields: SigningField[], draft: Draft): SigningField[] {
   return actionableFields(fields).filter(
-    (field) => field.required && !isFieldComplete(field, draft.values[field.id]),
+    (field) => field.required && !isFieldComplete(field, draft.values[field.id], draft),
   );
+}
+
+/** Drop the marks placed in initials fields, keeping every other answer. */
+export function withoutInitialsMarks(draft: Draft, fields: SigningField[]): Draft {
+  const initialsFields = new Set(
+    fields.filter((field) => field.type === "initials").map((field) => field.id),
+  );
+  const values = Object.fromEntries(
+    Object.entries(draft.values).filter(
+      ([id, value]) => !(initialsFields.has(id) && value.type === "mark"),
+    ),
+  );
+  return { ...draft, values };
 }
 
 /** Adopting a different signature un-applies the old one everywhere: applying is per field. */
@@ -148,8 +173,12 @@ export function buildCaptures(fields: SigningField[], draft: Draft): Capture[] {
       const adopted = draft.adopted;
       if (field.type === "initials") {
         // Initials are always the signer's typed initials: a full printed name or a full
-        // signature image does not belong in an initials box.
-        captures.push({ field_id: field.id, kind: "typed", typed_text: draft.initials });
+        // signature image does not belong in an initials box. Empty text is not initials at all,
+        // and the server refuses it; nothing is sent rather than something that cannot be honoured.
+        const initials = draft.initials.trim();
+        if (initials !== "") {
+          captures.push({ field_id: field.id, kind: "typed", typed_text: initials });
+        }
       } else if (adopted.kind === "click") {
         captures.push({ field_id: field.id, kind: "click" });
       } else if (adopted.kind === "typed") {

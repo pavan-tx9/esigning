@@ -303,7 +303,7 @@ test("a signing queue advances by itself, and stops when asked", async ({ page }
   await shot(page, "22-queue-countdown");
 
   // Staying is a button, not a timer that stops if you happen to touch the screen.
-  await ui.getByRole("button", { name: "Stay here" }).click();
+  await ui.getByRole("button", { name: /^Stay/ }).click();
   await expect(ui.getByRole("button", { name: "Open Order for T. N." })).toBeVisible();
   await shot(page, "23-queue-stayed");
   await page.waitForTimeout(6_000);

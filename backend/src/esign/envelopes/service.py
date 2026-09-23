@@ -293,6 +293,9 @@ class EnvelopeServiceImpl:
                 display_name=signer.display_name,
                 capacity=signer.capacity,
                 on_behalf_of=signer.on_behalf_of,
+                # PHI, like ``display_name``: shown to the signer acting for this person and
+                # printed in the document, never in the trail (``0504``).
+                on_behalf_of_display=signer.on_behalf_of_display,
                 order_index=role.order_index,
                 # The same standing rule as ``create``: a clinician re-authenticates whatever the
                 # role says, and here the role came from the request, so it matters more.
@@ -463,6 +466,9 @@ class EnvelopeServiceImpl:
                 display_name=signer.display_name,
                 capacity=signer.capacity,
                 on_behalf_of=signer.on_behalf_of,
+                # PHI, like ``display_name``: shown to the signer acting for this person and
+                # printed in the document, never in the trail (``0504``).
+                on_behalf_of_display=signer.on_behalf_of_display,
                 order_index=role.order_index,
                 # From the role, never from the request -- and a clinician re-authenticates
                 # whatever the role says. ``validate_definitions`` refuses to publish a
@@ -593,7 +599,7 @@ class EnvelopeServiceImpl:
             page_count=self._page_count(db, loaded.envelope.id, current),
             expires_at=loaded.envelope.expires_at,
             signer=self._signer_view(loaded, signer),
-            on_behalf_of_label=signer.on_behalf_of,
+            on_behalf_of_label=_on_behalf_of_label(signer),
             reauth_valid_until=self._reauth_valid_until(fresh),
             # Addendum 1 C: the UI skips the hand-off while this is in the future, so it has to be
             # told whether the attestation behind it belongs to this session or was borrowed, and
@@ -799,9 +805,13 @@ class EnvelopeServiceImpl:
                 "locale": current.locale,
                 "body_sha256": current.body_sha256,
                 # Addendum 3 C: where this acceptance came from, when it came from earlier in the
-                # sitting. Both null otherwise, which is every acceptance while the span is off.
+                # sitting -- the acceptance relied on, and the time the disclosure was actually
+                # displayed, carried forward from the head of the chain so the record says how
+                # long ago the person read it rather than only who they agreed with last. All
+                # three null otherwise, which is every acceptance while the span is off.
                 "relied_on_envelope_id": None if standing is None else standing.envelope_id,
                 "relied_on_accepted_at": None if standing is None else standing.accepted_at,
+                "relied_on_root_accepted_at": None if standing is None else standing.root_accepted_at,
             },
         )
         log.info(
@@ -853,7 +863,7 @@ class EnvelopeServiceImpl:
             signer_id=signer.id,
             display_name=signer.display_name,
             capacity=signer.capacity,
-            on_behalf_of_label=signer.on_behalf_of,
+            on_behalf_of_label=_on_behalf_of_label(signer),
             signed_at=now,  # server time; the client never supplies a date_signed value
         )
         stamped = self._documents.apply_signer_marks(base_pdf, list(mine), list(accepted), stamp)
@@ -1640,6 +1650,10 @@ class EnvelopeServiceImpl:
             # from configuration: what the span was set to that afternoon is not recoverable, and
             # the certificate has to be able to say this years later.
             consent_relied_on=consented.data.get("relied_on_envelope_id") is not None,
+            # ...and when they were actually shown it, so the line can say how much earlier rather
+            # than leaving "earlier in the sitting" to stand for anything up to the cap.
+            consent_displayed_at=_event_timestamp(consented.data.get("relied_on_root_accepted_at"))
+            or _event_timestamp(consented.data.get("relied_on_accepted_at")),
             viewed_at=viewed.occurred_at,
             consented_at=consented.occurred_at,
             signed_at=signed.occurred_at,
@@ -2000,24 +2014,68 @@ class EnvelopeServiceImpl:
         kiosk session, because a shared tablet is not a sitting -- the next person to hold it is
         somebody else. The rest -- same person, same host, same disclosure, inside the span, not
         given from a kiosk session, not this envelope -- is ``repo.standing_consent``.
+
+        A third happens after the row is found, and it is the one that makes the span a bound on
+        anything: the candidate may itself have stood on an earlier acceptance, so the span is
+        measured from the acceptance where the disclosure was last actually *displayed*
+        (``_consent_displayed_at``), not from the candidate. Without it document N stands on N-1
+        inside the span, N-1 stood on N-2 inside the span, and the window renews itself one
+        document at a time -- a queue could run for a day on one display of the notice while every
+        individual hop looked lawful, which is exactly what the cap is quoted as preventing.
         """
         if self._settings.consent_span_seconds <= 0 or session.kiosk is not None:
             return None
         current = consent or self._identity.current_consent(db, locale or self._settings.default_locale)
         now = self._clock.now()
+        span = timedelta(seconds=self._settings.consent_span_seconds)
         found = repo.standing_consent(
             db,
             host_id=loaded.envelope.host_id,
             host_user_id=signer.host_user_id,
             consent_text_id=current.id,
-            since=now - timedelta(seconds=self._settings.consent_span_seconds),
+            since=now - span,
             now=now,
             asking_envelope_id=loaded.envelope.id,
             envelope_id=envelope_id,
         )
         if found is None:
             return None
-        return StandingConsent(envelope_id=found.envelope_id, accepted_at=found.consented_at)
+        root = self._consent_displayed_at(db, found)
+        if root is None or now - root > span:
+            # The sitting is over, counted from the one time the person read the notice. The UI
+            # shows the checkbox again, and a client that asks to rely on this anyway is refused.
+            return None
+        return StandingConsent(envelope_id=found.envelope_id, accepted_at=found.consented_at, root_accepted_at=root)
+
+    def _consent_displayed_at(self, db: Session, acceptance: repo.ConsentAcceptance) -> datetime | None:
+        """When the disclosure behind this acceptance was last displayed, from the trail.
+
+        Read from the earlier envelope's own ``consent.accepted`` rather than from its ``signers``
+        row: the row says when the person agreed, and only the append-only event says whether they
+        were shown the notice then or were themselves standing on something earlier. An acceptance
+        that carries ``relied_on_root_accepted_at`` hands that root straight on, so the chain is
+        walked once at the moment it is created and never again -- every link holds the same root.
+
+        ``None`` when the earlier envelope has no such event for that signer, which stops the
+        acceptance standing: the row and the event are written in one transaction, so a row with no
+        event is damage, and an acceptance nothing in the trail accounts for is not one to lean a
+        second signature on. An event from before the root was carried falls back to
+        ``relied_on_accepted_at`` -- not the full bound, but the acceptance it names is the nearest
+        thing to a display that trail records.
+        """
+        event = _first_event(
+            self._audit.list(db, "envelope", acceptance.envelope_id),
+            EventType.CONSENT_ACCEPTED,
+            acceptance.signer_id,
+        )
+        if event is None:
+            return None
+        if event.data.get("relied_on_envelope_id") is None:
+            # The notice was displayed on that document: the acceptance is its own root.
+            return acceptance.consented_at
+        return _event_timestamp(event.data.get("relied_on_root_accepted_at")) or _event_timestamp(
+            event.data.get("relied_on_accepted_at")
+        )
 
     def _require_fresh_reauth(
         self, db: Session, loaded: _Loaded, signer: repo.SignerRow, session: SessionInfo
@@ -2350,12 +2408,32 @@ def _signer_actor(signer: repo.SignerRow) -> Actor:
     )
 
 
+def _on_behalf_of_label(signer: repo.SignerRow) -> str | None:
+    """Who this signer acts for, in the words a person reads.
+
+    ``on_behalf_of`` is the envelope's ``patient_ref`` and is required to be opaque, because it is
+    what reaches the audit trail. Since Addendum 3 A the primary button carries the whole of the
+    intent confirmation -- "Sign as Grace Okafor, on behalf of ..." -- so an unreadable reference
+    there is a sentence a parent cannot check before performing the act it describes. The host may
+    supply its own words for the same person; the attribution in the record does not move.
+    """
+    return signer.on_behalf_of_display or signer.on_behalf_of
+
+
 def _check_on_behalf_of(signer: NewSigner, patient_ref: str) -> None:
     needs = signer.capacity in ("guardian", "proxy")
     if needs and not signer.on_behalf_of:
         raise ValidationFailed("a guardian or proxy must say who they act for", code="on_behalf_of_required")
     if not needs and signer.on_behalf_of:
         raise ValidationFailed("only a guardian or proxy acts on behalf of someone", code="on_behalf_of_not_allowed")
+    if signer.on_behalf_of_display and not signer.on_behalf_of:
+        # A name for somebody this signer is not acting for. The column's CHECK refuses it too;
+        # this is the refusal the host gets to read, with a code of its own so "you sent a display
+        # name" is never mistaken for "you sent on_behalf_of on a signer who may not have one".
+        raise ValidationFailed(
+            "only a guardian or proxy names the person they act for",
+            code="on_behalf_of_display_not_allowed",
+        )
     if needs and signer.on_behalf_of != patient_ref:
         # The schema says on_behalf_of is the envelope's patient_ref. A different value would
         # attribute the signature to somebody who is not on this document.
@@ -2536,6 +2614,23 @@ def _reauth_at(signed: AuditEvent) -> datetime | None:
     if age is None:
         return None
     return signed.occurred_at - timedelta(seconds=int(age))
+
+
+def _event_timestamp(value: Any) -> datetime | None:
+    """An instant read back out of stored audit ``data``, or ``None`` when it is not one.
+
+    ``data`` is canonical JSON, so a timestamp comes back as RFC 3339 UTC with a ``Z``. Anything
+    else was not written by this service, and every caller here treats "not a time" as "no time"
+    rather than computing with it -- which, for standing consent, means the acceptance does not
+    stand instead of standing on a value nobody can read.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _age_seconds(now: datetime, auth_time: datetime) -> int:

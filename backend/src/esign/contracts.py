@@ -341,6 +341,13 @@ class CertificateSigner:
     #: document, which is a thing a reader of the certificate must be told rather than left to
     #: infer from two identical-looking timestamps.
     consent_relied_on: bool = False
+    #: Addendum 3 C: when the disclosure this signer agreed to was actually displayed to them --
+    #: the root of the chain ``consent.accepted`` carries as ``relied_on_root_accepted_at``.
+    #: ``None`` when ``consent_relied_on`` is false (the notice was displayed on this document)
+    #: and for an acceptance recorded before the root was carried. The certificate prints it
+    #: beside ``consented_at``, so a reader can see how long before the agreement the person read
+    #: the notice rather than being told only that it was "earlier".
+    consent_displayed_at: datetime | None = None
 
 
 #: Addendum 1 A. What the attesting staff member says about the scan. ``true_copy`` is the only
@@ -990,6 +997,16 @@ class NewSigner:
     display_name: str
     capacity: Capacity
     on_behalf_of: str | None = None
+    #: How the person this signer acts for should be *named* to them. ``on_behalf_of`` is the
+    #: envelope's ``patient_ref``, which is required to be opaque (``is_opaque_id``) because it
+    #: reaches the audit trail -- so the only thing the signing UI could put in front of a parent
+    #: was an internal reference ("on behalf of mrn-100907"), in the one sentence that stands for
+    #: their intent to sign. This is the host's own words for the same person, and it is treated
+    #: exactly like ``display_name``: it lives in the database and in the PDF, and never in audit
+    #: ``data``, a webhook payload, a log line or an error message. Only a guardian or proxy may
+    #: carry one (``on_behalf_of_display_not_allowed``); absent, the UI falls back to
+    #: ``on_behalf_of`` as it did before.
+    on_behalf_of_display: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1164,6 +1181,18 @@ class StandingConsent:
 
     envelope_id: UUID
     accepted_at: datetime
+    #: Addendum 3 C: when the disclosure was last actually *displayed* to this person -- the
+    #: acceptance at the head of the chain this one belongs to. For an acceptance the signer gave
+    #: after reading the notice it is ``accepted_at`` itself; for one that already stood on an
+    #: earlier acceptance it is that earlier acceptance's root, carried forward unchanged.
+    #:
+    #: The span is measured from here, not from ``accepted_at``. Without that, document N stands
+    #: on N-1, which stood on N-2, and each recording renews the window: the disclosure could go
+    #: undisplayed for a whole day inside a service configured for fifteen minutes. The chain is
+    #: allowed -- each document names the acceptance it actually rested on -- but its total length
+    #: is ``CONSENT_SPAN_SECONDS`` counted from the one display, which is the number compliance
+    #: was quoted.
+    root_accepted_at: datetime
 
 
 @dataclass(frozen=True)
@@ -1177,6 +1206,12 @@ class SigningView:
     page_count: int
     expires_at: datetime
     signer: SignerView
+    #: Who this signer is acting for, in the words the UI shows: the host-supplied
+    #: ``NewSigner.on_behalf_of_display`` when there is one, and the opaque ``on_behalf_of``
+    #: otherwise. ``None`` for a signer acting for themselves. Addendum 3 A makes "Sign as <name>,
+    #: on behalf of <this>" the single act that signs the document and the whole of the intent
+    #: confirmation, so it is a label for a person to read, never an assertion about the record --
+    #: the trail's attribution stays the opaque ``on_behalf_of``.
     on_behalf_of_label: str | None
     reauth_valid_until: datetime | None  # from fresh_reauth: covers a span attestation too
     other_signers: tuple[tuple[str, SignerStatus], ...]  # (role_label, status); never a name
@@ -1331,14 +1366,19 @@ class EnvelopeService(Protocol):
         electronically at 09:12" instead of the checkbox. The acceptance is still *recorded here*:
         ``signers.consent_text_id`` and ``consented_at`` are set on this envelope exactly as they
         are without it, and ``consent.accepted`` is appended to this envelope's stream, carrying
-        ``relied_on_envelope_id`` and ``relied_on_accepted_at`` so the shortcut is evidence rather
-        than an absence. What it is not is an assertion the client gets to make: the server
-        re-finds the standing acceptance under the same rules that offered it (the signer's own
-        ``(host_id, host_user_id)``, the same consent text, inside ``CONSENT_SPAN_SECONDS``,
-        neither session a kiosk one, and a different envelope of the same host), and anything that
-        does not match is Conflict (``consent_not_standing``) -- on which the UI falls back to the
-        checkbox and posts again without it. Omitted, this method behaves exactly as it did before
-        the addendum, whatever the span is set to."""
+        ``relied_on_envelope_id``, ``relied_on_accepted_at`` and ``relied_on_root_accepted_at`` so
+        the shortcut is evidence rather than an absence. What it is not is an assertion the client
+        gets to make: the server re-finds the standing acceptance under the same rules that
+        offered it (the signer's own ``(host_id, host_user_id)``, the same consent text, inside
+        ``CONSENT_SPAN_SECONDS``, neither session a kiosk one, and a different envelope of the
+        same host), and anything that does not match is Conflict (``consent_not_standing``) -- on
+        which the UI falls back to the checkbox and posts again without it.
+
+        The span is measured from the acceptance where the disclosure was last *displayed*
+        (``StandingConsent.root_accepted_at``), not from the acceptance being relied on: a chain
+        of documents each standing on the one before may not renew the window a document at a
+        time. Omitted, this method behaves exactly as it did before the addendum, whatever the
+        span is set to."""
 
     def sign(self, db: Session, session: SessionInfo, captures: list[Capture], ctx: RequestContext) -> EnvelopeView:
         """Requires viewed + consented, and a fresh re-authentication when the role demands it.

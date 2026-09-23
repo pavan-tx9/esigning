@@ -130,6 +130,9 @@ class SignerRow:
     order_index: int
     requires_reauth: bool
     status: SignerStatus
+    #: The host's own words for the person ``on_behalf_of`` names (``0504``). PHI, like
+    #: ``display_name``: the database and the signing UI, never audit data, a webhook or a log.
+    on_behalf_of_display: str | None
     consent_text_id: UUID | None
     viewed_at: datetime | None
     consented_at: datetime | None
@@ -261,6 +264,7 @@ def _signer(row: Any) -> SignerRow:
         order_index=int(row.order_index),
         requires_reauth=bool(row.requires_reauth),
         status=str(row.status),  # type: ignore[arg-type]  # CHECK-constrained in the schema
+        on_behalf_of_display=None if row.on_behalf_of_display is None else str(row.on_behalf_of_display),
         consent_text_id=_opt_uuid(row.consent_text_id),
         viewed_at=_opt_utc(row.viewed_at),
         consented_at=_opt_utc(row.consented_at),
@@ -286,7 +290,9 @@ _ENVELOPE_COLUMNS = (
 _SIGNER_COLUMNS = (
     "id, envelope_id, role_key, host_user_id, display_name, capacity, on_behalf_of, order_index, "
     "requires_reauth, status, consent_text_id, viewed_at, consented_at, signed_at, declined_at, "
-    "decline_reason_code, viewed_sha256"
+    "decline_reason_code, viewed_sha256, "
+    # 0504: how the person ``on_behalf_of`` names is shown to the signer who acts for them.
+    "on_behalf_of_display"
 )
 
 
@@ -451,13 +457,14 @@ def insert_signer(
     on_behalf_of: str | None,
     order_index: int,
     requires_reauth: bool,
+    on_behalf_of_display: str | None = None,
 ) -> None:
     db.execute(
         text(
             "INSERT INTO signers (id, envelope_id, role_key, host_user_id, display_name, capacity, "
-            "  on_behalf_of, order_index, requires_reauth, status) "
+            "  on_behalf_of, on_behalf_of_display, order_index, requires_reauth, status) "
             "VALUES (:id, :env, :role_key, :host_user_id, :display_name, :capacity, :on_behalf_of, "
-            "  :order_index, :requires_reauth, 'pending')"
+            "  :on_behalf_of_display, :order_index, :requires_reauth, 'pending')"
         ),
         {
             "id": signer_id,
@@ -467,6 +474,7 @@ def insert_signer(
             "display_name": display_name,
             "capacity": capacity,
             "on_behalf_of": on_behalf_of,
+            "on_behalf_of_display": on_behalf_of_display,
             "order_index": order_index,
             "requires_reauth": requires_reauth,
         },

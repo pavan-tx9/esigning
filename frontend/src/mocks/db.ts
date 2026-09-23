@@ -36,6 +36,10 @@ export const SCENARIOS = {
     "A clinician's signing queue (addendum 3 B): three one-page orders, one confirmation of identity covering all of them, consent already given for the first. Three taps a document.",
   "standing-consent":
     "A patient who agreed to sign electronically a few minutes ago, for an earlier document in the same sitting. The Read screen states that instead of asking again.",
+  guardian:
+    "A parent signing for her child. The one act that signs the document names the child, in the words the host sent for him and not the chart reference the record keeps.",
+  "guardian-ref":
+    "The same parent, on a host that sent no name for the child: all the session has is the opaque reference, so the sentence she confirms points at the document instead of reciting it.",
   "first-time":
     "A signer with nothing on file: no saved signature and no standing consent. The signature panel opens on the chooser and the box is unticked.",
   "reauth-press":
@@ -529,6 +533,27 @@ export function documentFor(record: MockRecord, sealed = false): Uint8Array {
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
+/**
+ * The child a guardian scenario's signer acts for, in the host's own words
+ * (`NewSigner.on_behalf_of_display`, SPEC section 16 A). The record's own attribution is the
+ * opaque `on_behalf_of` and never this, which is exactly why the UI has to be handed it: the
+ * reference is unreadable, and the press of "Sign as ..." is the whole intent confirmation.
+ */
+export const GUARDIAN_CHILD_NAME = "Sam Okafor";
+/** The same child as the record has him: the envelope's `patient_ref`, held to `is_opaque_id`. */
+export const GUARDIAN_CHILD_REF = "mrn-100907";
+
+/**
+ * Who this signer acts for, as the host left it: its own words when it sent them, and otherwise
+ * the opaque reference, which is all `GET /signing/session` can report (SPEC section 9).
+ */
+const onBehalfOfLabelFor = (scenario: Scenario): string | null =>
+  scenario === "guardian"
+    ? GUARDIAN_CHILD_NAME
+    : scenario === "guardian-ref"
+      ? GUARDIAN_CHILD_REF
+      : null;
+
 export const ENVELOPE_ID = "6f1c1a52-4a0e-4c59-9d7e-0a4d5f6b7c81";
 export const SIGNER_ID = "0b9d7f3e-2c41-4f7a-8a55-3e1f2d4c5b6a";
 /** The envelope a standing acceptance was given for: an earlier document, already signed. */
@@ -554,6 +579,8 @@ export function queuePositionOf(record: MockRecord): number | null {
 
 export function sessionBody(record: MockRecord) {
   const clinician = isClinician(record.scenario);
+  const actingFor = onBehalfOfLabelFor(record.scenario);
+  const guardian = actingFor !== null;
   const kiosk = record.scenario === "kiosk";
   const others =
     record.scenario === "multi"
@@ -589,10 +616,10 @@ export function sessionBody(record: MockRecord) {
     },
     signer: {
       id: SIGNER_ID,
-      display_name: clinician ? "Dr. Priya Raman" : "Maria Alvarez",
-      role_label: clinician ? "Clinician" : "Patient",
-      capacity: clinician ? "clinician" : "self",
-      on_behalf_of_label: null,
+      display_name: clinician ? "Dr. Priya Raman" : guardian ? "Grace Okafor" : "Maria Alvarez",
+      role_label: clinician ? "Clinician" : guardian ? "Patient or guardian" : "Patient",
+      capacity: clinician ? "clinician" : guardian ? "guardian" : "self",
+      on_behalf_of_label: actingFor,
       status: record.signerStatus,
       requires_reauth: clinician,
       reauth_valid_until: reauthUntil === null ? null : iso(reauthUntil),

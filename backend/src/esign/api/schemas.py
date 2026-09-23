@@ -80,6 +80,13 @@ class SignerBody(_Body):
     display_name: str = Field(max_length=200)
     capacity: Capacity
     on_behalf_of: str | None = Field(default=None, max_length=128)
+    #: How the person ``on_behalf_of`` names should be shown to this signer. ``on_behalf_of`` is
+    #: the envelope's ``patient_ref`` and has to be opaque, because it reaches the audit trail;
+    #: this is the host's own words for the same person, and the signing UI shows it in the
+    #: sentence on the sign button. PHI, and bounded like ``display_name``: it is stored on the
+    #: signer row and printed in the document, and never reaches audit ``data``, a webhook, a log
+    #: line or an error message. Only a guardian or proxy may carry one.
+    on_behalf_of_display: str | None = Field(default=None, max_length=200)
 
 
 class NewEnvelopeBody(_Body):
@@ -107,6 +114,7 @@ class NewEnvelopeBody(_Body):
                     display_name=s.display_name,
                     capacity=s.capacity,
                     on_behalf_of=s.on_behalf_of,
+                    on_behalf_of_display=s.on_behalf_of_display,
                 )
                 for s in self.signers
             ),
@@ -249,6 +257,7 @@ class NewHostDocumentEnvelopeBody(_Body):
                     display_name=s.display_name,
                     capacity=s.capacity,
                     on_behalf_of=s.on_behalf_of,
+                    on_behalf_of_display=s.on_behalf_of_display,
                 )
                 for s in self.signers
             ),

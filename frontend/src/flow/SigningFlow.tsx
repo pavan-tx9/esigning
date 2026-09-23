@@ -29,6 +29,7 @@ import { hasSessionToken, setSessionToken } from "@/lib/api";
 import type { ParentChannel, QueuePosition } from "@/lib/embed";
 import {
   isNetworkError,
+  onBehalfOfPhrase,
   type SigningSession,
   SubmissionKeys,
   sessionQueryOptions,
@@ -126,9 +127,20 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
         return;
       }
       if (message.type === "esign:init") {
-        // One token per page load. A second init is ignored rather than swapping identities.
-        if (hasSessionToken() || stateRef.current.phase !== "connecting") {
+        const current = stateRef.current;
+        /**
+         * The next document of a run (addendum 3 B, INTEGRATION.md section 9): the host answers
+         * `esign:next` by opening the next envelope into this same iframe. Accepted only once this
+         * one is finished with -- never mid-signature, where it would be an identity swap -- and
+         * everything about the finished document goes first, so nothing of one signer's session
+         * can be read by the next.
+         */
+        const finished = current.phase === "active" && current.step === "done";
+        if (!finished && (hasSessionToken() || current.phase !== "connecting")) {
           return;
+        }
+        if (finished) {
+          wipe();
         }
         setSessionToken(message.token);
         setLocale(message.locale ?? null);
@@ -142,7 +154,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [channel]);
+  }, [channel, wipe]);
 
   // ------------------------------------------------------------------ connecting
   useEffect(() => {
@@ -208,6 +220,20 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
     }
   }, [phase, channel, wipe]);
 
+  /**
+   * Coming back from the paper-path detour. The step was never unmounted, so its own heading-takes
+   * -focus effect will not run again: without this, closing the sheet would drop focus to the
+   * document and a keyboard user would restart at the top of the page.
+   */
+  const wasDeclining = useRef(false);
+  useEffect(() => {
+    const open = state.phase === "active" && state.declining;
+    if (wasDeclining.current && !open) {
+      shell.current?.querySelector<HTMLElement>("[data-step-heading]")?.focus?.();
+    }
+    wasDeclining.current = open;
+  });
+
   // ------------------------------------------------------------------ iframe height
   useEffect(() => {
     const node = shell.current;
@@ -249,14 +275,6 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
       />
     ) : (
       <ConnectingScreen />
-    );
-  } else if (state.declining) {
-    body = (
-      <DeclineStep
-        session={session}
-        onBack={() => dispatch({ type: "DECLINE_CLOSED" })}
-        onDeclined={() => dispatch({ type: "DECLINED", kiosk: session.session.kiosk })}
-      />
     );
   } else {
     const kiosk = session.session.kiosk;
@@ -314,11 +332,31 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
       ),
       done: <DoneStep session={session} locale={locale} queue={queue} />,
     };
-    body = steps[state.step];
+    /**
+     * The paper path is a detour, not a step: the step stays mounted behind it. Replacing it
+     * would throw away everything the step is holding that the draft is not -- ink on the
+     * signature pad, chiefly -- so somebody who opens "I'd rather sign on paper" to read what it
+     * means and comes back finds an empty box where their signature was. The flow already hoisted
+     * `pagesSeen` out of the Read step for exactly this reason.
+     */
+    body = (
+      <>
+        <div hidden={state.declining}>{steps[state.step]}</div>
+        {state.declining ? (
+          <DeclineStep
+            session={session}
+            onBack={() => dispatch({ type: "DECLINE_CLOSED" })}
+            onDeclined={() => dispatch({ type: "DECLINED", kiosk: session.session.kiosk })}
+          />
+        ) : null}
+      </>
+    );
   }
 
-  const activeStep = state.phase === "active" && !state.declining ? state.step : null;
-  const showPaperPath = session !== undefined && activeStep !== null && activeStep !== "done";
+  const activeStep = state.phase === "active" ? state.step : null;
+  const declining = state.phase === "active" && state.declining;
+  const showPaperPath =
+    session !== undefined && activeStep !== null && activeStep !== "done" && !declining;
 
   return (
     <HostLinkContext.Provider value={hostLink}>
@@ -332,10 +370,9 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
           {state.phase === "active" && session !== undefined && activeStep !== "done" ? (
             <DeadlineWatch session={session} />
           ) : null}
-          {/* Keyed so each step mounts fresh and its heading takes focus. */}
-          <div key={`${state.phase}:${activeStep ?? (state.phase === "active" ? "decline" : "")}`}>
-            {body}
-          </div>
+          {/* Keyed so each step mounts fresh and its heading takes focus. The paper-path detour
+              is deliberately not part of the key: it leaves the step mounted underneath. */}
+          <div key={`${state.phase}:${activeStep ?? ""}`}>{body}</div>
           {/* Visible on both screens before Done, as the addendum requires: the way out of an
               electronic signature is never more than one quiet link away. */}
           {showPaperPath ? (
@@ -368,6 +405,8 @@ function Masthead({
   queue: QueuePosition | null;
 }) {
   const index = step === null ? -1 : STEPS.indexOf(step);
+  const actingFor =
+    session === undefined ? null : onBehalfOfPhrase(session.signer.on_behalf_of_label);
   return (
     <header className="border-edge border-b bg-sheet px-4 py-3 sm:px-6">
       <div className="mx-auto flex max-w-3xl flex-wrap items-end justify-between gap-x-6 gap-y-2">
@@ -392,9 +431,7 @@ function Masthead({
               </p>
               <p className="text-ink-700 text-sm" data-testid="signing-as">
                 Signing as {session.signer.display_name} · {session.signer.role_label}
-                {session.signer.on_behalf_of_label
-                  ? `, on behalf of ${session.signer.on_behalf_of_label}`
-                  : ""}
+                {actingFor === null ? "" : `, ${actingFor}`}
               </p>
             </>
           ) : null}

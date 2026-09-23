@@ -7,6 +7,7 @@ import { hasSessionToken, setSessionToken } from "@/lib/api";
 import { ParentChannel } from "@/lib/embed";
 import {
   EARLIER_ENVELOPE_ID,
+  GUARDIAN_CHILD_NAME,
   liveSavedSignature,
   type MockRecord,
   mockDb,
@@ -369,6 +370,74 @@ describe("the whole flow for one patient", () => {
     ]);
   }, 25_000);
 
+  /**
+   * "2 of 3 done" is the count the sign button uses, or it is a lie: a value in a field is not
+   * the same as a field that is finished. An unticked required box keeps its value rather than
+   * clearing it, so it used to keep counting as done while the button stayed inert underneath.
+   */
+  it("counts a field as done only where the sign button agrees it is", async () => {
+    await start("single");
+    await readAndContinue();
+    await choosePrintedName();
+    const box = screen.getByRole("checkbox", { name: /Notice of Privacy/ });
+    await user.click(box);
+    await click("Sign here");
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("2 of 2");
+
+    await user.click(box);
+    expect(box).not.toBeChecked();
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("1 of 2");
+    await click("Sign as Maria Alvarez");
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent("One thing is still needed");
+    expect(mockDb.peek("single")?.signRequests).toHaveLength(0);
+  }, 20_000);
+
+  /**
+   * An initials mark stands for the typed initials and nothing else. Emptying the box used to
+   * leave the row saying "Initials in place", the counter saying everything was done, and the
+   * server refusing `typed_text: ""` with a 422 whose advice named the wrong box entirely.
+   */
+  it("clearing the initials box un-places them instead of sending empty text", async () => {
+    await start("multi");
+    await readAndContinue();
+    await choosePrintedName();
+    await click("Add initials");
+    await click("Sign here");
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("2 of 3");
+
+    await user.clear(screen.getByLabelText("Your initials"));
+    expect(screen.queryByText("Initials in place")).toBeNull();
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("1 of 3");
+
+    await click("Sign as Maria Alvarez");
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent(/One thing is still needed/);
+    expect(mockDb.peek("multi")?.signRequests).toHaveLength(0);
+
+    // Typing them again is all it takes, and the mark has to be made again on purpose.
+    await user.type(screen.getByLabelText("Your initials"), "MA");
+    await click("Add initials");
+    await click("Sign as Maria Alvarez");
+    await screen.findByTestId("waiting-on-others");
+    expect(sent("multi").captures).toContainEqual({
+      field_id: "patient_initials_risks",
+      kind: "typed",
+      typed_text: "MA",
+    });
+  }, 25_000);
+
+  /** Pressing a field's button swaps it for another one; focus must not fall to the document. */
+  it("leaves focus in the row whose button was pressed", async () => {
+    await start("single");
+    await readAndContinue();
+    await choosePrintedName();
+    await click("Sign here");
+    const remove = screen.getByRole("button", { name: "Remove" });
+    expect(remove).toHaveFocus();
+
+    await user.click(remove);
+    expect(screen.getByRole("button", { name: "Sign here" })).toHaveFocus();
+  }, 20_000);
+
   it("a field can be undone, and the count and the sign button follow", async () => {
     await start("single");
     await readAndContinue();
@@ -432,6 +501,62 @@ describe("the short path", () => {
     });
     // Nothing was ever asked of the host page beyond the queue itself.
     expect(types(host)).not.toContain("esign:reauth_required");
+  }, 25_000);
+});
+
+/**
+ * Addendum 3 A made the press of "Sign as ..." the single act that signs the document and the
+ * whole of the intent confirmation. For a parent that sentence names their child, so it has to be
+ * a sentence they can read: the host sends `on_behalf_of_display` and the UI shows those words.
+ * Nothing about the record moves -- the trail's attribution is still the opaque `on_behalf_of`.
+ */
+describe("a parent signing for a child", () => {
+  it("names the child in the sentence the press confirms", async () => {
+    await start("guardian");
+    const signAs = `Sign as Grace Okafor, on behalf of ${GUARDIAN_CHILD_NAME}`;
+
+    expect(await screen.findByTestId("signing-as")).toHaveTextContent(
+      `Signing as Grace Okafor · Patient or guardian, on behalf of ${GUARDIAN_CHILD_NAME}`,
+    );
+    await readAndContinue();
+    await choosePrintedName();
+    await user.click(await screen.findByRole("checkbox", { name: /Notice of Privacy/ }));
+    await click("Sign here");
+    await click(signAs);
+
+    await screen.findByTestId("step-done");
+    const record = mockDb.peek("guardian");
+    expect(record?.signerStatus).toBe("signed");
+    // The words are a display decision and only that: nothing about the child goes over the wire.
+    expect(record?.signRequests[0]?.body).not.toContain(GUARDIAN_CHILD_NAME);
+    expect(JSON.parse(record?.signRequests[0]?.body ?? "{}")).toEqual({
+      intent_confirmed: true,
+      captures: [
+        { field_id: "ack_received", checked: true },
+        { field_id: "patient_sig", kind: "click" },
+      ],
+    });
+  }, 25_000);
+
+  /**
+   * A host that sends no display name leaves the opaque `on_behalf_of` as the label. Reciting a
+   * chart reference is not an intent anybody can check, so the sentence points at the document,
+   * which is open above it and does name the patient.
+   */
+  it("points at the document when all the host sent was a reference", async () => {
+    await start("guardian-ref");
+    expect(await screen.findByTestId("signing-as")).toHaveTextContent(
+      "Signing as Grace Okafor · Patient or guardian, for the patient named in this document",
+    );
+    await readAndContinue();
+    await choosePrintedName();
+    await user.click(await screen.findByRole("checkbox", { name: /Notice of Privacy/ }));
+    await click("Sign here");
+    expect(
+      screen.getByRole("button", {
+        name: "Sign as Grace Okafor, for the patient named in this document",
+      }),
+    ).toBeInTheDocument();
   }, 25_000);
 });
 
@@ -528,7 +653,8 @@ describe("a signing queue", () => {
     const host = await start("queue", queueInit(1));
     await signIt(host);
 
-    await click("Stay here");
+    // The copy of this one is still sealing, and staying is what saves it: the button says so.
+    await click("Stay and save my copy");
     expect(screen.queryByText(/Opening in/)).toBeNull();
     // Well past the countdown, and nothing was asked of the host.
     await new Promise((resolve) => setTimeout(resolve, QUEUE_COUNTDOWN_WAIT_MS));
@@ -545,6 +671,108 @@ describe("a signing queue", () => {
     expect(screen.queryByTestId("queue-next")).toBeNull();
     await new Promise((resolve) => setTimeout(resolve, QUEUE_COUNTDOWN_WAIT_MS));
     expect(types(host)).not.toContain("esign:next");
+  }, 25_000);
+
+  /**
+   * INTEGRATION.md section 9: "post a fresh `esign:init` into the same iframe". Nothing there
+   * says the frame is reloaded first, and a host that did exactly what it says used to get
+   * silence -- the second init was dropped and the signer sat on the Done screen for ever.
+   */
+  it("accepts the next document's token posted into the same frame", async () => {
+    const host = await start("queue", queueInit(1));
+    await signIt(host);
+    await waitFor(() => expect(types(host)).toContain("esign:next"), { timeout: 10_000 });
+
+    await host.send({
+      type: "esign:init",
+      token: tokenFor("queue", 2),
+      queue: { index: 2, total: QUEUE_TOTAL, next_title: QUEUE_TITLES[2] },
+    });
+
+    expect(await screen.findByTestId("step-read")).toBeInTheDocument();
+    expect(screen.getByTestId("queue-progress")).toHaveTextContent("2 of 3");
+    // A fresh session in every way: nothing of the last document is carried over.
+    expect(screen.getByTestId("step-progress")).toHaveTextContent("Step 1 of 3");
+    await waitFor(() => expect(mockDb.peek("queue", 2)?.signerStatus).toBe("viewed"));
+
+    await click("Continue to sign");
+    await screen.findByTestId("step-sign");
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("0 of 1");
+  }, 30_000);
+
+  it("will not take a second token while a signature is still being made", async () => {
+    const host = await start("queue", queueInit(1));
+    await readAndContinue({ multiPage: false });
+    await host.send({ type: "esign:init", token: tokenFor("queue", 2) });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(screen.getByTestId("step-sign")).toBeInTheDocument();
+    expect(mockDb.peek("queue", 2)).toBeUndefined();
+  }, 20_000);
+
+  /**
+   * Four seconds is long enough only if the way to stop it is where a non-pointer user already
+   * is. Focus arrives on "Stay here", and focus coming back into the card holds the countdown.
+   */
+  it("puts focus on the way to stop it, and holds while focus is back in the card", async () => {
+    const host = await start("queue", queueInit(1));
+    await signIt(host);
+    const stay = screen.getByRole("button", { name: /^Stay/ });
+    expect(stay).toHaveFocus();
+
+    // Focus leaving and coming back is the signer reaching for it, and holds the clock.
+    act(() => {
+      stay.blur();
+      stay.focus();
+    });
+    await new Promise((resolve) => setTimeout(resolve, QUEUE_COUNTDOWN_WAIT_MS));
+    expect(types(host)).not.toContain("esign:next");
+    expect(screen.getByTestId("queue-next")).toHaveTextContent("Held while you're here");
+  }, 25_000);
+
+  /**
+   * "Reduce motion" is a preference about movement, not about who gets the short path: the bar
+   * that empties goes, the count and the advance stay, and the way to stop it is still the first
+   * thing under the signer's hands. (`prefersReducedMotion` is read once, at mount, so the stub
+   * goes in before the flow is started.)
+   */
+  it("drops the moving bar for reduced motion, and keeps the countdown", async () => {
+    vi.spyOn(window, "matchMedia").mockReturnValue({ matches: true } as MediaQueryList);
+    const host = await start("queue", queueInit(1));
+    await signIt(host);
+
+    expect(screen.queryByTestId("queue-countdown-bar")).toBeNull();
+    expect(screen.getByTestId("queue-next")).toHaveTextContent(/Opening in \d second/);
+    expect(screen.getByRole("button", { name: /^Stay/ })).toHaveFocus();
+    await waitFor(() => expect(types(host)).toContain("esign:next"), { timeout: 10_000 });
+  }, 25_000);
+
+  /**
+   * After the countdown fires there is nothing left for the card to count, and if the host never
+   * opens anything the frame must stop asserting progress it cannot see.
+   */
+  it("says it is opening, and its button still works when nothing arrives", async () => {
+    const host = await start("queue", queueInit(1));
+    await signIt(host);
+    await waitFor(() => expect(types(host)).toContain("esign:next"), { timeout: 10_000 });
+
+    expect(screen.getByTestId("queue-opening")).toBeInTheDocument();
+    expect(screen.queryByText(/Opening in 0 second/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Stay/ })).toBeNull();
+
+    // The explicit press is not the automatic path, so it is not latched shut by it.
+    await click(`Open ${QUEUE_TITLES[1]}`);
+    expect(types(host).filter((type) => type === "esign:next")).toHaveLength(2);
+
+    await screen.findByTestId("queue-stalled", {}, { timeout: 16_000 });
+    expect(screen.getByTestId("queue-stalled")).toHaveTextContent("That didn't open");
+  }, 40_000);
+
+  /** The copy of this one is still sealing when the frame is about to move on. Say so. */
+  it("says what is being left behind when the copy is not sealed yet", async () => {
+    const host = await start("queue", queueInit(1));
+    await signIt(host);
+    expect(screen.getByTestId("queue-copy-pending")).toHaveTextContent("still being finalised");
+    expect(screen.getByRole("button", { name: "Stay and save my copy" })).toBeInTheDocument();
   }, 25_000);
 
   it("ignores a position the host could not have meant", async () => {
@@ -686,6 +914,44 @@ describe("re-authentication, on the press", () => {
     expect(mockDb.peek("reauth-press")?.signRequests).toHaveLength(1);
   }, 25_000);
 
+  /**
+   * The queued press is the one piece of state on this screen that acts without a press. It was
+   * made about answers that have since changed, so it goes with them: otherwise the hand-off
+   * comes back, the effect fires, and whatever the draft has become -- in the reported case an
+   * empty one -- is sent and refused, over a visibly empty field.
+   */
+  it("cancels a press waiting on the hand-off when the answers change under it", async () => {
+    const host = await toSign();
+    await click("Sign as Dr. Priya Raman");
+    expect(screen.getByTestId("reauth-waiting")).toBeInTheDocument();
+
+    await click("Remove");
+    expect(screen.queryByTestId("reauth-waiting")).toBeNull();
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent("that press was cancelled");
+
+    // The host's backend really did attest, and the answer still sends nothing.
+    mockDb.attestReauth("reauth-press");
+    await host.send({ type: "esign:reauth_done" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(mockDb.peek("reauth-press")?.signRequests).toHaveLength(0);
+    expect(screen.getByTestId("step-sign")).toBeInTheDocument();
+
+    // ...and the button says what is missing rather than refusing something nobody can mend.
+    await click("Sign as Dr. Priya Raman");
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent("One thing is still needed");
+
+    // Placing it again and pressing is the way through: one more hand-off, then the signature.
+    await click("Sign here");
+    await click("Sign as Dr. Priya Raman");
+    expect(screen.getByTestId("reauth-waiting")).toBeInTheDocument();
+    await host.send({ type: "esign:reauth_done" });
+    await screen.findByTestId("step-done", {}, { timeout: 8_000 });
+    expect(mockDb.peek("reauth-press")?.signerStatus).toBe("signed");
+    expect(JSON.parse(mockDb.peek("reauth-press")?.signRequests[0]?.body ?? "{}").captures).toEqual(
+      [{ field_id: "clinician_sig", kind: "adopted", adopted_signature_id: SAVED_SIGNATURE_ID }],
+    );
+  }, 25_000);
+
   it("gives up waiting after a while, and says nothing has been signed", async () => {
     await toSign("reauth-timeout");
     await click("Sign as Dr. Priya Raman");
@@ -796,6 +1062,50 @@ describe("a saved signature", () => {
     expect(JSON.stringify(body)).not.toMatch(/image_png|typed_text/);
   }, 25_000);
 
+  /**
+   * Changing your mind after the first field is placed. The panel used to be asked for a
+   * signature only while nothing had been adopted yet, so a signature chosen afterwards was shown
+   * in the panel, offered to be saved -- and silently left out: the submission carried the id of
+   * the old one, and the screen showed two different signatures at the moment of signing.
+   */
+  it("signs the signature chosen last, even when one was already placed", async () => {
+    await start("saved-signature");
+    await readAndContinue();
+    await user.click(screen.getByRole("checkbox", { name: /Notice of Privacy/ }));
+    await click("Sign here");
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("2 of 2");
+
+    // Choosing again makes the placed mark stale, so it comes off and has to be made again.
+    await click("Change");
+    expect(screen.getByTestId("fields-progress")).toHaveTextContent("1 of 2");
+    expect(screen.queryByText("Signature in place")).toBeNull();
+
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+    await user.click(screen.getByRole("checkbox", { name: /Save this signature for next time/ }));
+
+    // Nothing is signed while the new signature is nowhere on the document.
+    await click("Sign as Maria Alvarez");
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent("One thing is still needed");
+    expect(mockDb.peek("saved-signature")?.signRequests).toHaveLength(0);
+
+    await click("Sign here");
+    await click("Sign as Maria Alvarez");
+    await screen.findByTestId("step-done");
+
+    const body = sent("saved-signature");
+    expect(body.captures).toContainEqual({
+      field_id: "patient_sig",
+      kind: "typed",
+      typed_text: "Maria Alvarez",
+    });
+    expect(JSON.stringify(body)).not.toContain(SAVED_SIGNATURE_ID);
+    expect(body.save_adopted_signature).toBe(true);
+    expect(liveSavedSignature(mockDb.peek("saved-signature") as MockRecord)?.typedText).toBe(
+      "Maria Alvarez",
+    );
+  }, 30_000);
+
   it("can be replaced by a new one, saved on request, and the old one is revoked", async () => {
     await start("saved-signature");
     await readAndContinue();
@@ -868,16 +1178,23 @@ describe("a saved signature", () => {
   }, 25_000);
 
   it("will not place a signature that is not there yet, and says why", async () => {
+    const scrolled = vi.fn();
+    Element.prototype.scrollIntoView = scrolled;
     await start("first-time");
     await readAndContinue();
     // Drawing is selected and the pad is empty: the field's own button is what refuses.
     await click("Sign here");
-    expect(screen.getByRole("alert")).toHaveTextContent("The box is empty");
+    expect(screen.getByTestId("signature-problem")).toHaveTextContent("The box is empty");
+    // The panel is a long way above the button that was pressed, so the refusal is said beside
+    // that button too, and the panel's own copy is brought into view.
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent("The box is empty");
+    expect(scrolled).toHaveBeenCalled();
     expect(screen.getByTestId("fields-progress")).toHaveTextContent("0 of 2");
 
     await user.click(screen.getByRole("radio", { name: /Type it/ }));
     await click("Sign here");
-    expect(screen.getByRole("alert")).toHaveTextContent("type your full name");
+    expect(screen.getByTestId("signature-problem")).toHaveTextContent("type your full name");
+    expect(screen.getByTestId("sign-nudge")).toHaveTextContent("type your full name");
     expect(screen.getByTestId("fields-progress")).toHaveTextContent("0 of 2");
   }, 20_000);
 
@@ -1048,7 +1365,9 @@ describe("reading the document", () => {
 
     const readout = await screen.findByTestId("zoom-level");
     expect(readout).toHaveTextContent("Zoom 100%");
-    expect(readout).toHaveAttribute("role", "status");
+    // One channel per fact: the readout is named by both buttons and spoken by the announcer.
+    // A live region here as well made every press say the same thing twice.
+    expect(readout).not.toHaveAttribute("role");
     const smaller = screen.getByRole("button", { name: "Make the document smaller" });
     const larger = screen.getByRole("button", { name: "Make the document larger" });
     expect(smaller).toHaveAttribute("aria-describedby", readout.id);
@@ -1149,6 +1468,26 @@ describe("endings", () => {
     expect(mockDb.peek("single")?.declineReason).toBe("prefers_paper");
     expect(types(host)).toContain("esign:declined");
     expect(hasSessionToken()).toBe(false);
+  }, 25_000);
+
+  /**
+   * The paper path is a detour, not a step: the step stays mounted behind it. Everything the
+   * step is holding that the draft is not -- ink on the pad, a name half typed -- used to go
+   * with it, so reading what "sign on paper" means cost a signature.
+   */
+  it("keeps a signature being made when the paper path is opened and closed", async () => {
+    await start("first-time");
+    await readAndContinue();
+    await user.click(screen.getByRole("radio", { name: /Type it/ }));
+    await user.type(screen.getByLabelText("Type your full name"), "Maria Alvarez");
+
+    await click("I'd rather sign on paper");
+    await screen.findByTestId("step-decline");
+    await click("Go back to signing");
+
+    await screen.findByTestId("step-sign");
+    expect(screen.getByRole("radio", { name: /Type it/ })).toBeChecked();
+    expect(screen.getByLabelText("Type your full name")).toHaveValue("Maria Alvarez");
   }, 25_000);
 
   it("says that declining closes the document, before and after it happens", async () => {

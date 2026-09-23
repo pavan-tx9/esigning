@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from esign.clock import FixedClock
 from esign.config import Settings
-from esign.contracts import Conflict, NewSigner, NotFound, ValidationFailed
+from esign.contracts import Capture, Conflict, NewSigner, NotFound, ValidationFailed
 from tests.envelopes.conftest import (
     CTX,
     HIPAA_PAIR,
@@ -23,6 +23,8 @@ from tests.envelopes.conftest import (
     field,
     role,
 )
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"a drawn signature"
 
 
 def test_create_stores_revision_one_and_records_two_events(bench: Bench, db: Session) -> None:
@@ -267,6 +269,70 @@ def test_a_guardian_with_the_right_patient_is_accepted(bench: Bench, db: Session
 
     view = bench.create(db, host, PATIENT_CONSENT, signers=signers, patient_ref="patient-ref-001")
     assert view.signers[0].capacity == "guardian"
+
+
+#: A child's name, as unmistakable in a log line or an audit row as the tests in ``test_no_phi``.
+CHILD = "Sam Okafor-Featherstonehaugh"
+
+
+def test_a_guardian_is_shown_the_patients_name_while_the_trail_keeps_the_reference(bench: Bench, db: Session) -> None:
+    """Addendum 3 A made the primary button the single act that signs the document, and it reads
+    "Sign as <name>, on behalf of <this>". ``on_behalf_of`` has to be opaque, because it is what
+    reaches the append-only trail -- so without a display label the one sentence standing for a
+    parent's intent was an internal reference. The label moves; the attribution does not.
+    """
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    bench.consent(db)
+    signers = (
+        NewSigner(
+            role_key="patient",
+            host_user_id="u1",
+            display_name="A Parent",
+            capacity="guardian",
+            on_behalf_of="patient-ref-001",
+            on_behalf_of_display=CHILD,
+        ),
+    )
+
+    view = bench.create(db, host, PATIENT_CONSENT, signers=signers, patient_ref="patient-ref-001")
+    session = bench.session(db, bench.signer_id(view, "patient"))
+    assert bench.service.signing_view(db, session).on_behalf_of_label == CHILD
+
+    # ...and nothing about the record moved: the actor, the row and every event still say the
+    # opaque reference, and the child's name is nowhere in the trail.
+    bench.ready_to_sign(db, session)
+    bench.service.sign(db, session, [Capture("patient_sig", "drawn", image_png=PNG)], CTX)
+    rows = db.execute(
+        text("SELECT on_behalf_of, data::text AS data FROM audit_events WHERE stream_id = :id"),
+        {"id": view.id},
+    ).all()
+    assert {r.on_behalf_of for r in rows} == {None, "patient-ref-001"}
+    assert not [r for r in rows if CHILD in r.data]
+    assert (
+        db.execute(text("SELECT on_behalf_of FROM signers WHERE envelope_id = :id"), {"id": view.id}).scalar_one()
+        == "patient-ref-001"
+    )
+
+
+def test_a_display_label_needs_somebody_to_be_acting_for(bench: Bench, db: Session) -> None:
+    """A name for a person this signer is not acting for has nothing to attach itself to, and
+    would be a name on a row for no reason -- which is the one thing PHI must never be."""
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    signers = (
+        NewSigner(
+            role_key="patient",
+            host_user_id="u1",
+            display_name="A Person",
+            capacity="self",
+            on_behalf_of_display=CHILD,
+        ),
+    )
+
+    with pytest.raises(ValidationFailed) as seen:
+        bench.create(db, host, PATIENT_CONSENT, signers=signers)
+    assert seen.value.code == "on_behalf_of_display_not_allowed"
 
 
 def test_only_a_guardian_or_proxy_acts_on_behalf_of_someone(bench: Bench, db: Session) -> None:

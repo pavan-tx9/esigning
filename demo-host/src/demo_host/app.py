@@ -141,6 +141,14 @@ def create_app(
         return user.role in {"clinician", "staff"} or user.patient_id == patient_id
 
     def signers_body(task: Task) -> list[dict[str, Any]]:
+        """The signers of this task's envelope, as the host API takes them.
+
+        ``on_behalf_of`` is the patient's MRN, because it has to be opaque -- it reaches the audit
+        trail. ``on_behalf_of_display`` is the same person in the words a parent would use, and it
+        is the patient's own name rather than a second field on the task: a guardian's
+        ``on_behalf_of`` is required to equal the envelope's ``patient_ref``, so there is exactly
+        one person it can name, and writing it twice is one more place for them to disagree.
+        """
         return [
             {
                 "role_key": signer.role_key,
@@ -148,6 +156,7 @@ def create_app(
                 "display_name": state.users[signer.user_id].display_name,
                 "capacity": signer.capacity,
                 "on_behalf_of": signer.on_behalf_of,
+                "on_behalf_of_display": None if signer.on_behalf_of is None else state.patients[task.patient_id].name,
             }
             for signer in task.signers
         ]

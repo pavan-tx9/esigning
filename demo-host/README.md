@@ -120,7 +120,9 @@ the same host, for the same disclosure version and language, stands for their ot
 that long: the later ones show when it was given instead of asking again. What does **not** change
 is what is recorded -- every envelope still writes its own `consent.accepted`, still sets
 `signers.consent_text_id` and `consented_at`, and the event, the certificate and `esign verify`
-all name the earlier acceptance and re-read it from that envelope's own trail. What changes is
+all name the earlier acceptance and re-read it from that envelope's own trail. The window is
+measured from the moment the notice was displayed, carried forward through the queue, so five
+orders in a row do not add up to five spans. What changes is
 whether the notice was put in front of the signer a second time. ESIGN consent is consent to doing
 business electronically rather than to one form, so standing consent is defensible -- but whether
 it is acceptable here, and for how long, is compliance's decision (C12 in the checklist), not a

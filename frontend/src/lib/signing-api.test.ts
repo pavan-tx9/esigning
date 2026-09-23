@@ -5,6 +5,7 @@ import {
   copyPollDelay,
   isReauthLapsed,
   isSignatureUnavailable,
+  onBehalfOfPhrase,
   postConsent,
   postSign,
   type SignRequest,
@@ -440,5 +441,35 @@ describe("retry policy", () => {
     expect(shouldRetryQuery(0, new ApiError(409, "conflict", ""))).toBe(false);
     expect(shouldRetryQuery(0, new ApiValidationError("/x", []))).toBe(false);
     expect(shouldRetryQuery(2, new ApiNetworkError())).toBe(false);
+  });
+});
+
+/**
+ * Addendum 3 A made the press of "Sign as ..." the whole of the intent confirmation, so the
+ * sentence on the button has to be one a guardian can read. A host that sends
+ * `on_behalf_of_display` supplies the words; one that does not leaves the opaque `on_behalf_of`,
+ * and reciting a chart reference is not a statement of intent anybody can check.
+ */
+describe("naming the person a guardian signs for", () => {
+  it("uses the host's own words when they are words", () => {
+    expect(onBehalfOfPhrase("Rosa Patel")).toBe("on behalf of Rosa Patel");
+    // A hyphen alone is a name's punctuation, not an identifier's.
+    expect(onBehalfOfPhrase("Anne-Marie")).toBe("on behalf of Anne-Marie");
+    expect(onBehalfOfPhrase("Cher")).toBe("on behalf of Cher");
+    expect(onBehalfOfPhrase("Rosa Patel (child)")).toBe("on behalf of Rosa Patel (child)");
+  });
+
+  it("points at the document instead when all it has is a reference", () => {
+    const fallback = "for the patient named in this document";
+    expect(onBehalfOfPhrase("mrn-100907")).toBe(fallback);
+    expect(onBehalfOfPhrase("pt_abcdef")).toBe(fallback);
+    expect(onBehalfOfPhrase("patient.7")).toBe(fallback);
+    expect(onBehalfOfPhrase("9f1c2b4e8a7d4e1fa0c3")).toBe(fallback);
+    expect(onBehalfOfPhrase("rosa@example-clinic.test")).toBe(fallback);
+  });
+
+  it("says nothing at all for a signer acting for themselves", () => {
+    expect(onBehalfOfPhrase(null)).toBe(null);
+    expect(onBehalfOfPhrase("   ")).toBe(null);
   });
 });

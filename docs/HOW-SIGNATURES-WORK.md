@@ -639,7 +639,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `session.rejected` | a refused attempt to open a session. Committed separately, because the refused request is rolled back and the refusal is still evidence |
 | `document.presented` | the hash of the bytes actually served to this session |
 | `document.viewed` | the signer confirmed every page, and against which bytes |
-| `consent.accepted` | which disclosure, which version, which locale, and the hash of its body |
+| `consent.accepted` | which disclosure, which version, which locale, and the hash of its body — and, where the agreement was given for an earlier document of the same sitting (Addendum 3 C), which envelope it stood on (`relied_on_envelope_id`), when that acceptance was given (`relied_on_accepted_at`) and when the disclosure was last actually *displayed* (`relied_on_root_accepted_at`, carried forward unchanged through a chain, and what the span is measured from). All three are null together on an envelope that collected its own consent |
 | `auth.reauthenticated` | the host attested a fresh re-authentication for this session |
 | `signer.signed` | the whole act: what they were shown, what the marks went onto, what came out, how each field was filled, the digest of the ink, the consent version, whether re-authentication was used and by what method — and, since Addendum 1, *which* attestation covered it (`reauth_attestation_id`), whether that attestation was made in this session or borrowed (`reauth_scope`), how old it was (`reauth_age_seconds`), and the saved signature applied, if any (`adopted_signature_id`) |
 | `signer.declined` / `envelope.declined` | the refusal and its reason code |

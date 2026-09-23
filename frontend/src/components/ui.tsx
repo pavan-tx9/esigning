@@ -4,6 +4,7 @@ import {
   type MouseEventHandler,
   type ReactNode,
   type Ref,
+  type RefObject,
   useCallback,
   useContext,
   useEffect,
@@ -138,6 +139,12 @@ interface StepScreenProps {
   children?: ReactNode;
   /** Wider for the document; text screens stay at a comfortable measure. */
   wide?: boolean;
+  /**
+   * Somewhere other than the heading to put focus. For a screen that acts on its own after a few
+   * seconds, the way to stop it has to be under the signer's hands rather than several Tab
+   * presses behind the title.
+   */
+  focus?: RefObject<HTMLElement | null> | undefined;
   testId: string;
 }
 
@@ -146,10 +153,19 @@ interface StepScreenProps {
  * or screen-reader user always lands at the top of the new step rather than wherever the last
  * button was.
  */
-export function StepScreen({ title, lead, children, wide = false, testId }: StepScreenProps) {
+export function StepScreen({
+  title,
+  lead,
+  children,
+  wide = false,
+  focus,
+  testId,
+}: StepScreenProps) {
   const heading = useRef<HTMLHeadingElement>(null);
+  const target = useRef(focus);
+  target.current = focus;
   useEffect(() => {
-    heading.current?.focus({ preventScroll: true });
+    (target.current?.current ?? heading.current)?.focus({ preventScroll: true });
     window.scrollTo({ top: 0 });
   }, []);
   return (

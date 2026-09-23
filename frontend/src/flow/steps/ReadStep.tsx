@@ -309,12 +309,10 @@ export function ReadStep({
               both buttons, so someone who cannot see the page still knows where the zoom stands
               and when a press did nothing because it is already at the limit. */}
           <div className="mb-3 flex items-center justify-end gap-2">
-            <span
-              id={zoomReadout}
-              role="status"
-              data-testid="zoom-level"
-              className="mr-1 text-ink-700 text-sm"
-            >
+            {/* Named by both zoom buttons through `aria-describedby`, and read out by
+                `changeZoom`, which says it in better words. Not also a live region: one fact
+                wired into two channels is a fact a screen reader says twice. */}
+            <span id={zoomReadout} data-testid="zoom-level" className="mr-1 text-ink-700 text-sm">
               Zoom {Math.round(zoom * 100)}%
             </span>
             <Button

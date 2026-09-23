@@ -1,8 +1,21 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { type Ref, useId, useImperativeHandle, useState } from "react";
+import { type Ref, useEffect, useId, useImperativeHandle, useRef, useState } from "react";
 import { SignaturePad } from "@/components/SignaturePad";
-import { Button, CheckRow, Notice, Sheet, useAnnounce } from "@/components/ui";
-import { type AdoptedSignature, type Draft, type SavedLook, savedLook } from "@/flow/draft";
+import {
+  Button,
+  CheckRow,
+  Notice,
+  prefersReducedMotion,
+  Sheet,
+  useAnnounce,
+} from "@/components/ui";
+import {
+  type AdoptedSignature,
+  type Draft,
+  type SavedLook,
+  savedLook,
+  withoutInitialsMarks,
+} from "@/flow/draft";
 import {
   isNetworkError,
   postRevokeAdoptedSignature,
@@ -37,13 +50,27 @@ const cardClass = (selected: boolean) =>
     selected ? "bg-accent-wash ring-accent-600" : "ring-edge-strong hover:bg-sunk"
   }`;
 
+/**
+ * The answer to "what should I place?". A refusal carries its own sentence so the caller can say
+ * it where the press happened as well: the panel can be a screen away from the field's button on
+ * a phone, and a message nobody scrolls to is a press that appeared to do nothing.
+ */
+export type PanelChoice = { ok: true; adopted: AdoptedSignature } | { ok: false; reason: string };
+
 export interface SignaturePanelHandle {
   /**
-   * Hand over whatever the panel is showing, so a field can place it. Returns null after saying
-   * on screen why it cannot -- an empty pad, a name too short to be one -- which is the same
-   * refusal the old "Use this signature" button made, moved to the act that needs it.
+   * Hand over whatever the panel is showing, so a field can place it. Refuses -- saying why, on
+   * screen and to the caller -- when there is nothing to hand over: an empty pad, a name too short
+   * to be one. That is the refusal the old "Use this signature" button made, moved to the act that
+   * needs it.
    */
-  commit: () => AdoptedSignature | null;
+  commit: () => PanelChoice;
+  /**
+   * Ink drawn or a name typed in the chooser that has not been placed in any field yet. The
+   * signature that gets signed is the one in the draft, so a press of "Sign as ..." while this is
+   * true would quietly sign something other than what the panel is showing.
+   */
+  uncommitted: () => boolean;
 }
 
 interface SignaturePanelProps {
@@ -86,6 +113,15 @@ export function SignaturePanel({
   const [typed, setTyped] = useState(draft.adopted?.kind === "typed" ? draft.adopted.text : "");
   const [removing, setRemoving] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  /**
+   * What was last handed to a field, so ink still on the pad can be told apart from ink already
+   * placed. Reference equality is enough: `SignaturePad` hands up a new array on every change.
+   */
+  const placed = useRef<{ strokes: Stroke[] | null; typed: string | null }>({
+    strokes: null,
+    typed: null,
+  });
+  const refusal = useRef<HTMLParagraphElement>(null);
   const ids = {
     error: useId(),
     typed: useId(),
@@ -94,8 +130,14 @@ export function SignaturePanel({
     save: useId(),
   };
 
+  /**
+   * An initials mark stands for this text, so emptying the box un-places them: a row that goes on
+   * saying "Initials in place" over an empty box is the screen contradicting itself, and the
+   * submission it describes is one the server refuses.
+   */
   const setInitials = (value: string) => {
-    onDraft({ ...draft, initials: value });
+    const next = { ...draft, initials: value };
+    onDraft(value.trim() === "" ? withoutInitialsMarks(next, session.fields) : next);
     setProblem(null);
   };
   const setSave = (value: boolean) => onDraft({ ...draft, save: value });
@@ -139,60 +181,93 @@ export function SignaturePanel({
     : draft.adopted?.kind === "drawn" || draft.adopted?.kind === "typed";
   const canSave = !kiosk && hasSignatureField && madeHere;
 
-  function commit(): AdoptedSignature | null {
+  const refuse = (reason: string): PanelChoice => {
+    setProblem(reason);
+    return { ok: false, reason };
+  };
+
+  function commit(): PanelChoice {
     if (removing) {
-      setProblem("Please decide about your saved signature first: remove it, or keep it.");
-      return null;
+      return refuse("Please decide about your saved signature first: remove it, or keep it.");
     }
     if (needsInitials && draft.initials.trim() === "") {
-      setProblem("Please enter your initials.");
-      return null;
+      return refuse("Please enter your initials.");
     }
     if (!choosing) {
-      return showing;
+      return showing === null
+        ? refuse("Please choose a signature first.")
+        : { ok: true, adopted: showing };
     }
     if (method === "drawn") {
       const issue = inkProblem(strokes);
       if (issue === "empty") {
-        setProblem(
+        return refuse(
           "The box is empty. Draw your signature in it, or choose to type it or use your printed name.",
         );
-        return null;
       }
       if (issue === "too_small") {
-        setProblem("That's too small to read as a signature. Please draw it a little larger.");
-        return null;
+        return refuse("That's too small to read as a signature. Please draw it a little larger.");
       }
       try {
         const png = exportSignaturePng(strokes);
+        placed.current.strokes = strokes;
         setChoosing(false);
         setProblem(null);
-        return { kind: "drawn", dataUrl: png.dataUrl, base64: png.base64 };
+        return { ok: true, adopted: { kind: "drawn", dataUrl: png.dataUrl, base64: png.base64 } };
       } catch {
-        setProblem(
+        return refuse(
           "We couldn't save the drawing on this device. Please type your name or use your printed name instead.",
         );
-        return null;
       }
     }
     if (method === "typed") {
       const text = typed.trim().replace(/\s+/g, " ");
       if (text.length < 2) {
-        setProblem("Please type your full name.");
-        return null;
+        return refuse("Please type your full name.");
       }
+      placed.current.typed = text;
       setChoosing(false);
       setProblem(null);
-      return { kind: "typed", text };
+      return { ok: true, adopted: { kind: "typed", text } };
     }
     setChoosing(false);
     setProblem(null);
-    return { kind: "click" };
+    return { ok: true, adopted: { kind: "click" } };
+  }
+
+  /** Something made here and now that no field is carrying yet. */
+  function uncommitted(): boolean {
+    if (!choosing) {
+      return false;
+    }
+    if (method === "drawn") {
+      return strokes.length > 0 && strokes !== placed.current.strokes;
+    }
+    if (method === "typed") {
+      const text = typed.trim().replace(/\s+/g, " ");
+      return text !== "" && text !== placed.current.typed;
+    }
+    return false;
   }
 
   // No dependency list on purpose: `commit` reads this render's state, and a handle frozen at
   // mount would hand a field the signature the panel showed when the screen opened.
-  useImperativeHandle(ref, (): SignaturePanelHandle => ({ commit }));
+  useImperativeHandle(ref, (): SignaturePanelHandle => ({ commit, uncommitted }));
+
+  /**
+   * The refusal is at the foot of a panel that can be a whole screen tall, and the press that
+   * caused it happened at a field's own button below it. Bring it to the signer, as the Read
+   * screen does with its own. Optional call: this is a convenience, and a runtime without it must
+   * not take the screen down on the one path where something has already gone wrong.
+   */
+  useEffect(() => {
+    if (problem !== null) {
+      refusal.current?.scrollIntoView?.({
+        block: "center",
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+    }
+  }, [problem]);
 
   return (
     <Sheet testId="signature-panel">
@@ -204,7 +279,21 @@ export function SignaturePanel({
             onClick={() => {
               setChoosing(true);
               setProblem(null);
-              announce("Choose a signature.");
+              // Choosing again makes every placed mark stale: it stands for the signature being
+              // replaced. They come off, so each field asks to be signed again with whatever is
+              // chosen now -- and so the screen can never show one signature while carrying
+              // another into the submission.
+              const placedMarks = Object.values(draft.values).some(
+                (value) => value.type === "mark",
+              );
+              if (placedMarks) {
+                onDraft({ ...draft, values: withoutMarks(draft) });
+              }
+              announce(
+                placedMarks
+                  ? "Choose a signature. What you placed has been taken off, so you can place the new one."
+                  : "Choose a signature.",
+              );
             }}
           >
             Change
@@ -454,7 +543,13 @@ export function SignaturePanel({
       ) : null}
 
       {problem ? (
-        <p id={ids.error} role="alert" className="mt-4 font-medium text-danger-600">
+        <p
+          id={ids.error}
+          ref={refusal}
+          role="alert"
+          data-testid="signature-problem"
+          className="mt-4 font-medium text-danger-600"
+        >
           {problem}
         </p>
       ) : null}

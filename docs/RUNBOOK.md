@@ -1107,20 +1107,27 @@ set, and it is validated at startup (`0 ≤ span ≤ 3600`).
 signer's `consent_text_id` and `consented_at`, and no signature is accepted without them. What the
 span changes is whether the notice was put in front of the signer again — and the record says which
 it was: the event names the acceptance relied on and when it was given, the certificate prints
-"(given for an earlier document in the same sitting)", and `esign verify` re-reads that earlier
-envelope's own hash-chained trail rather than trusting the pointer. A kiosk session never has
-standing consent, in either direction.
+"(given for an earlier document in the same sitting; disclosure displayed 08:58)", and
+`esign verify` re-reads that earlier envelope's own hash-chained trail rather than trusting the
+pointer. A kiosk session never has standing consent, in either direction, and verification
+re-derives that too rather than assuming the rule held when the row was written.
 
 Pick the window from how long a sitting lasts — a patient at one desk, a clinician's queue of
-orders — not from how long somebody is logged in. `make demo` uses 900 seconds. A signature that
-stood on an agreement older than the `3600`-second cap describes something this service could not
-have produced, and verification says so whatever the configuration was at the time.
+orders — not from how long somebody is logged in. `make demo` uses 900 seconds. The window is
+measured from the moment the notice was **displayed**, not from the last agreement: document
+three stands on document two, which stood on document one, and every event carries that first
+display time forward, so a queue cannot renew the window one document at a time. A signature
+resting on a disclosure displayed longer ago than the `3600`-second cap describes something this
+service could not have produced, and verification says so whatever the configuration was at the
+time.
 
 **Auditing it afterwards**, the same way the span above is audited:
 
 ```sql
 SELECT date_trunc('day', occurred_at) AS day,
        (data->>'relied_on_envelope_id' IS NOT NULL) AS stood_on_an_earlier_one,
+       max(occurred_at - (data->>'relied_on_root_accepted_at')::timestamptz)
+         AS longest_since_the_notice_was_shown,
        count(*)
 FROM audit_events
 WHERE event_type = 'consent.accepted'

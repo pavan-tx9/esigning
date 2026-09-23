@@ -154,6 +154,77 @@ def test_a_relied_on_acceptance_that_is_not_in_that_trail_is_caught(
     assert report["seal"]["ok"] is True
 
 
+def test_a_relied_on_acceptance_given_from_a_kiosk_is_caught(
+    sitting: SittingFactory, clock: FixedClock, owner_engine: Engine
+) -> None:
+    """SPEC section 16 C's hardest rule, re-derived rather than assumed.
+
+    "A kiosk session never has standing consent" is enforced at record time by one ``NOT EXISTS``
+    in one SQL string, and no code path now produces an envelope that breaks it. That is exactly
+    the kind of guarantee this module exists to re-check: an older build, a direct row write or a
+    future path around the repository would otherwise leave a document whose consent rested on a
+    shared clinic tablet verifying clean.
+    """
+    s = sitting(SITTING_SECONDS)
+    first, second = a_sitting_of_two(s, clock)
+    assert s.ehr.verification(str(second["id"]))["ok"] is True
+
+    with owner_engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE signing_sessions SET kiosk_staff_user_id = 'staff-2207', "
+                "  kiosk_identity_check = 'photo_id' "
+                "WHERE signer_id IN (SELECT id FROM signers WHERE envelope_id = :env)"
+            ),
+            {"env": first["id"]},
+        )
+
+    report = s.ehr.verification(str(second["id"]))
+    assert report["ok"] is False
+    failed = failed_checks(report)
+    assert "kiosk session" in failed["consent_relied_on_matches_trail"]
+
+
+def test_a_chain_that_outlasts_the_maximum_span_is_caught(
+    sitting: SittingFactory, clock: FixedClock, owner_engine: Engine
+) -> None:
+    """The cap verification re-checks is on the whole chain, not on one hop.
+
+    A forged root -- a display time pushed back past the hour the code allows -- is a document
+    claiming a sitting this service could never have produced, and the check says so even though
+    the acceptance it names is really in the other envelope's trail.
+    """
+    s = sitting(SITTING_SECONDS)
+    _, second = a_sitting_of_two(s, clock)
+
+    with owner_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE audit_events DISABLE TRIGGER USER"))
+        conn.execute(
+            text(
+                "UPDATE audit_events SET data = jsonb_set(data, '{relied_on_root_accepted_at}', "
+                "  to_jsonb(to_char(occurred_at - interval '3 hours', "
+                '    \'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\'))) '
+                "WHERE stream_id = :env AND event_type = 'consent.accepted'"
+            ),
+            {"env": second["id"]},
+        )
+        conn.execute(text("ALTER TABLE audit_events ENABLE TRIGGER USER"))
+
+    failed = failed_checks(s.ehr.verification(str(second["id"])))
+    assert "outside the maximum span" in failed["consent_relied_on_matches_trail"]
+
+
+def test_the_certificate_says_when_the_disclosure_was_displayed(sitting: SittingFactory, clock: FixedClock) -> None:
+    """ "Earlier in the same sitting" reads the same whether that was three minutes or an hour ago,
+    and the difference is what a reader is weighing. The line names the moment."""
+    s = sitting(SITTING_SECONDS)
+    displayed_at = clock.now()
+    _, second = a_sitting_of_two(s, clock)
+
+    shown = displayed_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    assert f"disclosure displayed {shown}" in certificate_text(s, str(second["id"]))
+
+
 def test_a_relied_on_envelope_that_is_gone_is_caught(
     sitting: SittingFactory, clock: FixedClock, owner_engine: Engine
 ) -> None:

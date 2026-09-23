@@ -25,7 +25,7 @@ from datetime import date, datetime
 from typing import Annotated, Any, Final, Literal, get_args
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, model_validator
 from pydantic.functional_validators import AfterValidator
 
 from esign.audit.canonical import archive_attested_detail_digest, canonical_value
@@ -225,13 +225,20 @@ class DocumentViewedData(EventData):
 class ConsentAcceptedData(EventData):
     """This signer accepted this disclosure, on this envelope.
 
-    Addendum 3 C: the two ``relied_on_*`` fields are set together when the acceptance was recorded
-    against one the same person had already given for an earlier document in the same sitting.
-    The envelope id and the time it was given, and nothing else: the earlier envelope's own
+    Addendum 3 C: the three ``relied_on_*`` fields are set together when the acceptance was
+    recorded against one the same person had already given for an earlier document in the same
+    sitting. The envelope id and the times, and nothing else: the earlier envelope's own
     ``consent.accepted`` is the record of *what* was agreed, and pointing at it is what makes the
     shortcut checkable -- by the certificate, which says so in words, and by verification, which
-    goes and reads that trail. Both ``null`` for an acceptance given here and now, which is every
-    acceptance while the span is off.
+    goes and reads that trail. All three ``null`` for an acceptance given here and now, which is
+    every acceptance while the span is off.
+
+    ``relied_on_accepted_at`` is when the acceptance this one rested on was given;
+    ``relied_on_root_accepted_at`` is when the disclosure was last actually *displayed* -- the
+    head of the chain, carried forward unchanged by each document that stands on the one before.
+    Two times rather than one because they answer different questions, and only the second one
+    bounds how long the notice may go unshown: without it a queue renews the span one document at
+    a time and nothing on the record contradicts it.
     """
 
     signer_id: UUID
@@ -241,6 +248,30 @@ class ConsentAcceptedData(EventData):
     body_sha256: Sha256
     relied_on_envelope_id: UUID | None = None
     relied_on_accepted_at: Timestamp | None = None
+    relied_on_root_accepted_at: Timestamp | None = None
+
+    @model_validator(mode="after")
+    def _relied_on_is_all_or_nothing(self) -> ConsentAcceptedData:
+        """The three travel together, and the root is never after the acceptance it heads.
+
+        An event carrying two of the three would be a shortcut the trail describes only partly,
+        and one whose root is later than the acceptance it is the root of describes a chain that
+        cannot exist. Neither is representable rather than merely unwritten.
+        """
+        present = (
+            self.relied_on_envelope_id is not None,
+            self.relied_on_accepted_at is not None,
+            self.relied_on_root_accepted_at is not None,
+        )
+        if any(present) and not all(present):
+            raise ValueError("relied_on_envelope_id, relied_on_accepted_at and relied_on_root_accepted_at")
+        if (
+            self.relied_on_accepted_at is not None
+            and self.relied_on_root_accepted_at is not None
+            and self.relied_on_root_accepted_at > self.relied_on_accepted_at
+        ):
+            raise ValueError("relied_on_root_accepted_at")
+        return self
 
 
 class ReauthAttestedData(EventData):

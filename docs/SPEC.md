@@ -138,7 +138,10 @@ the state change.
    `consent.accepted` naming that earlier acceptance and its time. The row is set exactly as it is
    without the span, so every envelope still carries its own consent; what the span changes is
    whether the disclosure was displayed again, and the trail, the certificate and verification all
-   say which. Never for a kiosk session, in either direction.
+   say which. The span is measured from the acceptance where the disclosure was last *displayed*
+   (`relied_on_root_accepted_at`, carried forward unchanged through a chain of documents), never
+   from the acceptance being relied on: a queue may not renew the window a document at a time.
+   Never for a kiosk session, in either direction.
 5. **Re-authenticate** (roles with `requires_reauth`): the UI asks the host page to re-authenticate
    the user; the host backend then calls `POST /v1/sessions/{id}/reauth`. Signing requires an
    attestation younger than `REAUTH_MAX_AGE_SECONDS` (default 120). By default the attestation
@@ -291,15 +294,22 @@ the paper original and the attesting staff member, and the cover page and the ce
   `template_version` and `template_version_id` became optional, and are all null together on a
   `host_document` envelope: there is no published version to name, and the `document.supplied`
   that follows says where the document did come from.
-- Section 16 adds no event type and two fields. `consent.accepted` gained
-  `relied_on_envelope_id` and `relied_on_accepted_at`, set together when the acceptance was
-  recorded against a standing one (section 16 C) and `null` together otherwise -- which is every
-  acceptance while `CONSENT_SPAN_SECONDS` is zero. The envelope id and the time, and nothing
-  else: the earlier envelope's own `consent.accepted` is the record of *what* was agreed, and
-  pointing at it is what makes the shortcut checkable by the certificate and by verification
-  (`consent_relied_on_matches_trail`, which reads that other stream). A `consent.accepted`
-  written before this is reported by `verify` as `data keys do not match` -- the same consequence
-  Addendum 1's `signer.signed` change had.
+- Section 16 adds no event type and three fields. `consent.accepted` gained
+  `relied_on_envelope_id`, `relied_on_accepted_at` and `relied_on_root_accepted_at`, set together
+  when the acceptance was recorded against a standing one (section 16 C) and `null` together
+  otherwise -- which is every acceptance while `CONSENT_SPAN_SECONDS` is zero. The envelope id and
+  the two times, and nothing else: the earlier envelope's own `consent.accepted` is the record of
+  *what* was agreed, and pointing at it is what makes the shortcut checkable by the certificate and
+  by verification (`consent_relied_on_matches_trail`, which reads that other stream).
+  `relied_on_root_accepted_at` is when the disclosure was last actually *displayed* -- the head of
+  the chain, carried forward unchanged by each document that stands on the one before -- and it is
+  what the span is measured from, at record time and at verification. Two times rather than one
+  because bounding a single hop bounds nothing: without the root, document N stands on N-1 inside
+  the span, N-1 stood on N-2 inside the span, and how long the notice has gone unshown is
+  unbounded while every individual link looks lawful. The model refuses an event carrying some of
+  the three but not all, and one whose root is later than the acceptance it heads. A
+  `consent.accepted` written before this is reported by `verify` as `data keys do not match` --
+  the same consequence Addendum 1's `signer.signed` change had.
 - `signer.signed` gained `reauth_attestation_id`, `reauth_scope` and `reauth_age_seconds`, set
   together whenever `reauth_used`, and `adopted_signature_id` when an `adopted` capture was
   applied. Capture kinds in the trail are `drawn | typed | click | adopted | checkbox | text`.
@@ -348,9 +358,11 @@ the paper original and the attesting staff member, and the cover page and the ce
   signer: name, role, capacity, authentication method, re-authentication method, consent version,
   viewed/consented/signed times, IP, user agent, kiosk details. Section 16 C: where the acceptance
   was recorded against a standing one, the Consented line says so in words -- "09:12 (given for an
-  earlier document in the same sitting)" -- so a reader is never left to infer from two nearby
-  timestamps that the disclosure was displayed twice. Plus the audit event count and head
-  hash, the seal profile, and a line on how to verify. No chart data.
+  earlier document in the same sitting; disclosure displayed 08:58)" -- so a reader is never left
+  to infer from two nearby timestamps that the disclosure was displayed twice, and never left to
+  guess how much earlier "earlier" was. The displayed time is
+  `relied_on_root_accepted_at` from the trail, not a time read off a row. Plus the audit event
+  count and head hash, the seal profile, and a line on how to verify. No chart data.
 - Ship three sample templates in `templates/` with definitions: a patient consent form (patient,
   optional guardian capacity), a HIPAA acknowledgement (patient), and a procedure consent needing
   patient, witness and clinician in sequence. Generate the PDFs with a script so they are reproducible.
@@ -414,7 +426,12 @@ the paper original and the attesting staff member, and the cover page and the ce
   host_user_id)`, same `consent_text_id` (`consent_texts` is unique on version and locale, so one
   id is both), `consented_at` inside the span and not in the future, a different envelope from the
   one being signed, and no kiosk session on the signer whose acceptance it is. The session asking
-  must not be a kiosk session either. `EnvelopeService` owns the lookup because it owns the
+  must not be a kiosk session either. A candidate that itself stood on an earlier acceptance is
+  then held to *that* acceptance's root: the service reads the candidate envelope's own
+  `consent.accepted`, takes its `relied_on_root_accepted_at`, and the span is measured from there,
+  so a chain of documents is bounded as a whole rather than one hop at a time. An acceptance the
+  trail does not account for -- a `signers` row with no matching event -- never stands.
+  `EnvelopeService` owns the lookup because it owns the
   `signers` rows, and one definition answers both "is there one to offer?" and "is the one this
   request names still good?", so offering and recording cannot drift.
 - Rate limits (in-memory sliding window behind the `RateLimiter` protocol): per session and per IP
@@ -433,7 +450,7 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 | `POST /v1/templates/{key}/versions/{n}/publish` | publish (immutable from here) |
 | `POST /v1/templates/{key}/versions/{n}/retire` | retire |
 | `GET /v1/templates`, `GET /v1/templates/{key}` | list, detail |
-| `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names). Section 15: the same route also accepts a **multipart** request -- `document` (the PDF the host generated) plus `body` (JSON: `NewEnvelope` minus `template_key`/`template_version`/`prefill`, plus `document_type`, `signer_roles` (a `SignerRoleDef` list) and `fields`: `{"mode": "named"}`, the default, or `{"mode": "explicit", "fields": [FieldDef...]}` where `page` may count from the end (`-1` is the last page)), i.e. `NewHostDocumentEnvelope`. The request-size limit for a multipart request on this route is `MAX_SUPPLIED_DOCUMENT_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES`; the `Idempotency-Key` request hash covers the document bytes. Returns an `EnvelopeView` with `source: "host_document"` |
+| `POST /v1/envelopes` | create from a published version; body is `NewEnvelope`; supports `Idempotency-Key` (a replay returns the *same envelope*, as it is now: what is stored is its id, not a second copy of the signers' names). Section 15: the same route also accepts a **multipart** request -- `document` (the PDF the host generated) plus `body` (JSON: `NewEnvelope` minus `template_key`/`template_version`/`prefill`, plus `document_type`, `signer_roles` (a `SignerRoleDef` list) and `fields`: `{"mode": "named"}`, the default, or `{"mode": "explicit", "fields": [FieldDef...]}` where `page` may count from the end (`-1` is the last page)), i.e. `NewHostDocumentEnvelope`. The request-size limit for a multipart request on this route is `MAX_SUPPLIED_DOCUMENT_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES`; the `Idempotency-Key` request hash covers the document bytes. Returns an `EnvelopeView` with `source: "host_document"`. On both shapes a `guardian` or `proxy` signer may carry `on_behalf_of_display` beside `on_behalf_of`: the host's own words for the person it names, shown to the signer and printed in the document, never in the trail, a webhook or a log (section 16 A). Any other capacity is refused `on_behalf_of_display_not_allowed` |
 | `POST /v1/archives` | section 14 A: file a scan of a paper-signed document. Multipart: `scan` (a PDF; converting images is the host's job) + `body` (JSON text: `{patient_ref, document_type, host_document_ref?, paper_signed_on, attestation: {staff_user_id, staff_display_name, statement: "true_copy", original_disposition, paper_signers: [{display_name, capacity}]}, supersedes_envelope_id?}`, i.e. `NewArchive`). Supports `Idempotency-Key`. Returns an `EnvelopeView` with `kind: "paper_archive"`. The request-size limit for this route is `MAX_SCAN_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES` |
 | `GET /v1/envelopes/{id}` | `EnvelopeView`. Gained `kind`; for a paper archive `template_key`, `template_version` and `signing_order` are `null`, `signers` is empty, and `paper_signed_on` and `attested_at` are set. Gained `source` (section 15): for a host document `template_key` and `template_version` are `null` and everything else is as for a template envelope. `/document`, `/audit`, `/verification` and `/void` apply to every kind and source |
 | `POST /v1/envelopes/{id}/void` | `{reason_code}` from the fixed list `contracts.VOID_REASON_CODES` (a host-invented code would be free text with underscores, and it reaches the audit trail) |
@@ -500,7 +517,15 @@ HH:MM" rather than infer it. The three are `null` together.
 Inside the consent block rather than beside it, because standing is a fact about one disclosure in
 one language and says nothing read apart from them -- `?locale=` therefore decides it too.
 `null` whenever the span is off and on every kiosk session. The body is served with it either way:
-the UI offers "Read the full notice" on both paths.
+the UI offers "Read the full notice" on both paths. `accepted_at` is the acceptance the UI names;
+how long the disclosure has gone undisplayed is the server's business, not the UI's, so the root
+the span is measured from stays out of the payload.
+`on_behalf_of_label` is who this signer acts for, in words a person can read: the host's
+`on_behalf_of_display` for that signer when it sent one, and the opaque `on_behalf_of` otherwise.
+`null` for a signer acting for themselves. Since section 16 A the sign button carries the whole of
+the intent confirmation ("Sign as Grace Okafor, on behalf of ..."), so the sentence a guardian
+reads before performing that act must not be an internal reference; what the trail records is
+unchanged, and is always the opaque value.
 
 Capture shapes: `{"field_id", "kind": "drawn", "image_png_base64"}`, `{"field_id", "kind":
 "typed", "typed_text"}`, `{"field_id", "kind": "click"}`, `{"field_id", "kind": "adopted",
@@ -962,6 +987,47 @@ and the demo host's; the server side of them is unchanged, which is the point of
   one's trail names the document the signer had most recently agreed on. `accept_consent` is
   still legal for a signer who is already `consented` and still keeps the first acceptance in the
   row (section 13, fourth round); an envelope never stands for itself.
+
+Addendum 3, from the review of the built system. Two findings about section 16 and one about
+what its shorter flow left on the screen; no change to `0001`, `0700` or `0800`:
+
+- **The span is measured from the display, not from the last agreement.** Standing on the most
+  recent acceptance (above) is right for *which* document the trail names, and was wrong for *how
+  long* the shortcut lasts: the relying acceptance sets `consented_at` on its own row, which then
+  satisfied the same predicate for the next document, so document N stood on N-1, which stood on
+  N-2, and the window renewed itself one document at a time. Verification did not contradict it,
+  because it bounded the single hop `occurred_at - relied_on_accepted_at` and every hop was
+  inside the cap. Twenty documents an hour apart is one display of the disclosure and a working
+  day of standing consent -- which is the opposite of what
+  `config.CONSENT_SPAN_MAX_SECONDS` is quoted as containing. `consent.accepted` now also carries
+  `relied_on_root_accepted_at`, the moment the notice was last actually displayed, carried forward
+  unchanged by every link; `_standing_consent_for` reads the candidate's own event to find it and
+  measures the span from there; the certificate prints it; and
+  `consent_relied_on_matches_trail` bounds `occurred_at - root` by the cap *and* re-derives the
+  root from the earlier acceptance's own event, so the number is evidence rather than an
+  assertion. `ConsentAcceptedData` refuses an event carrying some of the three fields and not the
+  others, or a root later than the acceptance it heads.
+- **Verification re-derives the kiosk exclusion too.** "A kiosk session never has standing
+  consent" is section 16 C's hardest rule and was enforced at record time only, by a `NOT EXISTS`
+  inside `_STANDING_CONSENT_SQL`. `consent_relied_on_matches_trail` now runs the same exclusion
+  against the earlier acceptance's signer, for the reason the module gives for borrowed
+  attestations: a check that assumes the writer got it right is not a check. Nothing today
+  produces such an envelope, which is the point at which it is cheap to catch.
+- **A guardian reads a name, not a reference.** `signers.on_behalf_of_display` (`0504`) and
+  `NewSigner.on_behalf_of_display`: `on_behalf_of` is the envelope's `patient_ref` and is held to
+  `is_opaque_id` because it reaches the trail, so `SigningView.on_behalf_of_label` could only ever
+  be an internal identifier -- and section 16 A made the button carrying it the single act that
+  signs the document and the whole of the intent confirmation. The label is now the host's own
+  words when it sends them and the opaque value otherwise; the attribution in the record, the
+  actor on every event and the `signers.on_behalf_of` column are untouched. It is PHI and gets
+  `display_name`'s treatment exactly: the row, the signature caption in the PDF, and nowhere else.
+  The column is paired with `on_behalf_of` by a CHECK, and by
+  `on_behalf_of_display_not_allowed` at the edge, where the host can read the refusal. A host that
+  sends no display name still leaves an identifier in that sentence, so the signing UI makes one
+  last substitution of its own: a label still shaped like an opaque id is rendered "for the
+  patient named in this document", which is true, readable, and points at the thing on the screen
+  that does name them (`frontend/src/lib/signing-api.ts::onBehalfOfPhrase`). It is a display
+  decision and reaches no request, event or column.
 
 ## 14. Addendum 1: paper archives, adopted signatures, re-authentication span
 

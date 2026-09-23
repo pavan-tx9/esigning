@@ -194,12 +194,17 @@ def _consented(signer: CertificateSigner) -> str:
     disclosure on the first document and the rest of the queue recorded that acceptance rather
     than asking again (SPEC section 16 C). The acceptance on *this* document is real and is timed
     here; what a reader must not be left to infer is that the disclosure was displayed again. So
-    the line says so, in the same breath as the time.
+    the line says so, in the same breath as the time -- and names the moment it *was* displayed,
+    because "earlier in the same sitting" on its own would read the same whether that was ninety
+    seconds or an hour before, and the difference is the whole of what a reader is weighing.
     """
     when = _when(signer.consented_at)
-    if signer.consent_relied_on:
+    if not signer.consent_relied_on:
+        return when
+    if signer.consent_displayed_at is None:
         return f"{when} (given for an earlier document in the same sitting)"
-    return when
+    displayed = _when(signer.consent_displayed_at)
+    return f"{when} (given for an earlier document in the same sitting; disclosure displayed {displayed})"
 
 
 def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> None:

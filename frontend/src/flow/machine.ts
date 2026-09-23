@@ -82,7 +82,12 @@ export function flowReducer(state: FlowState, event: FlowEvent): FlowState {
   }
   switch (event.type) {
     case "TOKEN_RECEIVED":
-      return state.phase === "connecting" || state.phase === "connect_failed"
+      // ...and from the Done screen, which is the host opening the next document of a run into
+      // the same iframe (addendum 3 B). Nowhere else: a token arriving mid-signature would be a
+      // swap of identities under somebody's hands.
+      return state.phase === "connecting" ||
+        state.phase === "connect_failed" ||
+        (state.phase === "active" && state.step === "done")
         ? { phase: "loading" }
         : state;
     case "CONNECT_TIMED_OUT":

@@ -143,6 +143,42 @@ export type ReauthScope = z.infer<typeof reauthScopeSchema>;
 export type SavedSignature = z.infer<typeof adoptedSignatureSchema>;
 export type StandingConsent = z.infer<typeof standingConsentSchema>;
 
+/** The shape `on_behalf_of` is held to server-side (`contracts.OPAQUE_ID_PATTERN`). */
+const IDENTIFIER_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$/;
+/**
+ * What no name has and every reference does. A hyphen alone is not enough -- "Anne-Marie" is a
+ * name -- but a digit, a dot, an underscore, a colon, an `@` or a `+` in a single unspaced word
+ * is a clinic's identifier and not what anybody is called.
+ */
+const IDENTIFIER_MARK = /[\d._:@+]/;
+
+/**
+ * How to name the person this signer acts for, in words.
+ *
+ * `on_behalf_of_label` is the host's `on_behalf_of_display` when it sent one and the opaque
+ * `on_behalf_of` otherwise (SPEC section 16 A), and both arrive as the same plain string. Since
+ * addendum 3 A the press of "Sign as ..." carries the whole of the intent confirmation, so a
+ * guardian whose host sent no display name would be asked to perform an act described in a
+ * reference only the clinic can read -- "Sign as Grace Okafor, on behalf of mrn-100907". When the
+ * label still looks like an identifier, the document open above is the thing that names the
+ * patient, so the sentence says that instead of reciting the reference.
+ *
+ * It is a display decision and only a display decision: the attribution in the record is the
+ * opaque `on_behalf_of` either way, and nothing here reaches the server.
+ */
+export function onBehalfOfPhrase(label: string | null): string | null {
+  if (label === null) {
+    return null;
+  }
+  const value = label.trim();
+  if (value === "") {
+    return null;
+  }
+  return IDENTIFIER_SHAPE.test(value) && IDENTIFIER_MARK.test(value)
+    ? "for the patient named in this document"
+    : `on behalf of ${value}`;
+}
+
 export const signingKeys = {
   all: ["signing"] as const,
   session: ["signing", "session"] as const,

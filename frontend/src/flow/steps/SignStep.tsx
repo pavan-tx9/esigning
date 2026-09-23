@@ -37,6 +37,7 @@ import {
   isSessionGone,
   isSignatureUnavailable,
   mustReadAgain,
+  onBehalfOfPhrase,
   postSign,
   type SigningField,
   type SigningSession,
@@ -67,6 +68,10 @@ const FALLBACK_LABELS: Record<SigningField["type"], string> = {
 };
 
 export const labelOf = (field: SigningField) => field.label.trim() || FALLBACK_LABELS[field.type];
+
+/** Said wherever a press would otherwise act on a signature the signer has not placed anywhere. */
+const UNPLACED_SIGNATURE =
+  "Your new signature hasn't been placed yet. Press the button on each field to put it where the document asks.";
 
 interface SignStepProps {
   session: SigningSession;
@@ -119,7 +124,14 @@ export function SignStep({
   // so a signer asked for initials alone has nothing to save for next time.
   const hasSignatureField = fields.some((field) => field.type === "signature");
   const remaining = remainingRequired(session.fields, draft);
-  const done = fields.filter((field) => draft.values[field.id] !== undefined).length;
+  // Counted with the predicate the button uses, not by "this field holds something": an unticked
+  // required box and a whitespace-only answer both hold a value, and a header reading "2 of 2
+  // done" over an inert button saying one thing is still needed is the screen calling itself a
+  // liar.
+  const done = fields.filter(
+    (field) =>
+      draft.values[field.id] !== undefined && isFieldComplete(field, draft.values[field.id], draft),
+  ).length;
 
   // Already in the cache from the Read step: parsed once for the whole screen, never refetched
   // (each fetch of the bytes is recorded server-side as `document.presented`).
@@ -134,6 +146,14 @@ export function SignStep({
   /** A press of "Sign as ..." waiting on the hand-off: it sends itself when the server vouches. */
   const [pressPending, setPressPending] = useState(false);
   const [nudge, setNudge] = useState<string | null>(null);
+  /**
+   * The field whose button was last pressed. Pressing "Sign here" replaces that button with
+   * "Remove", so React unmounts the thing that had focus and the browser drops focus to the
+   * document: the next Tab starts again at the top of the screen, once per field. The row that
+   * was acted in takes focus instead -- and only that row, because applying a different signature
+   * un-places the others and they must not fight over it.
+   */
+  const [acted, setActed] = useState<string | null>(null);
   const signHint = useId();
 
   /**
@@ -251,13 +271,19 @@ export function SignStep({
   }, [reauth.status, queryClient, announce, locale]);
 
   // The press is what asked for the hand-off, so the press is what it completes: once the server
-  // vouches, the signature goes without asking for a second tap.
+  // vouches, the signature goes without asking for a second tap. What it sends is still checked
+  // first -- `updateDraft` cancels a queued press, and this is the belt to that braces: the one
+  // thing on this screen that acts without a press must never send a submission nobody looked at.
   useEffect(() => {
     if (pressPending && verified && reauth.status === "idle" && !sign.isPending) {
       setPressPending(false);
+      if (remaining.length > 0) {
+        nudgeWhatIsMissing();
+        return;
+      }
       sign.mutate();
     }
-  }, [pressPending, verified, reauth.status, sign.isPending, sign.mutate]);
+  });
 
   useEffect(() => {
     if (reauth.status === "waiting" && now - reauth.since > REAUTH_TIMEOUT_MS) {
@@ -277,25 +303,49 @@ export function SignStep({
    * Any change to what would be signed. The last refusal described the *old* submission, so it
    * goes: leaving "Try again" on the button after the signer has mended what was wrong would name
    * the wrong action, and the message under it would be about a request nobody is sending.
+   *
+   * A press waiting on the hand-off goes with it. That press is the one piece of state here that
+   * acts on its own, and it was made about answers that no longer exist: letting it fire would
+   * send whatever the draft became -- in the worst case an empty one -- and answer it with a
+   * refusal naming the wrong problem.
    */
   const updateDraft = (next: Draft) => {
     sign.reset();
-    setNudge(null);
+    setPressPending(false);
+    if (reauth.status === "waiting" || reauth.status === "checking") {
+      setReauth({ status: "idle" });
+      setNudge(
+        "Your answers changed, so that press was cancelled. Press the button again when you're ready.",
+      );
+    } else {
+      setNudge(null);
+    }
     onDraft(next);
   };
 
   /** Place the signature the panel is showing in one field. The panel decides what that is. */
   const applyMark = (field: SigningField) => {
-    let next = draft;
-    if (draft.adopted === null) {
-      const chosen = panel.current?.commit() ?? null;
-      if (chosen === null) {
-        return;
-      }
-      next = withAdopted(next, chosen, next.initials, next.save);
+    // Asked on every apply, never only the first time. The panel is where a signature is chosen
+    // and it can be chosen again at any point on this screen; a guard that stopped asking after
+    // the first mark meant a signature drawn afterwards was shown, saved-looking, and silently
+    // left out of the submission while the earlier one was signed.
+    const chosen = panel.current?.commit();
+    if (chosen === undefined || !chosen.ok) {
+      // The refusal is said in the panel, which can be a screen away. Say it here too, beside the
+      // button that was actually pressed.
+      setNudge(chosen?.reason ?? "Please choose a signature first.");
+      return;
     }
-    updateDraft(withValue(next, field.id, { type: "mark" }));
-    const left = Math.max(0, remaining.length - (field.required ? 1 : 0));
+    // The same signature handed back is not a fresh choice: re-adopting would drop the marks
+    // already placed with it and make the signer place every one of them again.
+    const chose =
+      chosen.adopted === draft.adopted
+        ? draft
+        : withAdopted(draft, chosen.adopted, draft.initials, draft.save);
+    const next = withValue(chose, field.id, { type: "mark" });
+    updateDraft(next);
+    setActed(field.id);
+    const left = remainingRequired(session.fields, next).length;
     announce(
       `${field.type === "initials" ? "Initials" : "Signature"} added. ${
         left === 0 ? "Everything that's needed is filled in." : `${left} left to complete.`
@@ -303,12 +353,18 @@ export function SignStep({
     );
   };
 
-  const setValue = (field: SigningField, value: FieldValue | null) =>
+  const setValue = (field: SigningField, value: FieldValue | null) => {
+    if (isMarkField(field)) {
+      setActed(field.id);
+    }
     updateDraft(withValue(draft, field.id, value));
+  };
 
   // "Sign as ..." is inert until every required field is done, and pressing it then says what is
   // missing rather than doing nothing (the inert-button pattern). Re-authentication is not a
   // reason to be inert: the press is what triggers it.
+  // The fields list is the better answer here even when a signature is sitting unplaced in the
+  // panel, because an unplaced signature *is* one of the fields it names.
   const nudgeWhatIsMissing = () => {
     setNudge(
       remaining.length === 1
@@ -319,6 +375,12 @@ export function SignStep({
 
   const press = () => {
     setNudge(null);
+    // A signature drawn or typed but never placed is not what any field is carrying, so signing
+    // now would sign something other than what the panel is showing.
+    if (panel.current?.uncommitted() === true) {
+      setNudge(UNPLACED_SIGNATURE);
+      return;
+    }
     if (signer.requires_reauth && !verified) {
       startReauth();
       return;
@@ -329,9 +391,11 @@ export function SignStep({
   const signError = sign.error;
   const sessionGone = isSessionGone(signError);
   const waiting = reauth.status === "waiting" || reauth.status === "checking";
-  const signerName = `${signer.display_name}${
-    signer.on_behalf_of_label ? `, on behalf of ${signer.on_behalf_of_label}` : ""
-  }`;
+  // The button's label is the intent confirmation in full, so every word of it has to be a word
+  // the signer can check before pressing it. `onBehalfOfPhrase` is what keeps an unreadable
+  // patient reference out of that sentence.
+  const actingFor = onBehalfOfPhrase(signer.on_behalf_of_label);
+  const signerName = `${signer.display_name}${actingFor === null ? "" : `, ${actingFor}`}`;
 
   return (
     <StepScreen
@@ -360,7 +424,10 @@ export function SignStep({
           <h2 className="text-ink-900 text-xl">
             {fields.length === 1 ? "Where it goes" : "Where they go"}
           </h2>
-          <p role="status" data-testid="fields-progress" className="text-ink-700">
+          {/* Plain text, not a live region. `applyMark` already announces "Signature added. 1
+              left to complete.", and a status region here made a screen reader say the same fact
+              twice, in worse words. */}
+          <p data-testid="fields-progress" className="text-ink-700">
             <span className="font-semibold text-ink-900">
               {done} of {fields.length}
             </span>{" "}
@@ -377,6 +444,7 @@ export function SignStep({
                 session={session}
                 field={field}
                 draft={draft}
+                acted={acted === field.id}
                 onApply={() => applyMark(field)}
                 onValue={(value) => setValue(field, value)}
               />
@@ -450,9 +518,17 @@ export function SignStep({
             </>
           ) : isReauthLapsed(signError) ? null : signError instanceof ApiError &&
             signError.status === 422 ? (
+            // A 422 on this route is any of `unknown_field`, `duplicate_capture`,
+            // `missing_required_field`, `no_captures` or `capture_shape_invalid`, and the status
+            // alone does not say which field it was about. Naming one ("choose your signature
+            // again") was right for exactly one of them and sent the signer to the wrong box for
+            // the rest. Telling the truth at the altitude the status actually supports is better
+            // than a confident instruction; per-code copy would need the code, which is a piece
+            // of work on the error contract and not this addendum's.
             <p>
-              Something in your answers wasn't accepted. Choose your signature again, place it, and
-              try once more.
+              Something in your answers wasn't accepted, and nothing has been signed. Check the
+              fields above, then press the button again. If it keeps happening, ask a member of
+              staff for help.
             </p>
           ) : signError instanceof ApiError && signError.status === 429 ? (
             <p>Too many attempts in a short time. Please wait a minute and try again.</p>
@@ -466,7 +542,12 @@ export function SignStep({
       ) : null}
 
       {nudge ? (
-        <p id={signHint} role="alert" className="mt-6 font-medium text-danger-600">
+        <p
+          id={signHint}
+          role="alert"
+          data-testid="sign-nudge"
+          className="mt-6 font-medium text-danger-600"
+        >
           {nudge}
         </p>
       ) : null}
@@ -541,6 +622,8 @@ interface FieldRowProps {
   session: SigningSession;
   field: SigningField;
   draft: Draft;
+  /** This is the row whose own button was last pressed, so it is the row focus belongs in. */
+  acted: boolean;
   onApply: () => void;
   onValue: (value: FieldValue | null) => void;
 }
@@ -550,14 +633,33 @@ interface FieldRowProps {
  * the "review your signatures" step as well as the doing of it: every applied mark is shown here,
  * in place, which is why the summary screen is gone rather than merely moved.
  */
-function FieldRow({ pdf, session, field, draft, onApply, onValue }: FieldRowProps) {
+function FieldRow({ pdf, session, field, draft, acted, onApply, onValue }: FieldRowProps) {
   const announce = useAnnounce();
   const inputId = useId();
   const textCountId = useId();
   const label = labelOf(field);
   const value = draft.values[field.id];
-  const complete = isFieldComplete(field, value);
+  const complete = isFieldComplete(field, value, draft);
   const applied = value?.type === "mark";
+  const applyButton = useRef<HTMLButtonElement>(null);
+  const removeButton = useRef<HTMLButtonElement>(null);
+  const wasApplied = useRef(applied);
+
+  /**
+   * Pressing this row's button swaps it for a different one, so the pressed element is unmounted
+   * and focus falls to the document. Put it back where the signer was working -- but only in the
+   * row they pressed, and never on the first render, where a row that arrives already applied
+   * (a failed submission being mended) must not steal focus from the heading.
+   */
+  useEffect(() => {
+    if (wasApplied.current === applied) {
+      return;
+    }
+    wasApplied.current = applied;
+    if (acted) {
+      (applied ? removeButton : applyButton).current?.focus?.();
+    }
+  }, [applied, acted]);
   const text = value?.type === "text" ? value.text : "";
   const textLeft = text.length >= TEXT_FIELD_HINT_AT ? TEXT_FIELD_MAX - text.length : null;
   const adopted = draft.adopted;
@@ -599,6 +701,7 @@ function FieldRow({ pdf, session, field, draft, onApply, onValue }: FieldRowProp
                     {field.type === "initials" ? "Initials in place" : "Signature in place"}
                   </p>
                   <Button
+                    ref={removeButton}
                     variant="quiet"
                     onClick={() => {
                       onValue(null);
@@ -609,7 +712,7 @@ function FieldRow({ pdf, session, field, draft, onApply, onValue }: FieldRowProp
                   </Button>
                 </div>
               ) : (
-                <Button className="min-h-14 w-full" onClick={onApply}>
+                <Button ref={applyButton} className="min-h-14 w-full" onClick={onApply}>
                   {field.type === "initials" ? "Add initials" : "Sign here"}
                 </Button>
               )

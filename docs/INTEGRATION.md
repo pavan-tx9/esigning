@@ -91,6 +91,15 @@ Things worth knowing here:
   `conflict`.
 - `capacity` must be one the template's role allows. A `guardian` or `proxy` must also send
   `on_behalf_of`, and it must equal this envelope's `patient_ref`.
+- `on_behalf_of_display` (optional, `guardian` and `proxy` only, otherwise
+  `on_behalf_of_display_not_allowed`) is how that person should be *named* to the signer acting for
+  them. `on_behalf_of` has to be opaque because it reaches the audit trail, and since the sign
+  button became the whole of the intent confirmation the signer reads it: without this, a parent's
+  button says "Sign as Grace Okafor, on behalf of mrn-100907". Send the patient's name and it says
+  so instead. It is PHI, and is treated exactly like `display_name` — stored on the signer row and
+  printed in the document, never in the audit trail, a webhook payload, a log line or an error
+  message. The attribution in the record does not move: `on_behalf_of` is still what every event
+  carries. Omit it and the UI falls back to `on_behalf_of`, as it did before.
 - `signing_order` is `sequential` (session creation is gated on every earlier signer having signed)
   or `parallel` (any order, serialised by the envelope row lock).
 - A signer whose capacity is `clinician` always gets `requires_reauth: true`, whatever the
@@ -634,6 +643,16 @@ means one thing: *this* document is done with. What comes next is yours to decid
 envelope id against the document you opened for that person, create the next envelope and session,
 and post a fresh `esign:init` into the same iframe. Send no `queue` at all and nothing changes.
 
+**When a second `esign:init` is taken.** Into a live frame, only once the current document has
+reached its Done screen — which is the only moment `esign:next` is sent from, so answering that
+message is always in time. Posted any earlier it is ignored without a reply: a token arriving
+while a signature is being made would swap identities under the person signing, and no host has a
+good reason to do it. On the one it does take, the UI drops everything belonging to the finished
+document first (its token, its cached session, the document bytes, any signature in progress), so
+nothing of one signer's sitting can be read by the next. Reloading the iframe instead — a new
+`src`, then `esign:init` into the fresh frame on its `esign:ready` — is equally valid and is what
+`demo-host/src/demo_host/static/embed.js` does; it costs a page load and gains nothing beyond it.
+
 `next_title` is shown to the signer, so it is a title, never a name or a record number; the UI
 renders it as text and nothing else. A position that cannot be one ("9 of 3") is dropped rather
 than displayed. `demo-host/` implements the whole of this in about forty lines of `static/embed.js`
@@ -651,6 +670,13 @@ record changes — every envelope still writes its own `consent.accepted`, still
 certificate and `esign verify` can re-read it from that envelope's own trail. A kiosk session never
 has it, in either direction. There is nothing for a host to call: it is configuration, and turning
 it on is a compliance decision (`COMPLIANCE-CHECKLIST.md` C12).
+
+The span bounds how long the **disclosure may go undisplayed**, not how far apart two documents
+may be. Document three stands on document two, which stood on document one, and each event carries
+`relied_on_root_accepted_at` — the moment the notice was actually shown — forward unchanged. The
+span is measured from there, so a queue cannot renew the window a document at a time: whatever
+`CONSENT_SPAN_SECONDS` says, that many seconds after the person read the notice the checkbox comes
+back, however many forms they signed in between.
 
 ## 10. Reading the record back
 

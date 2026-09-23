@@ -913,14 +913,28 @@ class Verifier:
         ago, would all sit there looking exactly like a real one.
 
         So this goes and reads the other envelope's trail, which is hash-chained on its own, and
-        requires four things of what it finds: the same disclosure (``consent_text_id``), the same
+        requires six things of what it finds: the same disclosure (``consent_text_id``), the same
         person (the actor id both events record, on the same host), the time this event claims
         (within the row/event tolerance, since the recorded time came from the earlier signer's
-        row), and a gap no larger than :data:`esign.config.CONSENT_SPAN_MAX_SECONDS`. The cap is
-        the one part of the span that is a property of the code rather than of configuration
-        nobody wrote down: an acceptance this service relied on can never have been older, however
-        consistent the rest of the event is -- the same reasoning ``reauth_attestations_match_trail``
-        applies to a borrowed attestation.
+        row), a root -- the moment the disclosure was last *displayed* -- that is the earlier
+        acceptance's own root rather than a number this event chose, a gap from that root no larger
+        than :data:`esign.config.CONSENT_SPAN_MAX_SECONDS`, and no kiosk session behind the earlier
+        acceptance.
+
+        The cap is measured from the root, not from the acceptance relied on, and that is the whole
+        point of carrying the root: bounding one hop bounds nothing, because a chain of hops each
+        inside the cap has no bound at all -- twenty documents, an hour apart, and the notice
+        displayed once. The cap is also the one part of the span that is a property of the code
+        rather than of configuration nobody wrote down: a chain this service produced can never
+        have been longer, however consistent the rest of the event is -- the same reasoning
+        ``reauth_attestations_match_trail`` applies to a borrowed attestation.
+
+        The kiosk exclusion is re-derived here for the same reason every other rule in this module
+        is: SPEC section 16 C's hardest rule is "a kiosk session never has standing consent, in
+        either direction", and it is enforced at record time by a ``NOT EXISTS`` in one SQL string.
+        A module whose job is to assume nothing cannot take that on trust -- an envelope whose
+        consent rested on an acceptance given on a shared clinic tablet is a finding, whoever or
+        whatever wrote the row.
         """
         relying = [
             e
@@ -955,9 +969,14 @@ class Verifier:
                 # and an acceptance found there could not have been standing anyway.
                 problems.append(f"{signer_id}: its consent relied on an envelope of another host")
                 continue
-            gap = event.occurred_at - accepted_at
+            # The moment the notice was displayed, as this event claims it. An event written before
+            # the root was carried says only which acceptance it leaned on, and is held to that.
+            root_at = _timestamp(event.data.get("relied_on_root_accepted_at")) or accepted_at
+            gap = event.occurred_at - root_at
             if gap < timedelta(0) or gap > timedelta(seconds=CONSENT_SPAN_MAX_SECONDS):
-                problems.append(f"{signer_id}: the acceptance it relied on is outside the maximum consent span")
+                problems.append(f"{signer_id}: the disclosure it relied on was displayed outside the maximum span")
+            if root_at > accepted_at:
+                problems.append(f"{signer_id}: its consent claims a disclosure displayed after the acceptance it used")
             match = next(
                 (
                     e
@@ -971,7 +990,42 @@ class Verifier:
             )
             if match is None:
                 problems.append(f"{signer_id}: no matching acceptance is in the trail of the envelope it relied on")
+                continue
+            # The root is the earlier acceptance's own root, carried forward -- never a number
+            # this event was free to pick. An earlier acceptance that was itself given against the
+            # displayed notice is its own root.
+            earlier_root = (
+                _timestamp(match.data.get("relied_on_root_accepted_at"))
+                or _timestamp(match.data.get("relied_on_accepted_at"))
+                or match.occurred_at
+            )
+            if abs(root_at - earlier_root) > _ROW_EVENT_TOLERANCE:
+                problems.append(f"{signer_id}: its consent names a display time the earlier acceptance does not")
+            if self._consent_came_from_a_kiosk(db, match):
+                problems.append(f"{signer_id}: its consent relied on an acceptance given from a kiosk session")
         run.expect("consent_relied_on_matches_trail", not problems, "; ".join(sorted(set(problems))))
+
+    def _consent_came_from_a_kiosk(self, db: Session, accepted: AuditEvent) -> bool:
+        """Whether the signer whose acceptance this is ever held a kiosk session.
+
+        The same exclusion ``envelopes.repository._STANDING_CONSENT_SQL`` applies when it decides
+        what may stand: any kiosk session on that signer, not merely the one the acceptance came
+        from, because the question is whether the person behind it can be assumed to still be
+        sitting there. A signer id the event does not carry is a finding of its own elsewhere
+        (``signer_rows_match_trail``); here it simply cannot be cleared, so it is reported.
+        """
+        signer_id = _uuid(accepted.data.get("signer_id"))
+        if signer_id is None:
+            return True
+        return (
+            db.execute(
+                text(
+                    "SELECT 1 FROM signing_sessions WHERE signer_id = :id AND kiosk_staff_user_id IS NOT NULL LIMIT 1"
+                ),
+                {"id": signer_id},
+            ).scalar_one_or_none()
+            is not None
+        )
 
     def _check_sealed_pages_match_final_revision(
         self, run: _Run, fetched: dict[str, list[bytes]], status: str, kind: str = "electronic"
