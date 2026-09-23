@@ -1,15 +1,15 @@
 import { expect, test } from "@playwright/test";
 import {
-  adoptTyped,
-  agree,
-  fillEveryField,
+  agreeAndContinue,
   looksSealed,
   openReport,
+  placeEveryField,
   readEveryPage,
-  reauthenticate,
   report,
   shot,
+  signAndConfirmIfAsked,
   signIn,
+  typeSignature,
 } from "./flow";
 
 /**
@@ -56,9 +56,9 @@ test.describe("a thirty-page report, on a phone", () => {
     await expect(progress).toContainText("of 30");
     await expect(progress).toContainText(/Still to see: pages \d+ to 30/);
     expect((await progress.innerText()).length).toBeLessThan(80);
-    await frame.getByRole("button", { name: "Continue" }).click({ force: true });
+    await frame.getByRole("button", { name: "Continue to sign" }).click({ force: true });
     await expect(frame.getByRole("alert")).toContainText(/Please look at pages \d+ to 30/);
-    await expect(frame.getByTestId("step-consent")).toHaveCount(0);
+    await expect(frame.getByTestId("step-sign")).toHaveCount(0);
     await shot(page, "91-long-document-gate");
 
     const pages = await readEveryPage(frame);
@@ -66,15 +66,11 @@ test.describe("a thirty-page report, on a phone", () => {
     await expect(progress).toContainText("All pages seen");
     await shot(page, "92-all-thirty-pages-seen");
 
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptTyped(frame, "Priya Raman");
+    await agreeAndContinue(frame);
+    await typeSignature(frame, "Priya Raman");
     // One signature field and nothing else: the date beside it is the server's to fill.
-    await fillEveryField(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await reauthenticate(page, frame);
-    await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-    await frame.getByRole("button", { name: "Sign document" }).click();
+    await placeEveryField(frame);
+    await signAndConfirmIfAsked(page, frame);
     await expect(frame.getByTestId("copy-ready")).toBeVisible({ timeout: 180_000 });
     await shot(page, "93-report-signed-and-sealed");
 
@@ -124,14 +120,10 @@ test.describe("a report two clinicians sign in turn, on a phone", () => {
     let frame = await openReport(page, "RPT-2292");
     let pages = await readEveryPage(frame);
     expect(pages).toBe(25);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptTyped(frame, "Priya Raman");
-    await fillEveryField(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await reauthenticate(page, frame);
-    await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-    await frame.getByRole("button", { name: "Sign document" }).click();
+    await agreeAndContinue(frame);
+    await typeSignature(frame, "Priya Raman");
+    await placeEveryField(frame);
+    await signAndConfirmIfAsked(page, frame);
 
     // Signed, and honest that it is not finished: somebody else still has to co-sign it.
     await expect(frame.getByTestId("waiting-on-others")).toContainText("co-signing clinician");
@@ -147,14 +139,10 @@ test.describe("a report two clinicians sign in turn, on a phone", () => {
     await expect(frame.getByTestId("signing-as")).toContainText("Tomas Silva");
     pages = await readEveryPage(frame);
     expect(pages).toBe(25);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptTyped(frame, "Tomas Silva");
-    await fillEveryField(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await reauthenticate(page, frame);
-    await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-    await frame.getByRole("button", { name: "Sign document" }).click();
+    await agreeAndContinue(frame);
+    await typeSignature(frame, "Tomas Silva");
+    await placeEveryField(frame);
+    await signAndConfirmIfAsked(page, frame);
     await expect(frame.getByTestId("copy-ready")).toBeVisible({ timeout: 180_000 });
     await shot(page, "97-cosigned-and-sealed");
 

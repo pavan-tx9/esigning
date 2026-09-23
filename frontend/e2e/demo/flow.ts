@@ -2,8 +2,13 @@
  * Driving the real thing: the stand-in EHR in the page, the signing UI in its iframe, and the
  * actual API, worker, database and sealer behind both. These helpers do what a person does, so a
  * spec reads as a story rather than as a list of selectors.
+ *
+ * Since Addendum 3 the flow they drive is three screens -- read, sign, done -- so the helpers are
+ * three too: read the document and agree in the same scroll, place the signature, press the one
+ * button that signs. Nothing that produces evidence was dropped, so nothing here asserts less.
  */
 
+import { readFileSync } from "node:fs";
 import { expect, type FrameLocator, type Locator, type Page } from "@playwright/test";
 
 export const PASSWORD = "demo1234";
@@ -35,9 +40,11 @@ export async function openTask(page: Page, title: string): Promise<FrameLocator>
   await task(page, title).getByTestId("open-task").click();
   await expect(page).toHaveURL(/\/sign\//);
   const frame = ui(page);
-  await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 45_000 });
+  await expect(frame.getByTestId("step-read")).toBeVisible({ timeout: 45_000 });
   return frame;
 }
+
+// --------------------------------------------------------------------------- screen 1: read
 
 /** Read the document the way somebody actually does: bring each page up and let it be seen. */
 export async function readEveryPage(frame: FrameLocator): Promise<number> {
@@ -62,38 +69,70 @@ export async function readEveryPage(frame: FrameLocator): Promise<number> {
   return pages;
 }
 
-export async function agree(frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("step-consent")).toBeVisible();
-  await frame.getByRole("checkbox", { name: /I agree to sign electronically/ }).check();
-  await frame.getByRole("button", { name: "Agree and continue" }).click();
+/**
+ * Agree to sign electronically and go on to the Sign screen (Addendum 3 A). The agreement is in
+ * the same scroll as the document it is about, so this is a tick and a button rather than a screen.
+ *
+ * Where the service is running with a consent span and this person has already agreed in this
+ * sitting, the box is a line saying when they agreed instead. Both are the same act for the
+ * signer -- press Continue -- and both post `POST /signing/consent`, so the helper takes either.
+ */
+export async function agreeAndContinue(frame: FrameLocator): Promise<void> {
+  await expect(frame.getByTestId("consent-block")).toBeVisible();
+  const standing = frame.getByTestId("standing-consent");
+  if ((await standing.count()) === 0) {
+    await frame
+      .getByRole("checkbox", { name: /I agree to sign this document electronically/ })
+      .check();
+  } else {
+    await expect(standing).toContainText(/You agreed to sign electronically at \d{1,2}:\d{2}/);
+  }
+  await frame.getByRole("button", { name: "Continue to sign" }).click();
+  await expect(frame.getByTestId("step-sign")).toBeVisible();
 }
 
+/** Read every page, agree, and arrive on the Sign screen. */
+export async function readAndContinue(frame: FrameLocator): Promise<number> {
+  const pages = await readEveryPage(frame);
+  await agreeAndContinue(frame);
+  return pages;
+}
+
+// --------------------------------------------------------------------------- screen 2: sign
+
 /**
- * Get to the part of the adopt step where a signature is *made*.
+ * Open the chooser in the signature panel.
  *
  * The signing service's database outlives a demo run -- only the demo host's worklist is fresh --
- * so a clinician who kept their signature in an earlier run is offered it again here, and the
- * ways of making a new one are behind "Create a new one" until they ask for them (SPEC section
- * 14 B). A helper that means "make one now" has to say so rather than assume nothing is on file.
+ * so a clinician who kept their signature in an earlier run is shown it here rather than a set of
+ * ways to make one. A helper that means "make one now" has to ask for the chooser rather than
+ * assume nothing is on file.
  */
-async function makeANewSignature(frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
-  const anotherOne = frame.getByRole("radio", { name: /Create a new one/ });
-  if (await anotherOne.isVisible()) {
-    await anotherOne.check();
+async function chooseANewSignature(frame: FrameLocator): Promise<void> {
+  await expect(frame.getByTestId("signature-panel")).toBeVisible();
+  const change = frame.getByRole("button", { name: "Change" });
+  if (await change.isVisible()) {
+    await change.click();
   }
 }
 
-/** Adopt a signature by typing a name. Steadier than drawing, and exercises the font embedding. */
-export async function adoptTyped(frame: FrameLocator, name: string): Promise<void> {
-  await makeANewSignature(frame);
+/** Type a name as the signature. Steadier than drawing, and exercises the font embedding. */
+export async function typeSignature(frame: FrameLocator, name: string): Promise<void> {
+  await chooseANewSignature(frame);
   await frame.getByRole("radio", { name: /Type it/ }).check();
   await frame.getByLabel("Type your full name").fill(name);
-  await frame.getByRole("button", { name: "Use this signature" }).click();
 }
 
-export async function adoptDrawn(page: Page, frame: FrameLocator): Promise<void> {
-  await makeANewSignature(frame);
+/** Type a name and tick the box that keeps it for next time (SPEC section 14 B). */
+export async function typeSignatureAndSave(frame: FrameLocator, name: string): Promise<void> {
+  await typeSignature(frame, name);
+  const keep = frame.getByRole("checkbox", { name: /Save this signature for next time/ });
+  await expect(keep).not.toBeChecked();
+  await keep.check();
+}
+
+export async function drawSignature(page: Page, frame: FrameLocator): Promise<void> {
+  await chooseANewSignature(frame);
   const pad = frame.getByTestId("signature-pad");
   await pad.scrollIntoViewIfNeeded();
   const box = await pad.boundingBox();
@@ -116,59 +155,100 @@ export async function adoptDrawn(page: Page, frame: FrameLocator): Promise<void>
     }
     await page.mouse.up();
   }
-  await frame.getByRole("button", { name: "Use this signature" }).click();
+}
+
+/** The signature saved last time is what the panel shows: nothing to choose, only to place. */
+export async function savedSignatureIsOffered(frame: FrameLocator): Promise<void> {
+  await expect(frame.getByTestId("signature-panel")).toBeVisible();
+  await expect(frame.getByTestId("signature-showing")).toBeVisible();
+  await expect(frame.getByTestId("saved-signature")).toBeVisible();
 }
 
 /**
- * Work through this signer's fields until the summary appears. Every template puts different
- * fields in front of a signer, so the loop reacts to whatever the step is asking for.
+ * One explicit act per field, which is what the fields list is: a row per field, each with the
+ * part of the page its mark lands on. Every template puts different fields in front of a signer,
+ * so the loop answers whatever each row is asking for.
  */
-export async function fillEveryField(frame: FrameLocator): Promise<void> {
-  for (let guard = 0; guard < 12; guard += 1) {
-    if (await frame.getByTestId("step-sign-summary").isVisible()) {
-      return;
+export async function placeEveryField(frame: FrameLocator): Promise<void> {
+  const rows = frame.locator('[data-testid="field-row"]');
+  const count = await rows.count();
+  expect(count).toBeGreaterThan(0);
+  for (let index = 0; index < count; index += 1) {
+    const row = rows.nth(index);
+    await row.scrollIntoViewIfNeeded();
+    if ((await row.getAttribute("data-done")) === "true") {
+      continue;
     }
-    await expect(frame.getByTestId("step-sign-field")).toBeVisible();
-    const signHere = frame.getByRole("button", { name: /^(Sign here|Add my initials here)$/ });
-    const checkbox = frame.getByRole("checkbox");
-    const textBox = frame.getByRole("textbox");
-    if (await signHere.isVisible()) {
-      await signHere.click();
+    const mark = row.getByRole("button", { name: /^(Sign here|Add initials)$/ });
+    const checkbox = row.getByRole("checkbox");
+    const textBox = row.getByRole("textbox");
+    if (await mark.isVisible()) {
+      await mark.click();
     } else if (await checkbox.first().isVisible()) {
       await checkbox.first().check();
     } else if (await textBox.first().isVisible()) {
       await textBox.first().fill("Noted");
     }
-    const next = frame.getByRole("button", { name: /^(Next|Check your answers)$/ });
-    await next.click();
+    await expect(row).toHaveAttribute("data-done", "true");
   }
-  throw new Error("the signing step never reached the summary");
-}
-
-export async function confirmAndSign(frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("step-sign-summary")).toBeVisible();
-  await frame.getByRole("button", { name: "Continue" }).click();
-  await expect(frame.getByTestId("step-confirm")).toBeVisible();
-  await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-  await frame.getByRole("button", { name: "Sign document" }).click();
+  await expect(frame.getByTestId("fields-progress")).toContainText(`${count} of ${count}`);
 }
 
 /**
- * The host page's side of re-authentication: the UI asks, the EHR takes a password.
- *
- * The demo runs the service with a re-authentication span, so a confirmation this clinician made
- * for another document a few minutes ago may still cover this one; the button is then "Confirm
- * again", and pressing it exercises exactly the same hand-off.
+ * The one press that signs (Addendum 3 A 3). It is the intent confirmation -- there is no
+ * checkbox restating it -- and, for a role that needs re-authentication with nothing live, it is
+ * also what asks the host for it.
  */
-export async function reauthenticate(page: Page, frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("step-confirm")).toBeVisible();
-  await frame.getByRole("button", { name: /^(Confirm it's me|Confirm again)$/ }).click();
+export async function signDocument(frame: FrameLocator): Promise<void> {
+  const button = frame.getByTestId("sign-button");
+  await button.scrollIntoViewIfNeeded();
+  await expect(button).toContainText(/^Sign as /);
+  await button.click();
+}
+
+/**
+ * The host page's side of re-authentication, which now happens on the press: the press asks, the
+ * EHR takes a password, and the signature goes by itself when the service has been told. No
+ * second tap, which is the point of the addendum.
+ *
+ * Only for a signer the service is not already vouching for. Where it may be -- the demo runs
+ * with a re-authentication span -- use `signAndConfirmIfAsked`.
+ */
+export async function signWithReauth(page: Page, frame: FrameLocator): Promise<void> {
+  await expect(frame.getByTestId("reauth-needed")).toContainText("when you press this");
+  await signDocument(frame);
   await expect(frame.getByTestId("reauth-waiting")).toBeVisible();
   await expect(page.locator("#reauth")).toBeVisible();
   await page.getByLabel("Password").fill(PASSWORD);
   await page.getByTestId("reauth-confirm").click();
-  await expect(frame.getByTestId("reauth-verified")).toBeVisible();
+  await expect(frame.getByTestId("step-done")).toBeVisible({ timeout: 60_000 });
 }
+
+/**
+ * Sign, and answer the host's password prompt if one is asked for.
+ *
+ * Whether it is asked for is the *service's* decision, not the spec's: with a re-authentication
+ * span running, a confirmation this clinician made minutes ago on another document may still
+ * cover this one, and then the press signs with no hand-off at all. The screen says which it will
+ * be before the press -- "your records system will ask you to confirm it's you when you press
+ * this", or a line saying when the confirmation was made -- so this reads that and then insists
+ * on the half it named.
+ */
+export async function signAndConfirmIfAsked(
+  page: Page,
+  frame: FrameLocator,
+): Promise<"handed off" | "already confirmed"> {
+  const vouchedFor = (await frame.getByTestId("reauth-verified").count()) > 0;
+  if (!vouchedFor) {
+    await signWithReauth(page, frame);
+    return "handed off";
+  }
+  await signDocument(frame);
+  await expect(frame.getByTestId("step-done")).toBeVisible({ timeout: 60_000 });
+  return "already confirmed";
+}
+
+// --------------------------------------------------------------------------- the host, afterwards
 
 /**
  * Wait for something the EHR only finds out by asking again. Its pages are plain server-rendered
@@ -211,25 +291,6 @@ export function looksSealed(pdf: Buffer, envelopeId?: string): void {
   }
 }
 
-/** Adopt a typed signature and tick the box that keeps it for next time (SPEC section 14 B). */
-export async function adoptTypedAndSave(frame: FrameLocator, name: string): Promise<void> {
-  await makeANewSignature(frame);
-  await frame.getByRole("radio", { name: /Type it/ }).check();
-  await frame.getByLabel("Type your full name").fill(name);
-  const keep = frame.getByRole("checkbox", { name: /Save this signature for next time/ });
-  await expect(keep).not.toBeChecked();
-  await keep.check();
-  await frame.getByRole("button", { name: "Use this signature" }).click();
-}
-
-/** The signature saved last time is offered first; take it. Still placed per field afterwards. */
-export async function useSavedSignature(frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
-  await expect(frame.getByTestId("saved-signature")).toBeVisible();
-  await expect(frame.getByRole("radio", { name: /Use my saved signature/ })).toBeChecked();
-  await frame.getByRole("button", { name: "Use this signature" }).click();
-}
-
 /** A report on a clinician's Reports page (Addendum 2), by the EHR's own reference for it. */
 export function report(page: Page, reference: string) {
   return page.locator(`[data-testid="report"][data-reference="${reference}"]`);
@@ -247,19 +308,63 @@ export async function openReport(page: Page, reference: string): Promise<FrameLo
   await report(page, reference).getByTestId("open-report").click();
   await expect(page).toHaveURL(/\/sign\//);
   const frame = ui(page);
-  await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 90_000 });
+  await expect(frame.getByTestId("step-read")).toBeVisible({ timeout: 90_000 });
   return frame;
 }
 
-/** A queue document: open from the queue page, read, agree, sign with a typed name. */
-export async function openFromQueue(page: Page, title: string): Promise<FrameLocator> {
-  await page
+/** A row of a clinician's signing queue, by the document's title. */
+export function queueTask(page: Page, title: string) {
+  return page
     .locator('[data-testid="queue-task"]')
-    .filter({ has: page.getByRole("heading", { name: title }) })
-    .getByTestId("queue-sign")
-    .click();
+    .filter({ has: page.getByRole("heading", { name: title }) });
+}
+
+/** Open a queue document, which from Addendum 3 B starts a run through the rest of them. */
+export async function openFromQueue(page: Page, title: string): Promise<FrameLocator> {
+  await queueTask(page, title).getByTestId("queue-sign").click();
   await expect(page).toHaveURL(/\/sign\//);
   const frame = ui(page);
-  await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 45_000 });
+  await expect(frame.getByTestId("step-read")).toBeVisible({ timeout: 45_000 });
   return frame;
+}
+
+// --------------------------------------------------------------------------- the evidence itself
+
+/**
+ * The audit trail of one envelope, from the Host API, with the key `make demo` wrote down.
+ *
+ * A spec that asserted on the screen alone would be checking what the EHR says happened. This is
+ * the service's own hash-chained record, read the way a customer's backend reads it, and it is
+ * where Addendum 3 C's claim can actually be checked: that every document in a sitting has its
+ * own `consent.accepted`, and that the ones standing on an earlier agreement say which.
+ */
+export interface AuditEvent {
+  event_type: string;
+  data: Record<string, unknown>;
+  actor: { user_id: string | null; role: string };
+}
+
+export async function auditTrail(page: Page, envelopeId: string): Promise<AuditEvent[]> {
+  const key = demoApiKey();
+  const response = await page.request.get(
+    `${process.env.DEMO_ESIGN_API_URL ?? "http://localhost:8000"}/v1/envelopes/${envelopeId}/audit`,
+    { headers: { Authorization: `Bearer ${key}` } },
+  );
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as { events: AuditEvent[] };
+  return body.events;
+}
+
+let apiKey: string | null = null;
+
+function demoApiKey(): string {
+  if (apiKey === null) {
+    const env = readFileSync(new URL("../../../.demo/env", import.meta.url), "utf8");
+    const found = /^DEMO_ESIGN_API_KEY=(.+)$/m.exec(env)?.[1]?.trim();
+    if (found === undefined) {
+      throw new Error("no API key in .demo/env; the demo stack writes it when it registers");
+    }
+    apiKey = found;
+  }
+  return apiKey;
 }

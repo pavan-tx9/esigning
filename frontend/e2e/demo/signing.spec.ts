@@ -1,20 +1,21 @@
 import { readFileSync } from "node:fs";
 import { expect, type Frame, type Page, test } from "@playwright/test";
 import {
-  adoptDrawn,
-  adoptTyped,
-  agree,
-  confirmAndSign,
-  fillEveryField,
+  agreeAndContinue,
+  drawSignature,
   heard,
   looksSealed,
   openTask,
+  placeEveryField,
+  readAndContinue,
   readEveryPage,
-  reauthenticate,
   reloadUntilVisible,
   shot,
+  signAndConfirmIfAsked,
+  signDocument,
   signIn,
   task,
+  typeSignature,
   ui,
   waitForWebhook,
 } from "./flow";
@@ -54,37 +55,44 @@ test.describe("a patient with a phone in the waiting room", () => {
 
     const frame = await openTask(page, "Acknowledgement of privacy practices");
     await expect(frame.getByTestId("signing-as")).toContainText("Maria Alvarez");
+    await expect(frame.getByTestId("step-progress")).toContainText("Step 1 of 3");
     await readEveryPage(frame);
-    await shot(page, "phone-02-review");
+    await shot(page, "phone-02-read");
 
     // The document is rendered to be read, and nothing forces the page sideways.
     const canvas = await frame.locator('[data-page="1"] canvas').boundingBox();
     expect(canvas?.width ?? 0).toBeGreaterThan(300);
     expect(await sidewaysScroll(embeddedFrame(page))).toBe(0);
 
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await expect(frame.getByTestId("step-consent")).toBeVisible();
-    await shot(page, "phone-03-consent");
-    await agree(frame);
+    // Addendum 3 A: the agreement is in the same scroll as the document it is about. It opens in
+    // place, so the page it is about is still on screen behind it.
+    await frame.getByTestId("consent-block").scrollIntoViewIfNeeded();
+    await expect(frame.getByTestId("disclosure")).toHaveAttribute("data-expanded", "false");
+    await frame.getByRole("button", { name: "Read the full notice" }).click();
+    await expect(frame.getByTestId("disclosure")).toHaveAttribute("data-expanded", "true");
+    await shot(page, "phone-03-consent-in-the-same-scroll");
+    await agreeAndContinue(frame);
 
-    await adoptDrawn(page, frame);
-    await shot(page, "phone-04-signature-adopted");
+    await expect(frame.getByTestId("step-progress")).toContainText("Step 2 of 3");
+    await drawSignature(page, frame);
+    await shot(page, "phone-04-signature-chosen");
 
-    // A finger, not a mouse: the action that moves the flow on is a real touch target.
-    const next = await frame
-      .getByRole("button", { name: /^(Sign here|Next|Check your answers)$/ })
+    // A finger, not a mouse: the action that places a mark is a real touch target.
+    const place = await frame
+      .getByRole("button", { name: /^(Sign here|Add initials)$/ })
       .first()
       .boundingBox();
-    expect(next?.height ?? 0).toBeGreaterThanOrEqual(44);
+    expect(place?.height ?? 0).toBeGreaterThanOrEqual(44);
 
-    await fillEveryField(frame);
-    await confirmAndSign(frame);
+    await placeEveryField(frame);
+    await shot(page, "phone-05-fields-placed");
+    await signDocument(frame);
 
     // Sealed inline or by the worker; the UI polls and says honestly which it is meanwhile.
     await expect(frame.getByTestId("step-done")).toBeVisible();
     await expect(frame.getByTestId("copy-ready")).toBeVisible({ timeout: 120_000 });
     expect(await sidewaysScroll(embeddedFrame(page))).toBe(0);
-    await shot(page, "phone-05-signed-and-sealed");
+    await shot(page, "phone-06-signed-and-sealed");
 
     // The signer's own copy, out of the UI, really is a sealed PDF.
     const [download] = await Promise.all([
@@ -111,12 +119,12 @@ test.describe("a patient with a phone in the waiting room", () => {
     await expect(
       page.getByRole("heading", { name: "Acknowledgement of privacy practices" }),
     ).toBeVisible();
-    await shot(page, "phone-06-filed-in-the-chart");
+    await shot(page, "phone-07-filed-in-the-chart");
 
     // And anybody can make the service re-check the seal, the hashes and the chain on the spot.
     await page.getByTestId("verify").click();
     await expect(page.getByTestId("verification-result")).toContainText("Verified.");
-    await shot(page, "phone-07-verified");
+    await shot(page, "phone-08-verified");
   });
 });
 
@@ -161,24 +169,20 @@ test.describe("a procedure consent needing three people", () => {
     test("signs first and is told the copy comes later", async ({ page }) => {
       await signIn(page, "maria");
       const frame = await openTask(page, "Consent to a procedure");
-      const pages = await readEveryPage(frame);
+      const pages = await readAndContinue(frame);
       expect(pages).toBe(3);
-      await shot(page, "tablet-01-review");
+      await shot(page, "tablet-01-read-and-agreed");
       expect(await sidewaysScroll(embeddedFrame(page))).toBe(0);
 
-      await frame.getByRole("button", { name: "Continue" }).click();
-      await expect(frame.getByTestId("step-consent")).toBeVisible();
-      await shot(page, "tablet-02-consent");
-      await agree(frame);
-      await adoptDrawn(page, frame);
-      await shot(page, "tablet-03-signature-adopted");
-      await fillEveryField(frame);
-      await confirmAndSign(frame);
+      await drawSignature(page, frame);
+      await placeEveryField(frame);
+      await shot(page, "tablet-02-ready-to-sign");
+      await signDocument(frame);
 
       await expect(frame.getByTestId("waiting-on-others")).toContainText(
         "the witness and the clinician",
       );
-      await shot(page, "tablet-04-waiting-on-others");
+      await shot(page, "tablet-03-waiting-on-others");
     });
   });
 
@@ -192,35 +196,38 @@ test.describe("a procedure consent needing three people", () => {
   test("the witness signs next", async ({ page }) => {
     await signIn(page, "ben");
     const frame = await openTask(page, "Consent to a procedure");
-    await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptTyped(frame, "Ben Doyle");
-    await fillEveryField(frame);
-    await confirmAndSign(frame);
+    await readAndContinue(frame);
+    await typeSignature(frame, "Ben Doyle");
+    await placeEveryField(frame);
+    await signDocument(frame);
     await expect(frame.getByTestId("step-done")).toBeVisible();
   });
 
-  test("the clinician re-authenticates through the EHR, signs, and it seals", async ({ page }) => {
+  test("the clinician re-authenticates through the EHR on the press, and it seals", async ({
+    page,
+  }) => {
     await signIn(page, "priya");
     const frame = await openTask(page, "Consent to a procedure");
-    await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptTyped(frame, "Priya Raman");
-    await fillEveryField(frame);
-    await expect(frame.getByTestId("step-sign-summary")).toBeVisible();
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await shot(page, "20-reauth-asked-for");
+    await readAndContinue(frame);
+    await typeSignature(frame, "Priya Raman");
+    await placeEveryField(frame);
 
-    await reauthenticate(page, frame);
-    await shot(page, "21-reauth-confirmed");
-    expect(await heard(page)).toEqual(
-      expect.arrayContaining(["esign:reauth_required", "esign:reauth_done"]),
-    );
+    // Addendum 3 A 4: re-authentication is asked for by the press that signs, not by a screen
+    // before it, and nothing else is pressed afterwards. Whether it is asked for at all is the
+    // service's call: the demo runs with a re-authentication span, so a confirmation she made on
+    // her queue a few minutes ago may still cover this signature -- and then the record says so
+    // instead, and the host page is never asked for a password.
+    await shot(page, "20-ready-to-sign-as-a-clinician");
+    const how = await signAndConfirmIfAsked(page, frame);
+    await shot(page, "21-signed-as-a-clinician");
+    if (how === "handed off") {
+      expect(await heard(page)).toEqual(
+        expect.arrayContaining(["esign:reauth_required", "esign:reauth_done"]),
+      );
+    } else {
+      expect(await heard(page)).not.toContain("esign:reauth_required");
+    }
 
-    await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-    await frame.getByRole("button", { name: "Sign document" }).click();
     await expect(frame.getByTestId("copy-ready")).toBeVisible({ timeout: 150_000 });
     await shot(page, "22-three-signers-sealed");
 
@@ -244,9 +251,9 @@ test("choosing paper ends the envelope and tells the clinic", async ({ page }) =
   await signIn(page, "grace");
   const frame = await openTask(page, "Consent to treatment");
   await readEveryPage(frame);
-  await frame.getByRole("button", { name: "Continue" }).click();
 
-  await expect(frame.getByTestId("step-consent")).toBeVisible();
+  // Visible on the Read screen as much as on the Sign screen: the way out is never more than one
+  // quiet link away, wherever the signer has got to.
   await frame.getByRole("button", { name: "I'd rather sign on paper" }).click();
   await expect(frame.getByTestId("step-decline")).toBeVisible();
   await expect(frame.getByRole("radio", { name: "I would rather sign on paper" })).toBeChecked();
@@ -288,13 +295,16 @@ test.describe("the clinic tablet", () => {
       "Maria Alvarez is signing in front of Alice Wu; identity checked by photo id",
     );
     const frame = ui(page);
-    await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 45_000 });
+    await expect(frame.getByTestId("step-read")).toBeVisible({ timeout: 45_000 });
     await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptDrawn(page, frame);
-    await fillEveryField(frame);
-    await confirmAndSign(frame);
+
+    // A shared tablet is never handed somebody else's agreement, whatever the consent span is
+    // set to: the person in front of it may not be the person who agreed (Addendum 3 C).
+    await expect(frame.getByTestId("standing-consent")).toHaveCount(0);
+    await agreeAndContinue(frame);
+    await drawSignature(page, frame);
+    await placeEveryField(frame);
+    await signDocument(frame);
 
     // The tablet ends by asking for itself back, and forgets who was holding it.
     await expect(frame.getByTestId("screen-handback")).toBeVisible();

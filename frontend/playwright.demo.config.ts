@@ -24,6 +24,9 @@ export default defineConfig({
   expect: { timeout: 20_000 },
   use: {
     baseURL: process.env.DEMO_HOST_URL ?? "http://localhost:8100",
+    // Bounded, so a click that waits for something the stack has not done yet fails with the
+    // locator it was waiting on rather than sitting there until the whole test times out.
+    actionTimeout: 60_000,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
     // A clinician at a desk. The phone and tablet sizes are set per spec.

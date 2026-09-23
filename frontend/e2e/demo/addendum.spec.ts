@@ -1,27 +1,33 @@
 import { fileURLToPath } from "node:url";
-import { expect, test } from "@playwright/test";
+import { expect, type FrameLocator, type Page, test } from "@playwright/test";
 import {
-  adoptDrawn,
-  adoptTypedAndSave,
-  agree,
-  confirmAndSign,
-  fillEveryField,
+  type AuditEvent,
+  agreeAndContinue,
+  auditTrail,
+  drawSignature,
   looksSealed,
   openFromQueue,
   openTask,
+  placeEveryField,
+  queueTask,
+  readAndContinue,
   readEveryPage,
-  reauthenticate,
   reloadUntilVisible,
+  savedSignatureIsOffered,
   shot,
+  signDocument,
   signIn,
+  signWithReauth,
+  typeSignature,
+  typeSignatureAndSave,
   ui,
-  useSavedSignature,
 } from "./flow";
 
 /**
- * Addendum 1 against the real stack: a paper document filed by the front desk, a clinician's
- * signing queue on one confirmation, a signature saved on one order and offered on the next, a
- * shared tablet that is never offered it, and the front desk taking it away.
+ * Addenda 1 and 3 against the real stack: a paper document filed by the front desk, a clinician's
+ * queue signed as one run on one confirmation of identity and one agreement to sign
+ * electronically, a signature saved on one order and offered on the next, a shared tablet that is
+ * never offered either, and the front desk taking the saved signature away.
  *
  * Serial with the rest of the demo suite, on documents of its own (Sam's, and the clinicians'
  * order queues), so it leaves the worklist `signing.spec.ts` expects untouched.
@@ -78,69 +84,206 @@ test("the front desk files a scan of an ink-signed consent, and it is sealed and
   expect(page.url()).not.toMatch(/Alvarez|mrn-/);
 });
 
-// --------------------------------------------------------------------------- C. the signing queue
+// ------------------------------------------------- C + 3 B/C. the queue, signed as one run
 
-test("a clinician confirms once and signs three orders in a row; each record says which confirmation", async ({
+const ORDERS = [
+  "Order sign-off ORD-4471",
+  "Order sign-off ORD-4472",
+  "Order sign-off ORD-4473",
+  "Order sign-off ORD-4474",
+  "Order sign-off ORD-4475",
+];
+
+/** Every press of anything pressable inside the signing UI, since this document was opened. */
+async function tapsOnThisDocument(page: Page): Promise<string[]> {
+  const frame = page.frames().find((f) => f.url().includes("/sign?host="));
+  return (await frame?.evaluate(() => (window as unknown as { __taps: string[] }).__taps)) ?? [];
+}
+
+/** A signature is on file, whatever earlier runs left in the service's database. */
+async function haveASignatureOnFile(frame: FrameLocator, name: string): Promise<void> {
+  if ((await frame.getByTestId("saved-signature").count()) > 0) {
+    await savedSignatureIsOffered(frame);
+    return;
+  }
+  await typeSignatureAndSave(frame, name);
+}
+
+const consentEvent = (events: AuditEvent[]) =>
+  events.find((event) => event.event_type === "consent.accepted");
+
+test("a clinician confirms once, agrees once, and signs five orders that open one after another", async ({
   page,
 }) => {
+  // Five documents, five seals, five webhook deliveries, all in one test because the run is the
+  // thing being tested: it cannot be split without splitting the sitting.
+  test.setTimeout(900_000);
+
+  // The count is of real presses in the real browser, so "three taps" is measured rather than
+  // asserted. The iframe reloads between documents, so each document starts the count again.
+  await page.addInitScript(() => {
+    (window as unknown as { __taps: string[] }).__taps = [];
+    document.addEventListener(
+      "click",
+      (event) => {
+        const hit = (event.target as HTMLElement | null)?.closest(
+          "button, a, input, label, [role='button']",
+        );
+        if (hit) {
+          (window as unknown as { __taps: string[] }).__taps.push(
+            (hit.textContent ?? hit.nodeName).trim().slice(0, 40),
+          );
+        }
+      },
+      true,
+    );
+  });
+
   await signIn(page, "priya");
   await page.getByRole("link", { name: "Signing queue" }).click();
   await expect(page.getByRole("heading", { name: "Signing queue" })).toBeVisible();
-  await expect(page.locator('[data-testid="queue-task"]')).toHaveCount(4);
+  // Her five orders, and the procedure consent that is hers to sign but not yet her turn.
+  await expect(page.locator('[data-testid="queue-task"]')).toHaveCount(6);
+  // A report is read, not run through: it has its own page and never joins the queue.
+  await expect(page.getByText("Annual care summary")).toHaveCount(0);
   await shot(page, "60-queue");
 
-  // One confirmation, checked by the EHR and attested server to server on the first document.
+  // One confirmation of identity, checked by the EHR and attested server to server on the first
+  // document's session (Addendum 1 C).
   await page.locator("#queue-password").fill("demo1234");
   await page.getByTestId("queue-confirm").click();
   await expect(page.getByTestId("queue-confirmed")).toBeVisible();
   await shot(page, "61-queue-confirmed");
 
-  const orders = ["Order sign-off ORD-4471", "Order sign-off ORD-4472", "Order sign-off ORD-4473"];
-  for (const [index, title] of orders.entries()) {
-    const frame = await openFromQueue(page, title);
-    await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await frame.getByRole("radio", { name: /Use my printed name/ }).check();
-    await frame.getByRole("button", { name: "Use this signature" }).click();
-    await fillEveryField(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
+  const frame = await openFromQueue(page, ORDERS[0] as string);
+  await expect(page.getByTestId("queue-run")).toContainText("Document 1 of 5 in this run");
 
-    // No hand-off: the service already vouches for her, and the screen says on what grounds.
-    await expect(frame.getByTestId("step-confirm")).toBeVisible();
+  for (const [index, title] of ORDERS.entries()) {
+    // The host page and the signing UI agree about which document this is and where it sits.
+    await expect(page.getByTestId("sign-title")).toContainText(title);
+    await expect(frame.getByTestId("queue-progress")).toContainText(`${index + 1} of 5`);
+    await readEveryPage(frame);
+
+    // Addendum 3 C: the rest of the run says when the agreement was given instead of asking
+    // again. (The first order asks, unless this clinician agreed within the span in an earlier
+    // run against this same database -- which is the same sitting as far as the service is
+    // concerned. What must hold either way is that it does not stand on anything in this run,
+    // which the trail is checked for below.)
+    if (index > 0) {
+      await expect(frame.getByTestId("standing-consent")).toBeVisible();
+      await shot(page, `62-order-${index + 1}-standing-consent`);
+    }
+    await agreeAndContinue(frame);
+
+    // No hand-off: the service vouches for her already, and the screen says on what grounds.
     const covered = frame.getByTestId("reauth-verified");
-    await expect(covered).toContainText(/You confirmed your identity at \d{1,2}:\d{2}/);
     await expect(covered).toHaveAttribute("data-reauth-scope", index === 0 ? "session" : "span");
     if (index > 0) {
       await expect(covered).toContainText("for an earlier document");
     }
-    await expect(frame.getByRole("button", { name: "Confirm it's me" })).toHaveCount(0);
     await expect(page.locator("#reauth")).toBeHidden();
-    if (index === 1) {
-      await shot(page, "62-queue-second-document-covered");
+
+    if (index === 0) {
+      await haveASignatureOnFile(frame, "Priya Raman");
+    } else {
+      await savedSignatureIsOffered(frame);
+    }
+    await placeEveryField(frame);
+    await signDocument(frame);
+    await expect(frame.getByTestId("step-done")).toBeVisible();
+
+    // Addendum 3 A, measured against the real service: read, place, sign.
+    if (index > 0) {
+      const taps = await tapsOnThisDocument(page);
+      expect(taps).toHaveLength(3);
+      expect(taps[0]).toBe("Continue to sign");
+      expect(taps[1]).toBe("Sign here");
+      expect(taps[2]).toMatch(/^Sign as /);
     }
 
-    await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-    await frame.getByRole("button", { name: "Sign document" }).click();
-    await expect(frame.getByTestId("step-done")).toBeVisible();
-    await expect(page.getByTestId("back-link")).toBeVisible({ timeout: 120_000 });
-    // The host page never had to ask for a password on any of the three.
-    await expect(page.locator('#log li[data-message="esign:reauth_required"]')).toHaveCount(0);
-    await page.getByTestId("back-link").click();
-    await expect(page.getByRole("heading", { name: "Signing queue" })).toBeVisible();
+    if (index < ORDERS.length - 1) {
+      // It counts down in the open and then asks the host, which opens the next one into the
+      // same frame as its own session. Nothing goes back to the list in between.
+      await expect(frame.getByTestId("queue-next")).toBeVisible();
+      if (index === 0) {
+        await shot(page, "63-countdown-to-the-next-order");
+      }
+      await expect(frame.getByTestId("queue-progress")).toContainText(`${index + 2} of 5`, {
+        timeout: 60_000,
+      });
+      await expect(page).toHaveURL(/\/sign\//);
+    }
   }
-  await expect(page.locator('[data-testid="queue-task"][data-status="signed"]')).toHaveCount(3);
-  await shot(page, "63-queue-done");
 
-  // The sealed copies are in the charts, and the verifier is happy with a borrowed attestation.
-  await page.getByRole("link", { name: "Worklist" }).click();
-  await page.getByRole("link", { name: "Sam Okafor" }).click();
-  const order = page.locator('[data-testid="chart-document"]', { hasText: "ORD-4472" });
-  await reloadUntilVisible(page, order);
-  await order.getByRole("link").click();
+  // The last one says so, and the host page ends the run rather than sending her back to a list.
+  await expect(frame.getByTestId("queue-finished")).toContainText("That was the last of 5");
+  await expect(page.getByTestId("queue-all-signed")).toContainText("All 5 signed");
+  await shot(page, "64-all-five-signed");
+  await expect(page.locator('#log li[data-message="esign:next"]')).toHaveCount(4);
+  await expect(page.locator('#log li[data-message="esign:reauth_required"]')).toHaveCount(0);
+
+  // ----------------------------------------------------------------- what each envelope records
+  await page.goto("/queue");
+  // The queue page knows nothing until it is asked again: each signature is the service's to
+  // report, and each sealed copy arrives by webhook afterwards. Wait for all five to be filed.
+  await expect
+    .poll(
+      async () => {
+        await page.reload();
+        let filed = 0;
+        for (const title of ORDERS) {
+          filed += await queueTask(page, title)
+            .getByRole("link", { name: "See it in the chart" })
+            .count();
+        }
+        return filed;
+      },
+      { timeout: 300_000, intervals: [3_000] },
+    )
+    .toBe(5);
+  await shot(page, "65-queue-done");
+  await expect(page.locator('[data-testid="queue-task"][data-status="signed"]')).toHaveCount(5);
+
+  const envelopes: string[] = [];
+  for (const title of ORDERS) {
+    await queueTask(page, title).getByRole("link", { name: "See it in the chart" }).click();
+    envelopes.push((await page.getByTestId("envelope-id").innerText()).trim());
+    await page.goBack();
+  }
+  expect(new Set(envelopes).size).toBe(5);
+
+  for (const [index, envelopeId] of envelopes.entries()) {
+    const events = await auditTrail(page, envelopeId);
+    const types = events.map((event) => event.event_type);
+    // Every document in the sitting was read, agreed to and signed on its own. The span changed
+    // whether the notice was displayed again, and nothing about what is on the record.
+    expect(types).toContain("document.viewed");
+    expect(types).toContain("consent.accepted");
+    expect(types).toContain("signer.signed");
+    // Nobody else is in this envelope's trail: every event that names a user names her, and the
+    // rest are the host's own calls and the service's own work (sealing, the certificate).
+    const named = [
+      ...new Set(events.map((event) => event.actor.user_id).filter((id) => id !== null)),
+    ];
+    expect(named).toEqual(["u-priya"]);
+
+    const consent = consentEvent(events);
+    if (index === 0) {
+      expect(envelopes).not.toContain(consent?.data.relied_on_envelope_id);
+    } else {
+      // It stands on the agreement given for the document before it, and says which and when.
+      expect(consent?.data.relied_on_envelope_id).toBe(envelopes[index - 1]);
+      expect(consent?.data.relied_on_accepted_at).toEqual(expect.any(String));
+    }
+  }
+
+  // And the verifier is happy with both borrowings: the attestation and the agreement.
+  await queueTask(page, ORDERS[2] as string)
+    .getByRole("link", { name: "See it in the chart" })
+    .click();
   await page.getByTestId("verify").click();
   await expect(page.getByTestId("verification-result")).toContainText("Verified.");
-  await shot(page, "64-queue-order-verified");
+  await shot(page, "66-queue-order-verified");
 });
 
 // --------------------------------------------------------------------------- B. a saved signature
@@ -148,39 +291,31 @@ test("a clinician confirms once and signs three orders in a row; each record say
 test("a clinician saves a signature on one order and is offered it on the next", async ({
   page,
 }) => {
+  test.setTimeout(420_000);
   await signIn(page, "tomas");
   await page.getByRole("link", { name: "Signing queue" }).click();
 
-  // The first order: the usual hand-off, and the signature kept for next time.
-  let frame = await openFromQueue(page, "Order sign-off ORD-4480");
-  await readEveryPage(frame);
-  await frame.getByRole("button", { name: "Continue" }).click();
-  await agree(frame);
-  await adoptTypedAndSave(frame, "Tomas Silva");
+  // The first order: no confirmation made on the queue page, so the press asks the host for one.
+  const frame = await openFromQueue(page, "Order sign-off ORD-4480");
+  await readAndContinue(frame);
+  await typeSignatureAndSave(frame, "Tomas Silva");
   await shot(page, "70-save-signature");
-  await fillEveryField(frame);
-  await frame.getByRole("button", { name: "Continue" }).click();
-  await reauthenticate(page, frame);
-  await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-  await frame.getByRole("button", { name: "Sign document" }).click();
-  await expect(frame.getByTestId("step-done")).toBeVisible();
-  await expect(page.getByTestId("back-link")).toBeVisible({ timeout: 120_000 });
-  await page.getByTestId("back-link").click();
+  await placeEveryField(frame);
+  await signWithReauth(page, frame);
 
-  // The second: offered first, placed per field, and the confirmation from the first still holds.
-  frame = await openFromQueue(page, "Order sign-off ORD-4481");
-  await readEveryPage(frame);
-  await frame.getByRole("button", { name: "Continue" }).click();
-  await agree(frame);
-  await expect(frame.getByText(/Typed · saved on/)).toBeVisible();
+  // The second opens by itself, and offers what he kept rather than asking him to make it again.
+  await expect(frame.getByTestId("queue-progress")).toContainText("2 of 2", { timeout: 60_000 });
+  await expect(page.getByTestId("sign-title")).toContainText("ORD-4481");
+  await readAndContinue(frame);
+  await savedSignatureIsOffered(frame);
+  await expect(frame.getByTestId("saved-signature")).toContainText(/Saved name · kept from/);
   await shot(page, "71-saved-signature-offered");
-  await useSavedSignature(frame);
-  await fillEveryField(frame);
-  await frame.getByRole("button", { name: "Continue" }).click();
   await expect(frame.getByTestId("reauth-verified")).toHaveAttribute("data-reauth-scope", "span");
-  await frame.getByRole("checkbox", { name: /I want to sign it as/ }).check();
-  await frame.getByRole("button", { name: "Sign document" }).click();
+  await placeEveryField(frame);
+  await signDocument(frame);
+
   await expect(frame.getByTestId("copy-ready")).toBeVisible({ timeout: 120_000 });
+  await expect(page.getByTestId("queue-all-signed")).toContainText("All 2 signed");
   await shot(page, "72-signed-with-saved-signature");
   await expect(page.getByTestId("filed-link")).toBeVisible({ timeout: 120_000 });
   await page.getByTestId("filed-link").click();
@@ -199,12 +334,10 @@ test.describe("a saved signature, a shared tablet, and the front desk", () => {
     // Sam, on the portal, keeps his signature.
     await signIn(page, "sam");
     let frame = await openTask(page, "Acknowledgement of privacy practices (annual)");
-    await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await adoptTypedAndSave(frame, "Sam Okafor");
-    await fillEveryField(frame);
-    await confirmAndSign(frame);
+    await readAndContinue(frame);
+    await typeSignatureAndSave(frame, "Sam Okafor");
+    await placeEveryField(frame);
+    await signDocument(frame);
     await expect(frame.getByTestId("step-done")).toBeVisible();
 
     // The front desk hands him the clinic tablet for the next one: nothing saved is offered.
@@ -216,17 +349,18 @@ test.describe("a saved signature, a shared tablet, and the front desk", () => {
     await card.getByRole("radio", { name: "Photo ID" }).check();
     await card.getByTestId("kiosk-start").click();
     frame = ui(page);
-    await expect(frame.getByTestId("step-review")).toBeVisible({ timeout: 45_000 });
+    await expect(frame.getByTestId("step-read")).toBeVisible({ timeout: 45_000 });
     await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+    // Neither the agreement he gave a minute ago nor the signature he kept is offered here.
+    await expect(frame.getByTestId("standing-consent")).toHaveCount(0);
+    await agreeAndContinue(frame);
+    await expect(frame.getByTestId("signature-panel")).toBeVisible();
     await expect(frame.getByTestId("saved-signature")).toHaveCount(0);
     await expect(frame.getByTestId("save-signature")).toHaveCount(0);
     await shot(page, "80-kiosk-nothing-saved-offered");
-    await adoptDrawn(page, frame);
-    await fillEveryField(frame);
-    await confirmAndSign(frame);
+    await drawSignature(page, frame);
+    await placeEveryField(frame);
+    await signDocument(frame);
     await expect(frame.getByTestId("screen-handback")).toBeVisible();
     await page.getByTestId("kiosk-finish").click();
 
@@ -242,11 +376,10 @@ test.describe("a saved signature, a shared tablet, and the front desk", () => {
     // His next session on the portal is not offered it.
     await signIn(page, "sam");
     frame = await openTask(page, "Consent to treatment (review appointment)");
-    await readEveryPage(frame);
-    await frame.getByRole("button", { name: "Continue" }).click();
-    await agree(frame);
-    await expect(frame.getByTestId("step-sign-adopt")).toBeVisible();
+    await readAndContinue(frame);
+    await expect(frame.getByTestId("signature-panel")).toBeVisible();
     await expect(frame.getByTestId("saved-signature")).toHaveCount(0);
+    await typeSignature(frame, "Sam Okafor");
     await expect(frame.getByTestId("save-signature")).toBeVisible();
     await shot(page, "82-after-revoke-nothing-offered");
   });
