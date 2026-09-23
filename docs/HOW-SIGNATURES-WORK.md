@@ -664,7 +664,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 
 | Check | Failing means |
 |---|---|
-| `audit_chain` | The chain does not verify. Sub-problems name the row: `sequence gap after 4` (an event is missing), `wrong prev_event_hash at 7` (the chain was re-linked), `hash mismatch at 7` (a column was edited), `non-monotonic occurred_at at 9` (a timestamp was moved backwards), `data keys do not match signer.signed at 7`, `unknown event_type at 11`. All but the last two require database-level access the application role does not have. **`data keys do not match <type>` has a second, innocent cause**: an event's `data` key set is compared against the model *this build* declares, so events written before a release that added a field to that type report it for ever after, with every hash still intact. Addendum 1 did exactly that to `signer.signed` (`reauth_attestation_id`, `reauth_scope`, `reauth_age_seconds`, `adopted_signature_id`), so documents signed before migration `0700` verify `FAILED` on this line and on `reauth_attestations_match_trail` while every stored hash, the seal and `certificate_head_hash` still pass. Tampering moves a hash; a release does not — `docs/RUNBOOK.md` §6.5 has the triage |
+| `audit_chain` | The chain does not verify. Sub-problems name the row: `sequence gap after 4` (an event is missing), `wrong prev_event_hash at 7` (the chain was re-linked), `hash mismatch at 7` (a column was edited), `non-monotonic occurred_at at 9` (a timestamp was moved backwards), `data keys do not match signer.signed at 7`, `unknown event_type at 11`. All but the last two require database-level access the application role does not have. **`data keys do not match <type>` has a second, innocent cause**: an event's `data` key set is compared against the model *this build* declares, so events written before a release that added a field to that type report it for ever after, with every hash still intact. Addendum 1 did exactly that to `signer.signed` (`reauth_attestation_id`, `reauth_scope`, `reauth_age_seconds`, `adopted_signature_id`), so documents signed before migration `0700` verify `FAILED` on this line and on `reauth_attestations_match_trail` while every stored hash, the seal and `certificate_head_hash` still pass. Addendum 3 did the same to `consent.accepted` (`relied_on_envelope_id`, `relied_on_accepted_at`, `relied_on_root_accepted_at`), so an envelope consented to before that release reports `data keys do not match consent.accepted at N` for ever, whether or not the consent span was ever switched on. Tampering moves a hash; a release does not — `docs/RUNBOOK.md` §6.5 has the triage |
 | `revision_numbers_gapless` | `document_revisions` is not `1..n`. A revision row was removed, which needs owner access |
 | `revision_N_<kind>_hash` | A stored revision is unreadable, or its bytes no longer hash to what the row claims (`blob_corrupt`), or the row exists and the object is gone (`blob_missing`). This is data loss or tampering in the object store |
 | `envelope_presented_pointer` / `envelope_current_revision_pointer` / `envelope_sealed_pointer` | The `envelopes` row points at different bytes than the revision table holds. The row was edited |
@@ -673,6 +673,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `capture_images_intact` | A stored drawn-signature image is missing or no longer hashes to its digest |
 | `captures_match_trail` | The capture `signer.signed` recorded is gone, or the row now points at a different image. The ink was swapped after the fact. An `adopted` capture (a saved signature, Addendum 1 B) keeps no ink of its own and points at the `adopted_signatures` row; the check follows that pointer, so the saved image is re-hashed and compared too |
 | `reauth_attestations_match_trail` | A signature that says it rested on a re-authentication names an attestation row that is missing, made for another user or host, made in a different session than `reauth_scope` claims, or whose method or `auth_time` (to within five seconds of `occurred_at - reauth_age_seconds`) is not what `signer.signed` recorded (Addendum 1 C) |
+| `consent_relied_on_matches_trail` | A `consent.accepted` that rested on an earlier acceptance (Addendum 3 C) cannot be corroborated from the envelope it names: that envelope is not in the database, or belongs to another host; its own hash-chained trail holds no acceptance of the same disclosure (`consent_text_id`), by the same person, at the time this event claims; the display time carried forward is not the one that earlier acceptance carried, or is after the acceptance itself; the notice it stands on was displayed more than `CONSENT_SPAN_MAX_SECONDS` (one hour) before this acceptance — a bound the code cannot exceed, so a longer chain describes something this service never produced; or the acceptance it leans on came from a kiosk session, where standing consent is never available in either direction. An envelope that collected its own consent **passes** this check rather than skipping it |
 | `envelope_row_matches_trail` | `created_at`, `document_type`, `template_version_id`, template key or version differ from what `envelope.created` recorded. For a paper archive the same check runs against `archive.created` and `archive.attested`: the filing and attestation times, the document type, and the `attestation` column's staff id, statement, disposition and paper-signer count (the scan's own hash is covered by `revision_1_scan_hash` and `trail_presented_hash`). That column is an ordinary jsonb column the application can update, so it is compared exactly as a signer row is. For a host document (Addendum 2) the comparison is against `envelope.created` and `document.supplied`: `template_version_id`, `template_key` and `template_version` must all be absent, `host_document_ref` must be the one recorded, and the SHA-256 of `envelopes.field_definitions['signer_roles']` must equal `document.supplied.signer_roles_sha256` — that column is UPDATE-able and holds the `requires_reauth` flags the certificate prints, so the digest is what stands in for a template version's immutability |
 | `signer_rows_match_trail` | A `signers` row disagrees with the trail: a timestamp more than 60 seconds from the event that recorded it, a status that does not match whether `signer.signed` exists, a rewritten `role_key`, `capacity`, `on_behalf_of` or `consent_text_id`, or no `document.viewed` covering the revision the signature was built on |
 | `supplied_document_recorded` | (Addendum 2, host documents only.) The envelope's stream does not hold exactly one `document.supplied` event. Either it was never written — which cannot happen through the application, since it is appended in the same transaction as the envelope row — or the stream holds two, which means two creations were recorded against one envelope. Nothing else in the report can be trusted about where this document came from until this passes |
@@ -842,7 +843,86 @@ opaque identifier that resolves inside the EHR rather than a description of the 
 
 ---
 
-## 7. Things a careful reader will ask
+## 7. Addendum 3: a shorter flow, and consent for a sitting
+
+Addendum 3 (`docs/SPEC-ADDENDUM-3.md`) took the signing flow from five screens to three — read,
+sign, done — and let one agreement to sign electronically cover a sitting. It removed **screens**,
+not acts: every page is still displayed before consent (`document.viewed`), consent is still
+explicit, each field still takes its own action, and the role that must re-authenticate still does.
+Two things about the evidence are worth stating exactly, because both are places where what the
+record holds did not change and what it *means* did.
+
+- **Intent is the press of the sign button.** The signer used to tick "I've read the document, and
+  I want to sign it as …" and then press "Sign document" — two acts saying the same thing, on a
+  screen after the one where they had signed the fields. Now one primary button, "Sign as
+  Maria Alvarez" (or "… on behalf of …"), sits under the sentence "By pressing this you are signing
+  this document. It counts the same as signing on paper, and you will get a copy." The request
+  still carries `intent_confirmed: true`, the service still refuses a signature without it, and
+  `signer.signed` records exactly what it always did. What changed is which act that flag stands
+  for, which is a judgement about what a court reads as intent rather than anything a test can
+  settle: `docs/COMPLIANCE-CHECKLIST.md` C13 is open for counsel, and §2.14 there maps each
+  non-negotiable act to where it now lives.
+- **Consent may stand for a sitting** (`CONSENT_SPAN_SECONDS`, default `0`, at most `3600`). With
+  it on, an acceptance by the same `(host_id, host_user_id)` of the same disclosure version and
+  locale stands for that person's other documents for that long, and the second document shows "You
+  agreed to sign electronically at 09:12" instead of the checkbox. **Every envelope still records
+  its own acceptance**: `consent.accepted` on its own stream, `signers.consent_text_id` and
+  `consented_at` set exactly as with the span off, and no signature accepted without them. What is
+  weakened is that the disclosure was not displayed again; what contains it is that the event says
+  so — `relied_on_envelope_id`, `relied_on_accepted_at`, and `relied_on_root_accepted_at`, the
+  moment the notice was last actually shown, carried forward unchanged through a chain so a queue
+  cannot renew the window a document at a time. The certificate prints "Consented 09:14 (given for
+  an earlier document in the same sitting; disclosure displayed 09:12)", and
+  `consent_relied_on_matches_trail` (section 4) re-reads the other envelope's trail years later. A
+  kiosk session never has it, in either direction — the same rule that keeps a saved signature off
+  a shared tablet — and verification re-derives that too rather than trusting the SQL that enforced
+  it. Off by default; switching it on is a compliance decision
+  (`docs/COMPLIANCE-CHECKLIST.md` C12, `docs/RUNBOOK.md` §7).
+
+### (j) Following a standing acceptance by hand
+
+Nothing here needs the service. Two queries against two streams, both hash-chained:
+
+```sh
+# 1. This envelope's own acceptance, and what it says it stood on.
+psql -c "SELECT sequence, occurred_at, actor_user_id, data
+         FROM audit_events
+         WHERE stream_id = '<envelope id>' AND event_type = 'consent.accepted'"
+# data: {"signer_id": "…", "consent_text_id": "8f1c…", "consent_version": "2026-09",
+#        "locale": "en-US", "body_sha256": "4d90…",
+#        "relied_on_envelope_id": "b1d0f6e2-…",                    the earlier document
+#        "relied_on_accepted_at": "2026-09-22T09:12:04.481073Z",   its acceptance
+#        "relied_on_root_accepted_at": "2026-09-22T09:12:04.481073Z"}  the notice displayed
+
+# 2. The same acceptance, in that envelope's own trail.
+psql -c "SELECT sequence, occurred_at, actor_user_id, data
+         FROM audit_events
+         WHERE stream_id = 'b1d0f6e2-…' AND event_type = 'consent.accepted'"
+```
+
+The second row has to exist, name the same `consent_text_id`, carry the same `actor_user_id`, and
+sit at `relied_on_accepted_at` (within the same 60-second row/event tolerance every other
+comparison uses). Its own root — its `relied_on_root_accepted_at`, or its `occurred_at` when it was
+the document that displayed the notice — is what the first row must have carried forward, and the
+gap from that root to the first row's `occurred_at` cannot exceed one hour. Then take the earlier
+acceptance's own `data.signer_id` and look for a kiosk context on any of that signer's sessions
+(`SELECT kiosk_staff_user_id FROM signing_sessions WHERE signer_id = '<that signer id>'`): one that
+is not null, and the acceptance was never one that could stand — the question is whether the person
+can be assumed to still be sitting there, so it is any session of theirs, not merely the one the
+acceptance came from. Those are the six things `consent_relied_on_matches_trail` checks, in the
+order it checks them.
+
+**What an opposing expert should ask, and the honest answer.** "Was the disclosure in front of this
+person when they agreed to sign *this* document?" With the span off, yes, and the trail of this one
+envelope says so. With it on, no — it was in front of them at `relied_on_root_accepted_at`, on the
+document named, minutes earlier at the same desk, and they agreed again here by pressing Continue
+with the standing line on screen. The record never claims otherwise: that is why the times are on
+the event, on the certificate and re-checkable from a second trail rather than smoothed into one
+"Consented" timestamp.
+
+---
+
+## 8. Things a careful reader will ask
 
 **"The signer's own copy — is it the same document?"** Yes, byte for byte. `GET /v1/signing/copy`
 returns the sealed blob and nothing else; while the seal is pending it returns `202 {"status":

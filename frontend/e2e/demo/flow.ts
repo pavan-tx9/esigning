@@ -75,20 +75,24 @@ export async function readEveryPage(frame: FrameLocator): Promise<number> {
  *
  * Where the service is running with a consent span and this person has already agreed in this
  * sitting, the box is a line saying when they agreed instead. Both are the same act for the
- * signer -- press Continue -- and both post `POST /signing/consent`, so the helper takes either.
+ * signer -- press Continue -- and both post `POST /signing/consent`, so the helper takes either
+ * and answers which one it got. A spec that cares asserts that answer against the envelope's
+ * trail, never against what an earlier run happened to leave in the service's database.
  */
-export async function agreeAndContinue(frame: FrameLocator): Promise<void> {
+export async function agreeAndContinue(frame: FrameLocator): Promise<boolean> {
   await expect(frame.getByTestId("consent-block")).toBeVisible();
   const standing = frame.getByTestId("standing-consent");
-  if ((await standing.count()) === 0) {
+  const stood = (await standing.count()) > 0;
+  if (stood) {
+    await expect(standing).toContainText(/You agreed to sign electronically at \d{1,2}:\d{2}/);
+  } else {
     await frame
       .getByRole("checkbox", { name: /I agree to sign this document electronically/ })
       .check();
-  } else {
-    await expect(standing).toContainText(/You agreed to sign electronically at \d{1,2}:\d{2}/);
   }
   await frame.getByRole("button", { name: "Continue to sign" }).click();
   await expect(frame.getByTestId("step-sign")).toBeVisible();
+  return stood;
 }
 
 /** Read every page, agree, and arrive on the Sign screen. */

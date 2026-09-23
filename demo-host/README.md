@@ -76,7 +76,11 @@ of document may be signed electronically.
   in between, and the run ends on an "All 5 signed" panel. Reports stay out of it (below), and so
   does anything waiting on another signer. With the consent span on as well, each order after the
   first shows "You agreed to sign electronically at 09:12" instead of the checkbox -- three taps
-  per document: continue, place the signature, sign.
+  per document: continue, place the signature, sign. Which document displays the notice is decided
+  by when this person last read it, not by where they are in the run: the service's database
+  outlives a demo run, so a clinician who agreed a few minutes ago in an earlier run is still in
+  that sitting and the first order stands too, and a sitting that began fifteen minutes ago runs
+  out part-way through, which puts the checkbox back on that document and starts the window again.
 - **Reports** (`/reports`, clinicians). Addendum 2: a document this system generates rather than
   one the service renders. "Generate and sign" renders a report for that patient with
   `reportlab` -- thirty pages of their own record for the annual summary, twenty-five for the case

@@ -843,7 +843,9 @@ have — with one exception, which is worth ruling out first because it is the o
    `sequence gap` and no `wrong prev_event_hash`?** Then nothing was edited. An event's key set is
    compared against the model the *running build* declares, so every event of that type written
    before a release that added a field to it reports this, for ever, with its hash still correct.
-   Addendum 1 did this to `signer.signed`: a document signed before migration `0700` now reports
+   Addendum 1 did this to `signer.signed`, and Addendum 3 to `consent.accepted` (three
+   `relied_on_*` keys, written on every acceptance since, whether or not the consent span is on).
+   A document signed before migration `0700` now reports
 
    ```
    FAILED  audit_chain  data keys do not match signer.signed at 7
@@ -1177,8 +1179,9 @@ uv --directory backend run esign consent add \
    and another worker takes it over.
 3. After any upgrade, seal one document and verify it — including in Acrobat if the sealing path
    changed at all.
-4. **If the release adds a field to an audit event's `data`** — Addendum 1 did, to `signer.signed`
-   — then every event of that type written before it will report `data keys do not match <type>`
+4. **If the release adds a field to an audit event's `data`** — Addendum 1 did, to `signer.signed`,
+   and Addendum 3 to `consent.accepted` — then every event of that type written before it will
+   report `data keys do not match <type>`
    from then on, and those envelopes verify `FAILED` although nothing was touched (§6.5 step 0).
    Before upgrading, run `esign verify --json` over a sample and keep the reports: a verification
    recorded as `ok` on the old build, plus the `verification.performed` events already in each

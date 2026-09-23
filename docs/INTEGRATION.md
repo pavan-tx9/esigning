@@ -377,6 +377,19 @@ client that sends a PDF, a hash, a timestamp or a `date_signed` value is refused
 than quietly ignored. `sign` requires an `Idempotency-Key` (422 `idempotency_key_required`); a
 retry with the same key returns the first response and creates one revision.
 
+Two of those requests are worth a sentence, because the UI in front of them changed with Addendum 3
+and the API did not:
+
+- `session` carries the disclosure to display as `consent: {version, locale, body, standing}`.
+  `standing` is `null` unless this person's acceptance of that same disclosure is still good
+  (§9, the consent span), and the UI shows it under the last page of the document rather than on a
+  screen of its own. When it is not null, the consent post that follows may name the envelope it
+  stands on: `{"consent_version": "…", "accepted": true, "relies_on_envelope_id": "…"}`.
+- `intent_confirmed: true` is what the press of the one primary button — "Sign as Maria Alvarez",
+  under the sentence saying what pressing it does — means. There is no separate intent checkbox
+  above it any more; the flag is still required, and `sign` is refused without it
+  (`COMPLIANCE-CHECKLIST.md` C13).
+
 ## 6. Webhooks
 
 Five events: `envelope.completed`, `envelope.sealed`, `envelope.declined`, `envelope.voided`,
@@ -670,6 +683,30 @@ record changes — every envelope still writes its own `consent.accepted`, still
 certificate and `esign verify` can re-read it from that envelope's own trail. A kiosk session never
 has it, in either direction. There is nothing for a host to call: it is configuration, and turning
 it on is a compliance decision (`COMPLIANCE-CHECKLIST.md` C12).
+
+What the signer's browser sees, for an integrator reading the session payload or writing their own
+client:
+
+```json
+{"consent": {"version": "2026-09", "locale": "en-US", "body": "…the disclosure…",
+             "standing": {"accepted_at": "2026-09-22T09:12:04Z",
+                          "envelope_id": "b1d0f6e2-…"}}}
+```
+
+```sh
+curl -s -X POST $API/v1/signing/consent -H "$SAUTH" \
+  -d '{"consent_version": "2026-09", "accepted": true,
+       "relies_on_envelope_id": "b1d0f6e2-…"}'
+```
+
+`relies_on_envelope_id` is a claim, never a record: the service re-runs the same lookup that
+offered the line, narrowed to the envelope named, and anything that does not match — another
+person's acceptance, another host's envelope, an acceptance of a disclosure in another version or
+another language, a kiosk session at either end, a notice displayed longer ago than the span, a
+span since turned off — is `409 consent_not_standing`, at which point the UI shows the checkbox and
+the signer agrees here. (A client posting a `consent_version` that is no longer current is
+`consent_version_stale`, span or no span, as it always was.) With the span off, or from a client
+that has never heard of the field, `POST /signing/consent` behaves exactly as it always has.
 
 The span bounds how long the **disclosure may go undisplayed**, not how far apart two documents
 may be. Document three stands on document two, which stood on document one, and each event carries

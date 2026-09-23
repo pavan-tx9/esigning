@@ -158,6 +158,9 @@ test("a clinician confirms once, agrees once, and signs five orders that open on
   const frame = await openFromQueue(page, ORDERS[0] as string);
   await expect(page.getByTestId("queue-run")).toContainText("Document 1 of 5 in this run");
 
+  /** Per document: did the agreement stand on an earlier one, or was the notice displayed here? */
+  const stood: boolean[] = [];
+
   for (const [index, title] of ORDERS.entries()) {
     // The host page and the signing UI agree about which document this is and where it sits.
     await expect(page.getByTestId("sign-title")).toContainText(title);
@@ -165,15 +168,17 @@ test("a clinician confirms once, agrees once, and signs five orders that open on
     await readEveryPage(frame);
 
     // Addendum 3 C: the rest of the run says when the agreement was given instead of asking
-    // again. (The first order asks, unless this clinician agreed within the span in an earlier
-    // run against this same database -- which is the same sitting as far as the service is
-    // concerned. What must hold either way is that it does not stand on anything in this run,
-    // which the trail is checked for below.)
-    if (index > 0) {
-      await expect(frame.getByTestId("standing-consent")).toBeVisible();
+    // again. Which document displays the notice is the database's to decide, not this spec's:
+    // the span is measured from when the notice was last *displayed* and carried forward
+    // unchanged, so a clinician who agreed in an earlier run against this same database is
+    // still in that sitting (the first order then stands too), and a sitting that began before
+    // this run can run out inside it (the notice comes back on that document, and the ones
+    // after it stand on it). Exactly one of the two screens is right each time; which one
+    // appeared is recorded here and checked against each envelope's own trail below.
+    if ((await frame.getByTestId("standing-consent").count()) > 0 && !stood.some(Boolean)) {
       await shot(page, `62-order-${index + 1}-standing-consent`);
     }
-    await agreeAndContinue(frame);
+    stood.push(await agreeAndContinue(frame));
 
     // No hand-off: the service vouches for her already, and the screen says on what grounds.
     const covered = frame.getByTestId("reauth-verified");
@@ -192,13 +197,19 @@ test("a clinician confirms once, agrees once, and signs five orders that open on
     await signDocument(frame);
     await expect(frame.getByTestId("step-done")).toBeVisible();
 
-    // Addendum 3 A, measured against the real service: read, place, sign.
+    // Addendum 3 A, measured against the real service: read, place, sign. The tick is the fourth
+    // tap on the document that displayed the notice, which is what the span removes from the
+    // rest of the run -- so the three are counted after it, wherever it fell.
     if (index > 0) {
       const taps = await tapsOnThisDocument(page);
-      expect(taps).toHaveLength(3);
-      expect(taps[0]).toBe("Continue to sign");
-      expect(taps[1]).toBe("Sign here");
-      expect(taps[2]).toMatch(/^Sign as /);
+      if (!stood[index]) {
+        expect(taps[0]).toMatch(/^I agree to sign this document/);
+      }
+      const presses = stood[index] ? taps : taps.slice(1);
+      expect(presses).toHaveLength(3);
+      expect(presses[0]).toBe("Continue to sign");
+      expect(presses[1]).toBe("Sign here");
+      expect(presses[2]).toMatch(/^Sign as /);
     }
 
     if (index < ORDERS.length - 1) {
@@ -268,14 +279,25 @@ test("a clinician confirms once, agrees once, and signs five orders that open on
     expect(named).toEqual(["u-priya"]);
 
     const consent = consentEvent(events);
-    if (index === 0) {
+    if (!stood[index]) {
+      // The notice was displayed on this document, so the agreement rests on nothing else.
+      expect(consent?.data.relied_on_envelope_id ?? null).toBeNull();
+    } else if (index === 0) {
+      // It stood before this run began, so it names an envelope from an earlier sitting -- never
+      // one of these five, which did not exist yet.
+      expect(consent?.data.relied_on_envelope_id).toEqual(expect.any(String));
       expect(envelopes).not.toContain(consent?.data.relied_on_envelope_id);
     } else {
       // It stands on the agreement given for the document before it, and says which and when.
       expect(consent?.data.relied_on_envelope_id).toBe(envelopes[index - 1]);
       expect(consent?.data.relied_on_accepted_at).toEqual(expect.any(String));
+      expect(consent?.data.relied_on_root_accepted_at).toEqual(expect.any(String));
     }
   }
+
+  // Whatever state the database was in, the run itself proves the shortcut: the notice is
+  // displayed at most once in five documents, and the others stand on that agreement.
+  expect(stood.filter((it) => !it).length).toBeLessThanOrEqual(1);
 
   // And the verifier is happy with both borrowings: the attestation and the agreement.
   await queueTask(page, ORDERS[2] as string)
