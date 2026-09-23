@@ -246,9 +246,10 @@ export function CheckRow({ checked, onChange, children, describedBy, invalid }: 
         aria-describedby={describedBy}
         aria-invalid={invalid || undefined}
         onChange={(event) => onChange(event.target.checked)}
-        className="mt-0.5 size-7 shrink-0 cursor-pointer accent-accent-600"
+        className="size-7 shrink-0 cursor-pointer accent-accent-600"
       />
-      <span className="text-ink-900 text-lg leading-snug">{children}</span>
+      {/* Same min-height as the box, so one line of text is centred on it and a wrapped label starts level with it. */}
+      <span className="flex min-h-7 items-center text-ink-900 text-lg leading-snug">{children}</span>
     </label>
   );
 }
