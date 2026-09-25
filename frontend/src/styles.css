@@ -143,12 +143,13 @@
   /* ------------------------------------------------------------------ the shell
      Top bar, one region that scrolls, action bar. It is exactly the height of the frame. */
   .app-shell {
-    position: fixed;
-    inset: 0;
     display: flex;
     flex-direction: column;
+    height: 100dvh;
     /* Clipped, not hidden: `overflow: hidden` still makes a scroll container, and a
-       `scrollIntoView` from anywhere can then push the top bar off the frame for good. */
+       `scrollIntoView` from anywhere can then push the top bar off the frame for good. Not
+       `position: fixed` either: a fixed box stops a scroll-into-view from reaching the host
+       page, so a frame only partly on the host's screen would never be brought into it. */
     overflow: clip;
     background: var(--color-paper);
   }
