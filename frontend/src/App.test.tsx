@@ -43,21 +43,33 @@ vi.mock("@/lib/use-pdf", async (original) => ({
 vi.mock("@/components/DocumentViewer", async () => {
   const { useEffect, useRef } = await import("react");
   return {
-    DocumentViewer: ({ onSeen }: { onSeen: (seen: ReadonlySet<number>) => void }) => {
+    DocumentViewer: ({
+      onSeen,
+      leading,
+      trailing,
+    }: {
+      onSeen: (seen: ReadonlySet<number>) => void;
+      leading?: React.ReactNode;
+      trailing?: React.ReactNode;
+    }) => {
       // The real viewer holds this in a stable callback, so a fresh identity each render does
       // not re-fire it. Do the same here, or the report becomes a render loop.
       const report = useRef(onSeen);
       report.current = onSeen;
       // A real viewer paints page 1 immediately and the observer marks it seen.
       useEffect(() => report.current(new Set([1])), []);
+      // The real viewer puts what the step hands it before the first page and after the last,
+      // in the same scroll: the "document changed" notice and the consent block.
       return (
-        <div>
+        <div className="doc-scroller" data-testid="document-viewer">
+          {leading}
           <button type="button" onClick={() => onSeen(new Set([1]))}>
             test: display page 1 only
           </button>
           <button type="button" onClick={() => onSeen(new Set([1, 2, 3]))}>
             test: display every page
           </button>
+          {trailing}
         </div>
       );
     },
@@ -245,7 +257,9 @@ describe("the whole flow for one patient", () => {
     await screen.findByTestId("step-read");
     expect(screen.getByRole("heading", { level: 1 })).toHaveFocus();
     expect(screen.getByTestId("step-progress")).toHaveTextContent("Step 1 of 3");
+    // The paper alternative, in words and as the press that takes it, on this screen and the next.
     expect(screen.getByText(/A member of staff can give you a printed copy/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "I'd rather sign on paper" })).toBeInTheDocument();
 
     // The consent block is in the same scroll as the document, not a screen after it.
     expect(await screen.findByTestId("consent-block")).toBeInTheDocument();
@@ -254,11 +268,14 @@ describe("the whole flow for one patient", () => {
     expect(screen.getByTestId("disclosure")).toHaveAttribute("data-expanded", "true");
     expect(screen.getByText(/You can also ask for a paper copy at any time/)).toBeInTheDocument();
 
-    // Continue is inert until both things are true, and says which one is missing.
-    await click("Continue to sign");
-    expect(screen.getByRole("alert")).toHaveTextContent("Please look at page 2");
+    // Until every page has been displayed the one button is the way to the next page that has
+    // not been, and "Continue to sign" is not on the screen at all.
+    expect(screen.getByRole("button", { name: "Next unseen page (2)" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue to sign" })).toBeNull();
+    expect(screen.getByTestId("page-progress")).toHaveTextContent("1 of 2 seen");
     expect(mockDb.peek("single")?.signerStatus).toBe("pending");
     await user.click(screen.getByRole("button", { name: "test: display every page" }));
+    expect(screen.getByTestId("page-progress")).toHaveTextContent("All pages seen");
     // `POST /viewed` goes when the pages have been displayed, not when the button is pressed.
     await waitFor(() => expect(mockDb.peek("single")?.signerStatus).toBe("viewed"));
     await click("Continue to sign");
@@ -586,7 +603,9 @@ describe("an agreement already given in this sitting", () => {
     await click("Continue to sign");
 
     // 409 consent_not_standing: still on the Read screen, told plainly, and asked for the tick.
-    expect(await screen.findByText("Please agree once more.")).toBeInTheDocument();
+    expect(
+      await screen.findByText(/The agreement you gave earlier no longer covers this document/),
+    ).toBeInTheDocument();
     expect(screen.getByTestId("step-read")).toBeInTheDocument();
     expect(screen.queryByTestId("standing-consent")).toBeNull();
     expect(mockDb.peek("consent-lapsed")?.signerStatus).toBe("viewed");
@@ -886,7 +905,7 @@ describe("re-authentication, on the press", () => {
   it("hands off, waits, believes the server, and then signs without another tap", async () => {
     const host = await toSign();
     expect(screen.getByTestId("reauth-needed")).toHaveTextContent(
-      "will ask you to confirm it's you when you press this",
+      "will ask you to confirm it's you when you press the button",
     );
 
     await click("Sign as Dr. Priya Raman");
@@ -1422,8 +1441,9 @@ describe("the session-deadline warning", () => {
     const banner = await screen.findByTestId("deadline-banner");
 
     expect(banner).toHaveTextContent(/this session closes in about \d+ minutes?/);
-    expect(banner.className).toContain("sticky");
-    // Above the document pages and the Read step's own sticky footer (z-10).
+    // It floats over the document region rather than sitting in the scroll, so it is on screen
+    // however far down a long report the reader is, and nothing moves when it appears.
+    expect(banner.className).toContain("absolute");
     expect(banner.className).toMatch(/\bz-30\b/);
     expect(within(banner).getByRole("alert")).toBeInTheDocument();
   });

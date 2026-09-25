@@ -319,13 +319,20 @@ The full contract:
 | host → UI | `esign:reauth_done` | your backend has attested it |
 | UI → host | `esign:signed`, `esign:sealed`, `esign:declined`, `esign:expired` | the outcome |
 | UI → host | `esign:next {envelope_id}` | "I am finished with this one; open the next" (§9) |
-| UI → host | `esign:resize {height}` | how tall the content is |
+| UI → host | `esign:resize {height}` | how tall the UI would like to be, at most |
 
 **Treat `esign:resize` as a maximum, not an instruction.** If the frame is made as tall as its
 content, the signing UI never scrolls: its own viewport becomes the whole document, every page of
 the PDF is on screen as far as the browser is concerned, and "I have looked at every page" is
 satisfied the moment it loads. The signature would then be evidence that somebody had a document
 open, not that they read it. Cap the height at the viewport and let the person scroll inside it.
+
+The UI is built for a frame of a fixed size (a full-screen signing mode, the whole of a phone
+screen): it fills whatever it is given exactly -- a top bar, one region that scrolls, an action
+bar -- and the page itself never scrolls. What `esign:resize` reports is therefore not the length
+of the document but what the UI would like at most: its bars plus up to about 1200px of content,
+less when a screen has less. Above that it scrolls inside; a fixed-size host can ignore the
+message.
 
 ## 4. Re-authentication
 

@@ -9,7 +9,7 @@
  *   host -> UI    esign:reauth_done        our *backend* has attested it to the service
  *   UI  -> host   esign:signed | esign:sealed | esign:declined | esign:expired
  *   UI  -> host   esign:next {envelope_id} "I am done with this one; open the next"
- *   UI  -> host   esign:resize {height}    so the iframe is as tall as its content
+ *   UI  -> host   esign:resize {height}    the most height the UI would like; a cap, not a size
  *
  * `esign:init` may carry a `queue {index, total, next_title}` when this document is one of a run
  * (Addendum 3 B). The host owns the queue and its tokens; all the UI does with it is show "3 of 8",

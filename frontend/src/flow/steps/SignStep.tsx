@@ -2,16 +2,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { FieldCloseUp } from "@/components/FieldCloseUp";
 import {
+  ActionBar,
   Button,
   CheckIcon,
   CheckRow,
   Dots,
   Notice,
-  Sheet,
-  StepScreen,
+  StepHeading,
   useAnnounce,
 } from "@/components/ui";
 import { useHostLink, useNow } from "@/flow/context";
+import { useWorkspace } from "@/flow/DocumentWorkspace";
 import {
   actionableFields,
   buildSignRequest,
@@ -31,7 +32,6 @@ import { MarkPreview } from "@/flow/steps/MarkPreview";
 import { SignaturePanel, type SignaturePanelHandle } from "@/flow/steps/SignaturePanel";
 import { ApiError } from "@/lib/api";
 import {
-  documentQueryOptions,
   isNetworkError,
   isReauthLapsed,
   isSessionGone,
@@ -47,7 +47,7 @@ import {
   signingKeys,
 } from "@/lib/signing-api";
 import { clockTime } from "@/lib/time";
-import { type PdfState, usePdf } from "@/lib/use-pdf";
+import type { PdfState } from "@/lib/use-pdf";
 
 export const REAUTH_TIMEOUT_MS = 120_000;
 
@@ -89,15 +89,16 @@ interface SignStepProps {
    * marks made with it are dropped and the panel says why.
    */
   onSignatureUnavailable: () => void;
+  onPaper: () => void;
 }
 
 /**
  * Screen 2 of 3 (addendum 3 A): the signature, the fields, and the one press that signs.
  *
- * What was five screens -- adopt, a screen per field, a summary, a confirmation -- is one. Every
- * act that produces evidence is still its own explicit act: one press per field, and one press
- * that signs the document. What went is the duplication between them: a checkbox restating what
- * the button says, and a summary repeating what the signer had just done field by field.
+ * Every act that produces evidence is its own explicit act: one press per field, and one press
+ * that signs the document. On a wide frame this is a panel beside the document, whose pages show
+ * each mark in place as it is applied; on a narrow one it takes the frame, and each field row
+ * carries a close-up of where on the page its mark goes.
  */
 export function SignStep({
   session,
@@ -109,6 +110,7 @@ export function SignStep({
   onSigned,
   onReadAgain,
   onSignatureUnavailable,
+  onPaper,
 }: SignStepProps) {
   const queryClient = useQueryClient();
   const host = useHostLink();
@@ -116,6 +118,7 @@ export function SignStep({
   const now = useNow(1_000);
   const live = useQuery(sessionQueryOptions(locale));
   const signer = live.data?.signer ?? session.signer;
+  const { pdf, goToPage } = useWorkspace();
 
   const fields = actionableFields(session.fields);
   const auto = serverFilledFields(session.fields);
@@ -133,13 +136,20 @@ export function SignStep({
       draft.values[field.id] !== undefined && isFieldComplete(field, draft.values[field.id], draft),
   ).length;
 
-  // Already in the cache from the Read step: parsed once for the whole screen, never refetched
-  // (each fetch of the bytes is recorded server-side as `document.presented`).
-  const document_ = useQuery(documentQueryOptions());
-  const pdf = usePdf(document_.data);
-
   const panel = useRef<SignaturePanelHandle>(null);
   const seededInitials = useRef(false);
+
+  // The document beside the panel opens on the page the first mark goes on, so what "Sign here"
+  // is about is in view before it is pressed. Once, quietly: it is the screen arranging itself,
+  // not the signer moving, and the live region should not say "Page 3 of 3" over the heading.
+  const firstFieldPage = fields[0]?.page;
+  const arrived = useRef(false);
+  useEffect(() => {
+    if (!arrived.current && firstFieldPage !== undefined) {
+      arrived.current = true;
+      goToPage(firstFieldPage, { silent: true });
+    }
+  }, [firstFieldPage, goToPage]);
   const [reauth, setReauth] = useState<Reauth>({ status: "idle" });
   /** Re-authenticated through the hand-off on this screen, as opposed to arriving already covered. */
   const [confirmedHere, setConfirmedHere] = useState(false);
@@ -369,7 +379,7 @@ export function SignStep({
     setNudge(
       remaining.length === 1
         ? `One thing is still needed: ${labelOf(remaining[0] as SigningField)}.`
-        : `${remaining.length} things are still needed. They're marked above.`,
+        : `${remaining.length} things are still needed. They're marked in the list.`,
     );
   };
 
@@ -398,220 +408,236 @@ export function SignStep({
   const signerName = `${signer.display_name}${actingFor === null ? "" : `, ${actingFor}`}`;
 
   return (
-    <StepScreen
-      testId="step-sign"
-      title="Sign the document"
-      lead={
-        <p>
-          Place your signature where{" "}
-          <span className="font-semibold text-ink-900">{session.envelope.title}</span> asks for it,
-          then sign. Nothing is sent until you press the button at the bottom.
-        </p>
-      }
-    >
-      <SignaturePanel
-        ref={panel}
-        session={session}
-        draft={draft}
-        hasSignatureField={hasSignatureField}
-        needsInitials={needsInitials}
-        signatureGone={signatureGone}
-        onDraft={updateDraft}
-      />
+    <>
+      <aside
+        className="side-panel"
+        data-testid="step-sign"
+        aria-labelledby="step-sign-title"
+        data-scroll-region
+      >
+        <div className="flex flex-col gap-3 p-3 sm:p-4">
+          <StepHeading id="step-sign-title">Sign the document</StepHeading>
 
-      <div className="mt-8">
-        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-          <h2 className="text-ink-900 text-xl">
-            {fields.length === 1 ? "Where it goes" : "Where they go"}
-          </h2>
-          {/* Plain text, not a live region. `applyMark` already announces "Signature added. 1
-              left to complete.", and a status region here made a screen reader say the same fact
-              twice, in worse words. */}
-          <p data-testid="fields-progress" className="text-ink-700">
-            <span className="font-semibold text-ink-900">
-              {done} of {fields.length}
-            </span>{" "}
-            done
-          </p>
-        </div>
-
-        <Sheet flush>
-          <ul className="m-0 list-none divide-y divide-edge p-0">
-            {fields.map((field) => (
-              <FieldRow
-                key={field.id}
-                pdf={pdf}
-                session={session}
-                field={field}
-                draft={draft}
-                acted={acted === field.id}
-                onApply={() => applyMark(field)}
-                onValue={(value) => setValue(field, value)}
-              />
-            ))}
-            {auto.map((field) => (
-              <li key={field.id} className="p-4 sm:px-6">
-                <p className="font-semibold text-ink-900">{labelOf(field)}</p>
-                <p className="text-ink-700 text-sm">
-                  Page {field.page} · Added automatically when you sign
-                </p>
-              </li>
-            ))}
-          </ul>
-        </Sheet>
-      </div>
-
-      {/* Re-authentication, inline, because it happens on the press and not on a screen of its
-          own. Everything here is about the one thing the signer is waiting for. */}
-      {waiting ? (
-        <div
-          role="status"
-          data-testid="reauth-waiting"
-          className="mt-6 rounded-lg bg-accent-wash px-4 py-4"
-        >
-          <p className="flex items-center gap-3 font-semibold text-ink-900">
-            <Dots /> Confirming it's you
-          </p>
-          <p className="mt-2 text-ink-700">
-            Your records system is asking you to sign in again. Finish that and the document is
-            signed straight away. There's no need to press anything else, or to refresh.
-          </p>
-          <Button
-            variant="quiet"
-            className="mt-1 px-0"
-            onClick={() => {
-              setPressPending(false);
-              setReauth({ status: "idle" });
-            }}
-          >
-            Cancel
-          </Button>
-        </div>
-      ) : null}
-
-      {reauth.status === "timed_out" ? (
-        <Notice tone="warn" alert className="mt-6">
-          We didn't hear back in time. Nothing has been signed. Press the button below to try again.
-        </Notice>
-      ) : null}
-      {reauth.status === "not_confirmed" ? (
-        <Notice tone="warn" alert className="mt-6">
-          We couldn't confirm that. Nothing has been signed. Press the button below to try again.
-        </Notice>
-      ) : null}
-      {reauth.status === "lapsed" ? (
-        <Notice tone="warn" alert className="mt-6">
-          The confirmation ran out before the document was signed. Nothing has been signed. Press
-          the button below and confirm once more.
-        </Notice>
-      ) : null}
-
-      {signError && !sessionGone && !sign.isPending ? (
-        <Notice tone="error" alert className="mt-6">
-          {isNetworkError(signError) ? (
-            <>
-              <p className="font-semibold">We couldn't reach the server.</p>
-              <p className="mt-1">
-                Your answers are still here. Check the connection, then press the button again. It's
-                safe to retry: the document can't be signed twice.
+          {/* Re-authentication, inline, because it happens on the press and not on a screen of
+              its own. Everything here is about the one thing the signer is waiting for. */}
+          {waiting ? (
+            <div
+              role="status"
+              data-testid="reauth-waiting"
+              className="rounded-md bg-accent-wash px-3 py-2.5 text-sm"
+            >
+              <p className="flex items-center gap-2 font-semibold text-ink-900">
+                <Dots /> Confirming it's you
               </p>
-            </>
-          ) : isReauthLapsed(signError) ? null : signError instanceof ApiError &&
-            signError.status === 422 ? (
-            // A 422 on this route is any of `unknown_field`, `duplicate_capture`,
-            // `missing_required_field`, `no_captures` or `capture_shape_invalid`, and the status
-            // alone does not say which field it was about. Naming one ("choose your signature
-            // again") was right for exactly one of them and sent the signer to the wrong box for
-            // the rest. Telling the truth at the altitude the status actually supports is better
-            // than a confident instruction; per-code copy would need the code, which is a piece
-            // of work on the error contract and not this addendum's.
-            <p>
-              Something in your answers wasn't accepted, and nothing has been signed. Check the
-              fields above, then press the button again. If it keeps happening, ask a member of
-              staff for help.
-            </p>
-          ) : signError instanceof ApiError && signError.status === 429 ? (
-            <p>Too many attempts in a short time. Please wait a minute and try again.</p>
-          ) : (
-            <p>
-              That didn't go through, and nothing has been signed. Please try again. If it keeps
-              happening, ask a member of staff for help.
-            </p>
-          )}
-        </Notice>
-      ) : null}
+              <p className="mt-1 text-ink-700">
+                Your records system is asking you to sign in again. Finish that and the document is
+                signed straight away. There's no need to press anything else, or to refresh.
+              </p>
+              <Button
+                variant="quiet"
+                size="sm"
+                className="mt-1 px-0"
+                onClick={() => {
+                  setPressPending(false);
+                  setReauth({ status: "idle" });
+                }}
+              >
+                Cancel
+              </Button>
+            </div>
+          ) : null}
 
-      {nudge ? (
-        <p
-          id={signHint}
-          role="alert"
-          data-testid="sign-nudge"
-          className="mt-6 font-medium text-danger-600"
-        >
-          {nudge}
-        </p>
-      ) : null}
+          {reauth.status === "timed_out" ? (
+            <Notice tone="warn" alert>
+              We didn't hear back in time. Nothing has been signed. Press the button below to try
+              again.
+            </Notice>
+          ) : null}
+          {reauth.status === "not_confirmed" ? (
+            <Notice tone="warn" alert>
+              We couldn't confirm that. Nothing has been signed. Press the button below to try
+              again.
+            </Notice>
+          ) : null}
+          {reauth.status === "lapsed" ? (
+            <Notice tone="warn" alert>
+              The confirmation ran out before the document was signed. Nothing has been signed.
+              Press the button below and confirm once more.
+            </Notice>
+          ) : null}
+
+          {signError && !sessionGone && !sign.isPending ? (
+            <Notice tone="error" alert>
+              {isNetworkError(signError) ? (
+                <>
+                  <p className="font-semibold">We couldn't reach the server.</p>
+                  <p className="mt-1">
+                    Your answers are still here. Check the connection, then press the button again.
+                    It's safe to retry: the document can't be signed twice.
+                  </p>
+                </>
+              ) : isReauthLapsed(signError) ? null : signError instanceof ApiError &&
+                signError.status === 422 ? (
+                // A 422 on this route is any of `unknown_field`, `duplicate_capture`,
+                // `missing_required_field`, `no_captures` or `capture_shape_invalid`, and the
+                // status alone does not say which field it was about. Telling the truth at the
+                // altitude the status supports is better than a confident instruction.
+                <p>
+                  Something in your answers wasn't accepted, and nothing has been signed. Check the
+                  fields below, then press the button again. If it keeps happening, ask a member of
+                  staff for help.
+                </p>
+              ) : signError instanceof ApiError && signError.status === 429 ? (
+                <p>Too many attempts in a short time. Please wait a minute and try again.</p>
+              ) : (
+                <p>
+                  That didn't go through, and nothing has been signed. Please try again. If it keeps
+                  happening, ask a member of staff for help.
+                </p>
+              )}
+            </Notice>
+          ) : null}
+
+          <SignaturePanel
+            ref={panel}
+            session={session}
+            draft={draft}
+            hasSignatureField={hasSignatureField}
+            needsInitials={needsInitials}
+            signatureGone={signatureGone}
+            onDraft={updateDraft}
+          />
+
+          <section aria-labelledby="fields-title">
+            <div className="mb-1.5 flex items-baseline justify-between gap-3 px-1">
+              <h2 id="fields-title" className="text-ink-900 text-sm">
+                {fields.length === 1 ? "Where it goes" : "Where they go"}
+              </h2>
+              {/* Plain text, not a live region. `applyMark` already announces "Signature added.
+                  1 left to complete.", and a status region here made a screen reader say the
+                  same fact twice, in worse words. */}
+              <p data-testid="fields-progress" className="text-ink-700 text-sm tabular-nums">
+                <span className="font-semibold text-ink-900">
+                  {done} of {fields.length}
+                </span>{" "}
+                done
+              </p>
+            </div>
+            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              {fields.map((field) => (
+                <FieldRow
+                  key={field.id}
+                  pdf={pdf}
+                  session={session}
+                  field={field}
+                  draft={draft}
+                  acted={acted === field.id}
+                  onApply={() => applyMark(field)}
+                  onValue={(value) => setValue(field, value)}
+                  onShow={() => goToPage(field.page)}
+                />
+              ))}
+              {auto.map((field) => (
+                <li key={field.id} className="rounded-lg bg-sheet px-3 py-2 text-sm shadow-sheet">
+                  <p className="font-semibold text-ink-900">{labelOf(field)}</p>
+                  <p className="text-ink-700 text-xs">
+                    Page {field.page} · Added automatically when you sign
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          {signer.requires_reauth ? (
+            <p className="px-1 text-ink-700 text-xs" data-testid="reauth-note">
+              {verified ? (
+                <span
+                  data-testid="reauth-verified"
+                  data-reauth-scope={signer.reauth_scope ?? undefined}
+                >
+                  <CheckIcon className="mr-1 text-accent-600" />
+                  {confirmedHere
+                    ? "Your identity is confirmed"
+                    : confirmedAt !== null
+                      ? `You confirmed your identity at ${confirmedAt}`
+                      : "You've already confirmed your identity"}
+                  {!confirmedHere && signer.reauth_scope === "span"
+                    ? " for an earlier document"
+                    : ""}
+                  {"; this signature will be recorded under that confirmation."}
+                  {coveredUntil !== null ? ` It covers this signature until ${coveredUntil}.` : ""}
+                  {secondsLeft > 0 && secondsLeft <= 30
+                    ? ` About ${secondsLeft} seconds left.`
+                    : ""}
+                </span>
+              ) : (
+                <span data-testid="reauth-needed">
+                  Because you're signing in a professional role, your records system will ask you to
+                  confirm it's you when you press the button. It takes a moment.
+                </span>
+              )}
+            </p>
+          ) : null}
+        </div>
+      </aside>
 
       {/* The press *is* the intent confirmation (addendum 3 A 3). The sentence above the button
           says so in as many words, which is what the checkbox used to say and one tap less. */}
-      <div className="mt-6">
-        <p className="text-ink-700">
-          By pressing this you are signing this document. It counts the same as signing on paper,
-          and you will get a copy.
-        </p>
-        <Button
-          className="mt-3 min-h-14 w-full text-lg"
-          data-testid="sign-button"
-          inert={remaining.length > 0}
-          busy={sign.isPending || waiting}
-          aria-describedby={nudge ? signHint : undefined}
-          onInertClick={nudgeWhatIsMissing}
-          onClick={press}
-        >
-          {waiting
-            ? "Confirming it's you…"
-            : sign.isPending
-              ? "Signing"
-              : sign.isError ||
-                  reauth.status === "timed_out" ||
-                  reauth.status === "not_confirmed" ||
-                  reauth.status === "lapsed"
-                ? "Try again"
-                : `Sign as ${signerName}`}
-        </Button>
-
-        {signer.requires_reauth ? (
-          <p className="mt-3 text-ink-700 text-sm" data-testid="reauth-note">
-            {verified ? (
-              <span
-                data-testid="reauth-verified"
-                data-reauth-scope={signer.reauth_scope ?? undefined}
-              >
-                <CheckIcon className="mr-1.5 text-accent-600" />
-                {confirmedHere
-                  ? "Your identity is confirmed"
-                  : confirmedAt !== null
-                    ? `You confirmed your identity at ${confirmedAt}`
-                    : "You've already confirmed your identity"}
-                {!confirmedHere && signer.reauth_scope === "span" ? " for an earlier document" : ""}
-                {"; this signature will be recorded under that confirmation."}
-                {coveredUntil !== null ? ` It covers this signature until ${coveredUntil}.` : ""}
-                {secondsLeft > 0 && secondsLeft <= 30 ? ` About ${secondsLeft} seconds left.` : ""}
-              </span>
-            ) : (
-              <span data-testid="reauth-needed">
-                Because you're signing in a professional role, your records system will ask you to
-                confirm it's you when you press this. It takes a moment.
-              </span>
-            )}
-          </p>
-        ) : null}
-      </div>
-
-      <div aria-live="polite" className="sr-only">
-        {sign.isPending ? "Signing the document. Please wait." : ""}
-      </div>
-    </StepScreen>
+      <ActionBar testId="sign-bar">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <div className="min-w-0 flex-1 basis-64 leading-5">
+            <p className="text-ink-700 text-sm">
+              By pressing this you are signing this document. It counts the same as signing on
+              paper, and you will get a copy.
+            </p>
+            {/* Reserved: what stops the press from working, or nothing. One line on a wide
+                frame, two on a phone, never cut short. */}
+            <p
+              id={signHint}
+              role="alert"
+              data-testid="sign-nudge"
+              className="status-line status-wrap text-danger-600 text-sm max-sm:text-xs"
+            >
+              {nudge ?? ""}
+            </p>
+          </div>
+          <div className="flex items-center gap-2 max-sm:w-full">
+            <Button
+              variant="quiet"
+              size="sm"
+              className="whitespace-nowrap max-sm:mr-auto max-sm:px-0 max-sm:text-xs"
+              onClick={onPaper}
+            >
+              I'd rather sign on paper
+            </Button>
+            <Button
+              size="lg"
+              className="max-sm:min-w-0 max-sm:flex-1 max-sm:px-3 max-sm:text-[0.95rem] sm:min-w-[16rem]"
+              data-testid="sign-button"
+              inert={remaining.length > 0}
+              busy={sign.isPending || waiting}
+              aria-describedby={nudge ? signHint : undefined}
+              onInertClick={nudgeWhatIsMissing}
+              onClick={press}
+            >
+              {waiting
+                ? "Confirming it's you…"
+                : sign.isPending
+                  ? "Signing"
+                  : sign.isError ||
+                      reauth.status === "timed_out" ||
+                      reauth.status === "not_confirmed" ||
+                      reauth.status === "lapsed"
+                    ? "Try again"
+                    : `Sign as ${signerName}`}
+            </Button>
+          </div>
+        </div>
+        <div aria-live="polite" className="sr-only">
+          {sign.isPending ? "Signing the document. Please wait." : ""}
+        </div>
+      </ActionBar>
+    </>
   );
 }
 
@@ -626,14 +652,16 @@ interface FieldRowProps {
   acted: boolean;
   onApply: () => void;
   onValue: (value: FieldValue | null) => void;
+  /** Scroll the document beside the panel to this field's page. */
+  onShow: () => void;
 }
 
 /**
- * One field, with the part of the page it lands on beside it and exactly one thing to do. This is
- * the "review your signatures" step as well as the doing of it: every applied mark is shown here,
+ * One field, with the part of the page it lands on and exactly one thing to do. This is the
+ * "review your signatures" step as well as the doing of it: every applied mark is shown here,
  * in place, which is why the summary screen is gone rather than merely moved.
  */
-function FieldRow({ pdf, session, field, draft, acted, onApply, onValue }: FieldRowProps) {
+function FieldRow({ pdf, session, field, draft, acted, onApply, onValue, onShow }: FieldRowProps) {
   const announce = useAnnounce();
   const inputId = useId();
   const textCountId = useId();
@@ -682,108 +710,126 @@ function FieldRow({ pdf, session, field, draft, acted, onApply, onValue }: Field
     ) : null;
 
   return (
-    <li className="p-4 sm:px-6" data-testid="field-row" data-field={field.id} data-done={complete}>
-      <div className="flex flex-wrap items-start gap-x-5 gap-y-4">
-        <div className="min-w-0 flex-1 basis-56">
-          {/* The control carries the field's label where it has one of its own -- a tick box and
-              a text box both do -- so the row does not print it twice. */}
-          <p className="text-ink-700 text-sm">
-            Page {field.page} · {field.required ? "Needed" : "Optional"}
-          </p>
-          {isMarkField(field) ? <p className="mt-0.5 font-semibold text-ink-900">{label}</p> : null}
+    <li
+      className="rounded-lg bg-sheet p-3 shadow-sheet"
+      data-testid="field-row"
+      data-field={field.id}
+      data-done={complete}
+    >
+      <div className="flex items-baseline justify-between gap-2">
+        {/* The control carries the field's label where it has one of its own -- a tick box and
+            a text box both do -- so the row does not print it twice. */}
+        <p className="min-w-0 truncate text-sm">
+          {isMarkField(field) ? (
+            <span className="font-semibold text-ink-900">{label}</span>
+          ) : (
+            <span className="text-ink-700">{field.required ? "Needed" : "Optional"}</span>
+          )}
+        </p>
+        <button
+          type="button"
+          onClick={onShow}
+          className="hidden shrink-0 text-accent-600 text-xs underline decoration-1 underline-offset-4 hover:text-accent-700 lg:inline"
+        >
+          Page {field.page}
+        </button>
+        <span className="shrink-0 text-ink-700 text-xs lg:hidden">Page {field.page}</span>
+      </div>
+      {isMarkField(field) ? (
+        <p className="text-ink-700 text-xs">{field.required ? "Needed" : "Optional"}</p>
+      ) : null}
 
-          <div className="mt-3">
-            {isMarkField(field) ? (
-              applied ? (
-                <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-accent-wash px-4 py-3">
-                  <p className="inline-flex items-center gap-2 font-semibold text-ink-900">
-                    <CheckIcon className="text-accent-600" />
-                    {field.type === "initials" ? "Initials in place" : "Signature in place"}
-                  </p>
-                  <Button
-                    ref={removeButton}
-                    variant="quiet"
-                    onClick={() => {
-                      onValue(null);
-                      announce(`${label} removed.`);
-                    }}
-                  >
-                    Remove
-                  </Button>
-                </div>
-              ) : (
-                <Button ref={applyButton} className="min-h-14 w-full" onClick={onApply}>
-                  {field.type === "initials" ? "Add initials" : "Sign here"}
-                </Button>
-              )
-            ) : null}
+      <div className="mt-2 lg:hidden">
+        {pdf.status === "ready" ? (
+          <FieldCloseUp
+            pdf={pdf.pdf}
+            field={field}
+            done={complete && value !== undefined}
+            maxHeight={110}
+          >
+            {inField}
+          </FieldCloseUp>
+        ) : (
+          // The bytes are already in the cache; this is pdf.js parsing them. A flat grey block
+          // reads as a broken image, so it breathes for the second it is there.
+          <div
+            className="quiet-pulse h-[110px] rounded-md bg-sunk"
+            aria-hidden="true"
+            data-testid="field-closeup-loading"
+          />
+        )}
+      </div>
 
-            {field.type === "checkbox" ? (
-              <CheckRow
-                checked={value?.type === "checkbox" && value.checked}
-                onChange={(checked) => onValue({ type: "checkbox", checked })}
+      <div className="mt-2">
+        {isMarkField(field) ? (
+          applied ? (
+            <div className="flex items-center justify-between gap-3 rounded-md bg-accent-wash px-3 py-1.5">
+              <p className="inline-flex items-center gap-2 font-semibold text-ink-900 text-sm">
+                <CheckIcon className="text-accent-600" />
+                {field.type === "initials" ? "Initials in place" : "Signature in place"}
+              </p>
+              <Button
+                ref={removeButton}
+                variant="quiet"
+                size="sm"
+                onClick={() => {
+                  onValue(null);
+                  announce(`${label} removed.`);
+                }}
               >
-                {label}
-              </CheckRow>
-            ) : null}
+                Remove
+              </Button>
+            </div>
+          ) : (
+            <Button ref={applyButton} className="w-full" onClick={onApply}>
+              {field.type === "initials" ? "Add initials" : "Sign here"}
+            </Button>
+          )
+        ) : null}
 
-            {field.type === "text" ? (
-              <div>
-                <label htmlFor={inputId} className="mb-2 block font-semibold text-ink-900">
-                  {label}
-                </label>
-                <textarea
-                  id={inputId}
-                  rows={field.rect.h > 30 ? 3 : 1}
-                  maxLength={TEXT_FIELD_MAX}
-                  aria-describedby={textLeft === null ? undefined : textCountId}
-                  value={text}
-                  onChange={(event) =>
-                    onValue(
-                      event.target.value === "" ? null : { type: "text", text: event.target.value },
-                    )
-                  }
-                  className="block min-h-12 w-full resize-y rounded-lg bg-paper px-4 py-2.5 text-ink-900 text-lg ring-[1.5px] ring-edge-strong ring-inset"
-                />
-                {/* Typing that simply stops is the one thing a text box must never do without
-                    saying so, so the room left is announced as it runs out. */}
-                {textLeft !== null ? (
-                  <p
-                    id={textCountId}
-                    role="status"
-                    data-testid="text-chars-left"
-                    className={`mt-2 text-sm ${textLeft === 0 ? "font-medium text-danger-600" : "text-ink-700"}`}
-                  >
-                    {textLeft === 0
-                      ? "That's as much as this box will take."
-                      : `${textLeft} ${textLeft === 1 ? "character" : "characters"} left.`}
-                  </p>
-                ) : null}
-              </div>
+        {field.type === "checkbox" ? (
+          <CheckRow
+            checked={value?.type === "checkbox" && value.checked}
+            onChange={(checked) => onValue({ type: "checkbox", checked })}
+          >
+            {label}
+          </CheckRow>
+        ) : null}
+
+        {field.type === "text" ? (
+          <div>
+            <label htmlFor={inputId} className="mb-1 block font-semibold text-ink-900 text-sm">
+              {label}
+            </label>
+            <textarea
+              id={inputId}
+              rows={field.rect.h > 30 ? 3 : 1}
+              maxLength={TEXT_FIELD_MAX}
+              aria-describedby={textLeft === null ? undefined : textCountId}
+              value={text}
+              onChange={(event) =>
+                onValue(
+                  event.target.value === "" ? null : { type: "text", text: event.target.value },
+                )
+              }
+              className="block min-h-11 w-full resize-y rounded-md bg-paper px-3 py-2 text-ink-900 ring-1 ring-edge-strong ring-inset"
+            />
+            {/* Typing that simply stops is the one thing a text box must never do without
+                saying so, so the room left is announced as it runs out. */}
+            {textLeft !== null ? (
+              <p
+                id={textCountId}
+                role="status"
+                data-testid="text-chars-left"
+                className={`mt-1 text-xs ${textLeft === 0 ? "font-medium text-danger-600" : "text-ink-700"}`}
+              >
+                {textLeft === 0
+                  ? "That's as much as this box will take."
+                  : `${textLeft} ${textLeft === 1 ? "character" : "characters"} left.`}
+              </p>
             ) : null}
           </div>
-        </div>
-
-        <div className="w-full max-w-[16rem] shrink-0 sm:w-56">
-          {pdf.status === "ready" ? (
-            <FieldCloseUp
-              pdf={pdf.pdf}
-              field={field}
-              done={complete && value !== undefined}
-              maxHeight={150}
-            >
-              {inField}
-            </FieldCloseUp>
-          ) : (
-            // The bytes are already in the cache; this is pdf.js parsing them. A flat grey block
-            // reads as a broken image, so it breathes for the second it is there.
-            <div
-              className="quiet-pulse h-[150px] rounded-lg bg-sunk"
-              aria-hidden="true"
-              data-testid="field-closeup-loading"
-            />
-          )}
-        </div>
+        ) : null}
       </div>
     </li>
   );

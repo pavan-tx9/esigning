@@ -138,7 +138,7 @@ export function SignaturePad({ strokes, onChange, describedBy }: SignaturePadPro
           }
           aria-describedby={describedBy}
           data-testid="signature-pad"
-          className="block h-44 w-full cursor-crosshair touch-none rounded-lg text-pen sm:h-52"
+          className="block h-36 w-full cursor-crosshair touch-none rounded-lg text-pen"
           onPointerDown={begin}
           onPointerMove={move}
           onPointerUp={end}
@@ -153,7 +153,7 @@ export function SignaturePad({ strokes, onChange, describedBy }: SignaturePadPro
           </p>
         )}
       </div>
-      <div className="mt-3 flex flex-wrap gap-3">
+      <div className="mt-2 flex flex-wrap gap-2">
         <Button variant="secondary" inert={!hasInk} onClick={() => onChange(strokes.slice(0, -1))}>
           Undo<span className="sr-only"> last stroke</span>
         </Button>

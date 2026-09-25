@@ -13,6 +13,9 @@ import {
   orderPdf,
   procedureFields,
   procedurePdf,
+  REPORT_PAGES,
+  reportFields,
+  reportPdf,
 } from "@/mocks/documents";
 import { SAVED_SIGNATURE_PNG_BASE64 } from "@/mocks/signature";
 
@@ -32,6 +35,8 @@ export const SCENARIOS = {
     "Clinician in a signing queue whose earlier re-authentication has run out: the hand-off is needed again.",
   "span-saved":
     "Clinician in a signing queue signing with their saved signature. The host can revoke it mid-flow (__esignMock.hostRevokedSignature) to see the signature go out from under them.",
+  report:
+    "A clinician signing a long generated report in a full-screen host: twenty-two pages, the signature on the last one, a saved signature on file, consent and identity already confirmed for an earlier document. What a queue of packets looks like from the frame.",
   queue:
     "A clinician's signing queue (addendum 3 B): three one-page orders, one confirmation of identity covering all of them, consent already given for the first. Three taps a document.",
   "standing-consent":
@@ -432,8 +437,11 @@ const isOrder = (scenario: Scenario) =>
   scenario === "reauth-press" ||
   scenario === "reauth-timeout" ||
   scenario === "reauth-lapsed";
+/** The long generated report a full-screen host asks a clinician to sign at the end. */
+const isReport = (scenario: Scenario) => scenario === "report";
 const isClinician = (scenario: Scenario) =>
   scenario === "clinician" ||
+  isReport(scenario) ||
   scenario === "span-valid" ||
   scenario === "span-saved" ||
   scenario === "span-expired" ||
@@ -441,12 +449,13 @@ const isClinician = (scenario: Scenario) =>
 const isProcedure = (scenario: Scenario) =>
   scenario === "multi" ||
   scenario === "initials-only" ||
-  (isClinician(scenario) && !isOrder(scenario));
+  (isClinician(scenario) && !isOrder(scenario) && !isReport(scenario));
 const roleOf = (scenario: Scenario) => (isClinician(scenario) ? "clinician" : "patient");
 /** Who has a signature on file from an earlier session. The kiosk patient does too: a shared
  * tablet must never be offered it, and the only way to prove that is for one to exist. */
 const hasSavedSignature = (scenario: Scenario) =>
   scenario === "saved-signature" ||
+  isReport(scenario) ||
   scenario === "kiosk" ||
   scenario === "span-saved" ||
   scenario === "standing-consent" ||
@@ -455,6 +464,7 @@ const hasSavedSignature = (scenario: Scenario) =>
 /** Who already agreed to sign electronically, for an earlier document in the same sitting. */
 const hasStandingConsent = (scenario: Scenario) =>
   scenario === "standing-consent" ||
+  isReport(scenario) ||
   scenario === "consent-lapsed" ||
   scenario === "queue" ||
   scenario === "reauth-press" ||
@@ -469,7 +479,7 @@ function spanAuthAge(scenario: Scenario): number | null {
   if (scenario === "span-valid" || scenario === "span-saved" || scenario === "span-expired") {
     return SPAN_AUTH_AGE_MS[scenario];
   }
-  if (scenario === "queue" || scenario === "reauth-lapsed") {
+  if (scenario === "queue" || scenario === "reauth-lapsed" || isReport(scenario)) {
     return 20_000;
   }
   // `reauth-press` and `reauth-timeout` have nothing to lean on: the press has to ask for it.
@@ -502,9 +512,11 @@ const usableReauthUntil = (record: MockRecord): number | null =>
 export function fieldsFor(record: MockRecord): MockField[] {
   const all = isOrder(record.scenario)
     ? orderFields
-    : isProcedure(record.scenario)
-      ? procedureFields
-      : hipaaFields;
+    : isReport(record.scenario)
+      ? reportFields
+      : isProcedure(record.scenario)
+        ? procedureFields
+        : hipaaFields;
   const mine = all.filter((field) => field.role === roleOf(record.scenario));
   // A template can ask a signer for initials and nothing else. The signature they adopt would
   // land nowhere -- initials go over as their own typed text -- so there is nothing to save, and
@@ -518,12 +530,18 @@ export function pageCountFor(record: MockRecord): number {
   if (isOrder(record.scenario)) {
     return 1;
   }
+  if (isReport(record.scenario)) {
+    return REPORT_PAGES;
+  }
   return isProcedure(record.scenario) ? 3 : 2;
 }
 
 export function documentFor(record: MockRecord, sealed = false): Uint8Array {
   if (isOrder(record.scenario)) {
     return orderPdf(sealed);
+  }
+  if (isReport(record.scenario)) {
+    return reportPdf(sealed);
   }
   if (isProcedure(record.scenario)) {
     return procedurePdf({ earlierSigned: record.scenario === "clinician", sealed });
@@ -603,14 +621,18 @@ export function sessionBody(record: MockRecord) {
       status: record.envelopeStatus,
       document_type: isOrder(record.scenario)
         ? "imaging_order"
-        : isProcedure(record.scenario)
-          ? "procedure_consent"
-          : "hipaa_acknowledgement",
+        : isReport(record.scenario)
+          ? "clinical_report"
+          : isProcedure(record.scenario)
+            ? "procedure_consent"
+            : "hipaa_acknowledgement",
       title: isOrder(record.scenario)
         ? (QUEUE_TITLES[(position ?? 1) - 1] ?? "Order for imaging")
-        : isProcedure(record.scenario)
-          ? "Consent to procedure"
-          : "Privacy notice acknowledgement",
+        : isReport(record.scenario)
+          ? "Discharge summary for R. P."
+          : isProcedure(record.scenario)
+            ? "Consent to procedure"
+            : "Privacy notice acknowledgement",
       page_count: pageCountFor(record),
       expires_at: iso(record.createdAt + 7 * 86_400_000),
     },

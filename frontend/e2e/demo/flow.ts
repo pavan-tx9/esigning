@@ -219,7 +219,7 @@ export async function signDocument(frame: FrameLocator): Promise<void> {
  * with a re-authentication span -- use `signAndConfirmIfAsked`.
  */
 export async function signWithReauth(page: Page, frame: FrameLocator): Promise<void> {
-  await expect(frame.getByTestId("reauth-needed")).toContainText("when you press this");
+  await expect(frame.getByTestId("reauth-needed")).toContainText("when you press the button");
   await signDocument(frame);
   await expect(frame.getByTestId("reauth-waiting")).toBeVisible();
   await expect(page.locator("#reauth")).toBeVisible();

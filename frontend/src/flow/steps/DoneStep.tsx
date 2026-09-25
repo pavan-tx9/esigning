@@ -70,8 +70,8 @@ export function DoneStep({
           stayRef={stayHere}
         />
       ) : queue !== null ? (
-        <p className="mb-6 flex items-start gap-2.5 rounded-lg bg-accent-wash px-4 py-3.5 text-ink-900">
-          <CheckIcon className="mt-1 text-accent-600" />
+        <p className="mb-4 flex items-start gap-2 rounded-md bg-accent-wash px-3 py-2.5 text-ink-900 text-sm">
+          <CheckIcon className="mt-0.5 text-accent-600" />
           <span data-testid="queue-finished">
             That was the last of {queue.total}. There is nothing else waiting for your signature.
           </span>
@@ -184,7 +184,7 @@ function NextInQueue({
   return (
     <div
       ref={card}
-      className="mb-6"
+      className="mb-4"
       onFocusCapture={() => {
         if (arriving.current) {
           arriving.current = false;
@@ -200,26 +200,29 @@ function NextInQueue({
       }}
     >
       <Sheet testId="queue-next">
-        <p className="text-ink-700 text-sm" data-testid="queue-position">
+        <p className="text-ink-700 text-xs" data-testid="queue-position">
           Document {queue.index} of {queue.total}
         </p>
-        <h2 className="mt-1 text-ink-900 text-xl">
+        <h2 className="mt-0.5 text-ink-900">
           {title === undefined ? "Next document" : `Next: ${title}`}
         </h2>
 
         {asking ? (
           <>
-            <p className="mt-2 flex items-center gap-3 text-ink-700" data-testid="queue-opening">
+            <p
+              className="mt-2 flex items-center gap-3 text-ink-700 text-sm"
+              data-testid="queue-opening"
+            >
               <Dots /> Opening the next document…
             </p>
             {stalled ? (
-              <p className="mt-3 text-ink-700" data-testid="queue-stalled">
+              <p className="mt-2 text-ink-700 text-sm" data-testid="queue-stalled">
                 That didn't open. Go back to your list and open the next one.
               </p>
             ) : null}
             <Button
               variant="secondary"
-              className="mt-4 min-h-14 w-full sm:w-auto"
+              className="mt-3 w-full sm:w-auto"
               onClick={() => ask(false)}
             >
               {openLabel}
@@ -227,21 +230,17 @@ function NextInQueue({
           </>
         ) : stayed ? (
           <>
-            <p className="mt-2 text-ink-700" role="status">
+            <p className="mt-2 text-ink-700 text-sm" role="status">
               Staying here. Open the next one whenever you're ready.
             </p>
             {copyPending ? <CopyStillSealing /> : null}
-            <Button
-              ref={stayRef}
-              className="mt-4 min-h-14 w-full sm:w-auto"
-              onClick={() => ask(false)}
-            >
+            <Button ref={stayRef} className="mt-3 w-full sm:w-auto" onClick={() => ask(false)}>
               {openLabel}
             </Button>
           </>
         ) : (
           <>
-            <p className="mt-2 text-ink-700">
+            <p className="mt-2 text-ink-700 text-sm">
               <span aria-hidden="true">
                 {paused
                   ? "Held while you're here."
@@ -273,7 +272,7 @@ function NextInQueue({
             <Button
               ref={stayRef}
               variant="secondary"
-              className="mt-4 min-h-14 w-full sm:w-auto"
+              className="mt-3 w-full sm:w-auto"
               onClick={() => {
                 setStayed(true);
                 announce("Staying on this page.");
@@ -294,7 +293,7 @@ function NextInQueue({
  */
 function CopyStillSealing() {
   return (
-    <p className="mt-2 text-ink-700" data-testid="queue-copy-pending">
+    <p className="mt-2 text-ink-700 text-sm" data-testid="queue-copy-pending">
       Your copy of this one is still being finalised. The clinic keeps it with your records; stay
       here if you would like to save it yourself.
     </p>
@@ -309,12 +308,12 @@ function WaitingOnOthers({ roles }: { roles: string[] }) {
       : `${unique.slice(0, -1).join(", ")} and ${unique[unique.length - 1]}`;
   return (
     <Sheet>
-      <h2 className="text-ink-900 text-xl">Your part is finished</h2>
-      <p className="mt-2 text-ink-700" data-testid="waiting-on-others">
+      <h2 className="text-ink-900">Your part is finished</h2>
+      <p className="mt-1 text-ink-700 text-sm" data-testid="waiting-on-others">
         This document still needs a signature from {names}. Your copy will be available once
         everyone has signed. The clinic can give it to you, and it will appear with your records.
       </p>
-      <p className="mt-3 text-ink-700">
+      <p className="mt-2 text-ink-700 text-sm">
         You don't need to do anything else. You can close this page.
       </p>
     </Sheet>
@@ -357,19 +356,19 @@ function SignedCopy() {
   if (url !== null) {
     return (
       <Sheet>
-        <h2 className="text-ink-900 text-xl">Your signed copy is ready</h2>
-        <p className="mt-2 text-ink-700" role="status" data-testid="copy-ready">
+        <h2 className="text-ink-900">Your signed copy is ready</h2>
+        <p className="mt-1 text-ink-700 text-sm" role="status" data-testid="copy-ready">
           The document has been finalised and locked so it can't be changed. Keep a copy for your
           records.
         </p>
         <a
           href={url}
           download="signed-document.pdf"
-          className="mt-4 inline-flex min-h-14 w-full items-center justify-center rounded-lg bg-accent-600 px-6 font-semibold text-lg text-on-accent hover:bg-accent-700 sm:w-auto"
+          className="mt-3 inline-flex min-h-11 w-full items-center justify-center rounded-md bg-accent-600 px-5 font-semibold text-on-accent hover:bg-accent-700 sm:w-auto"
         >
           Save your signed copy
         </a>
-        <p className="mt-3 text-ink-700 text-sm">
+        <p className="mt-2 text-ink-700 text-xs">
           PDF document. The clinic keeps the original with your records.
         </p>
       </Sheet>
@@ -398,16 +397,16 @@ function SignedCopy() {
   const slow = now - startedAt > SLOW_AFTER_MS;
   return (
     <Sheet>
-      <h2 className="flex items-center gap-3 text-ink-900 text-xl">
+      <h2 className="flex items-center gap-3 text-ink-900">
         <Dots /> Finalising your document
       </h2>
-      <p className="mt-2 text-ink-700" role="status" data-testid="copy-sealing">
+      <p className="mt-1 text-ink-700 text-sm" role="status" data-testid="copy-sealing">
         Your signature is recorded. The document is now being locked and time-stamped so it can't be
         changed. This usually takes less than a minute, and your copy will appear here when it's
         done.
       </p>
       {slow ? (
-        <p className="mt-3 text-ink-700" data-testid="copy-slow">
+        <p className="mt-2 text-ink-700 text-sm" data-testid="copy-slow">
           This is taking longer than usual. You don't have to wait: your signature is safe, and the
           clinic will have your copy once it's finished. We'll keep checking while this page is
           open.

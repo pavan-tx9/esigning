@@ -50,14 +50,14 @@ test.describe("a thirty-page report, on a phone", () => {
     const frame = await openReport(page, "RPT-2291");
     await expect(frame.getByTestId("signing-as")).toContainText("Priya Raman");
 
-    // The gate holds on a long document, and the copy that explains it stays readable: runs of
-    // pages are named as a range, not as twenty-nine numbers filling a phone screen.
+    // The gate holds on a long document: there is no "Continue to sign" until every page has
+    // been displayed, only the way to the next page that has not been, and the bar counts.
     const progress = frame.getByTestId("page-progress");
     await expect(progress).toContainText("of 30");
-    await expect(progress).toContainText(/Still to see: pages \d+ to 30/);
+    await expect(progress).toContainText(/\d+ of 30 seen/);
     expect((await progress.innerText()).length).toBeLessThan(80);
-    await frame.getByRole("button", { name: "Continue to sign" }).click({ force: true });
-    await expect(frame.getByRole("alert")).toContainText(/Please look at pages \d+ to 30/);
+    await expect(frame.getByRole("button", { name: "Continue to sign" })).toHaveCount(0);
+    await expect(frame.getByRole("button", { name: /Next unseen page \(\d+\)/ })).toBeVisible();
     await expect(frame.getByTestId("step-sign")).toHaveCount(0);
     await shot(page, "91-long-document-gate");
 

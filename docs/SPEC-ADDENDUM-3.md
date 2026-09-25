@@ -21,8 +21,10 @@ in the same scroll, the **consent block**:
 - when a standing acceptance exists (section C), the checkbox is replaced by one line: "You agreed
   to sign electronically at 09:12. [Read the notice]";
 - one primary button, **Continue to sign**, enabled when every page has been displayed and the
-  consent condition is met. Before that it is inert and, when pressed, says which of the two is
-  missing (the existing inert-button pattern);
+  consent condition is met. Until every page has been displayed the same button is instead
+  **Next unseen page (n)** and takes the reader to the first page not yet counted (section F);
+  once all are, it is Continue to sign, inert until the consent condition is met and, when
+  pressed inert, saying so (the existing inert-button pattern);
 - "I'd rather sign on paper" as a quiet link in the footer of this screen and the next.
 
 The server side is unchanged: `POST /signing/viewed` when the last page has been displayed,
@@ -124,3 +126,50 @@ be re-collected for every document in the same sitting. New setting `CONSENT_SPA
 - No schema change: standing consent is found from `signers` + `signing_sessions` rows of the
   earlier envelope (same host, same host_user_id, `consent_text_id`, `consented_at`), which are
   already there.
+
+## F. The frame: one shell, the document first
+
+Added after the flow shipped, from what the first host to embed it full-screen reported: a fixed
+frame (a 48px host bar, the iframe filling the rest, 1440×852 on a laptop, the whole screen on a
+phone), clinicians signing packets of twenty-to-thirty-page generated reports one after another,
+and the document getting a fraction of the height under titles, lead paragraphs and stacked
+notices. Nothing in sections A to E changes; this is how the same three screens are laid out.
+
+- **The shell is the frame.** Top bar (title, who is signing, "3 of 8" in a run, the step, zoom),
+  one region that scrolls, and an action bar that always holds the next action. The page itself
+  never scrolls, so a host that sizes the frame to its content cannot make every page "visible"
+  at once, and `esign:resize` reports what the UI would like at most (its bars plus up to about
+  1200px of content), not the length of the document (INTEGRATION.md section 3).
+- **Read and Sign share one viewer.** On a wide frame (1024px and up) the document stays on
+  screen, mounted and drawn, from Read into Sign, and Sign is a panel beside it whose pages show
+  each mark in place as it is applied. On a narrow frame the panel takes the frame and the
+  document is hidden behind it: its pages are released (a hidden page is not a drawn page), what
+  was seen stays seen, and coming back to Read draws again. The consent block still sits
+  directly under the last page, in the same scroll.
+- **Reading progress is visible.** The rule for a page being displayed is unchanged (drawn, at
+  least half on screen, for 700 ms: `lib/pages-seen.ts`); what changed is that the reader can see
+  what it has decided. The action bar carries one mark per page, filled once the page counts, and
+  the primary button is "Next unseen page (n)" until none are left, always naming and going to
+  the first page not yet counted, from the top. A fling through a report therefore costs a
+  press per page it skipped rather than a page-by-page search: the claim the signature rests on
+  -- every page displayed -- is the same claim, made the same way (drawn, half on screen, 700 ms;
+  a page whose canvas has been released or hidden is not drawn), and `POST /signing/viewed`
+  still goes only when the count equals the page count.
+- **Nothing shifts.** Each bar reserves its one line of status; what would have been a notice
+  inserted above the document is said there, or floats over the document region (the
+  session-deadline warning) without moving it.
+- **The document is drawn to a budget.** Pages are laid out in a column of at most 900 CSS pixels
+  (zoom still goes past it), drawn at a capped backing scale within a per-page pixel budget --
+  never below 1x, so a page zoomed to 3x is over the budget and sharp rather than under it and
+  blurred, with the retention window shrinking to its neighbours instead -- a few at a time and
+  nearest to the reader first, well ahead of the screen, and kept while they are within a
+  bounded neighbourhood of the page on screen. Every page has its size from the
+  first frame, so nothing below it moves when it is drawn. The bytes are still fetched once, in
+  full, from `GET /signing/document` -- that request is what records `document.presented`, and
+  range requests against it would be a change to what the record means, so they were not made.
+
+What this changes in the evidence: nothing. The pages counted as displayed are decided by the
+same rule; the consent block, the one press per field, the one press that signs, re-authentication
+on the press, the saved-signature choice, the decline path and the kiosk rules are where sections
+A to C put them. The demo host's queue spec and the flow tests were updated for the wording of the
+Read screen's button and bar.

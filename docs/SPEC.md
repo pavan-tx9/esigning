@@ -595,14 +595,17 @@ a tablet held by a patient in a clinic. Addendum 3 A (section 16) merged what we
 screens onto three; the acts are the same acts, and it is normative for their arrangement:
 
 1. **Connecting**: waiting for the token. Clear failure if it never arrives.
-2. **Read**: the PDF rendered with pdf.js, page by page, with progress ("Page 2 of 3"). Directly
+2. **Read**: the PDF rendered with pdf.js, page by page, in the one region of the frame that
+   scrolls, with progress in the action bar ("Page 2 of 3", a mark per page seen; the primary
+   button is "Next unseen page (n)" until every page has been displayed -- addendum 3 F). Directly
    under the last page, in the same scroll, the consent block: the disclosure collapsed to its
    opening lines and expanding in place, and an unchecked checkbox — or, where an acceptance
-   already stands (section 16 C), a line saying when it was given. One button, **Continue to
-   sign**, inert until every page has been displayed and the consent condition is met, and saying
-   which of the two is missing when pressed. `POST /signing/viewed` goes when the last page has
-   been displayed, `POST /signing/consent` when the button is pressed. A text alternative explains
-   that staff can provide a paper copy.
+   already stands (section 16 C), a line saying when it was given. One primary button: **Next
+   unseen page (n)** until every page has been displayed, taking the reader to the first page
+   not yet counted; then **Continue to sign**, inert until the consent condition is met and
+   saying so when pressed. `POST /signing/viewed` goes when the last page has been displayed,
+   `POST /signing/consent` when the button is pressed. A text alternative in the bar explains
+   that staff can provide a paper copy, beside the press that asks for one.
 3. **Sign**: the signature panel at the top (the one on file, with "Change", or the
    draw / type / click-to-sign chooser inline), then this signer's fields as a list, each applied
    by an explicit action of its own, with how many remain. One primary button, "Sign as <name>",

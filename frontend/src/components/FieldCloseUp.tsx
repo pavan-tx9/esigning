@@ -31,7 +31,7 @@ export function FieldCloseUp({ pdf, field, done, maxHeight = 220, children }: Fi
     <div ref={measure} aria-hidden="true" className="w-full" data-testid="field-closeup">
       {view ? (
         <div
-          className="relative mx-auto overflow-hidden rounded-lg ring-1 ring-edge"
+          className="relative mx-auto overflow-hidden rounded-md ring-1 ring-edge"
           style={{ width: `${view.width}px`, height: `${view.height}px` }}
         >
           <div
@@ -44,6 +44,7 @@ export function FieldCloseUp({ pdf, field, done, maxHeight = 220, children }: Fi
               size={size}
               width={size.width * view.scale}
               active
+              queueKey={`closeup:${field.id}`}
             >
               <div
                 data-field-box={field.id}

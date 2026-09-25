@@ -37,9 +37,9 @@ const COLLAPSED_BLOCKS = 2;
 function Block({ block }: { block: DisclosureBlock }) {
   if (block.kind === "heading") {
     return block.level === 2 ? (
-      <h3 className="pt-2 font-semibold text-ink-900 text-lg">{block.text}</h3>
+      <h3 className="pt-1 font-semibold text-ink-900">{block.text}</h3>
     ) : (
-      <h4 className="pt-1 font-semibold text-ink-900">{block.text}</h4>
+      <h4 className="pt-1 font-semibold text-ink-900 text-sm">{block.text}</h4>
     );
   }
   if (block.kind === "list") {
@@ -96,17 +96,23 @@ export function ConsentBlock({
   const hasMore = body.length > collapsed.length;
 
   return (
-    <Sheet testId="consent-block" className="mt-8">
-      <h2 lang={ownTitle === null ? undefined : consent.locale} className="text-ink-900 text-xl">
-        {ownTitle ?? "Agreeing to sign electronically"}
-      </h2>
+    <Sheet testId="consent-block" className="mt-4">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+        <h2
+          lang={ownTitle === null ? undefined : consent.locale}
+          className="text-base text-ink-900"
+        >
+          {ownTitle ?? "Agreeing to sign electronically"}
+        </h2>
+        <p className="text-ink-500 text-xs">Version {consent.version}</p>
+      </div>
 
       <div
         id={noticeId}
         lang={consent.locale}
         data-testid="disclosure"
         data-expanded={open ? "true" : "false"}
-        className="mt-3 space-y-3 text-ink-700 leading-relaxed"
+        className="mt-2 space-y-2 text-ink-700 text-sm leading-normal"
       >
         {shown.map(({ key, block }) => (
           <Block key={key} block={block} />
@@ -122,25 +128,23 @@ export function ConsentBlock({
           aria-controls={noticeId}
           data-testid="disclosure-toggle"
           onClick={() => setOpen(!open)}
-          className="mt-3 inline-flex min-h-12 items-center gap-2 font-semibold text-accent-600 underline decoration-1 underline-offset-4 hover:text-accent-700"
+          className="mt-2 inline-flex min-h-9 items-center gap-1.5 font-semibold text-accent-600 text-sm underline decoration-1 underline-offset-4 hover:text-accent-700"
         >
           <Chevron open={open} />
           {open ? "Hide the full notice" : "Read the full notice"}
         </button>
       ) : null}
 
-      <p className="mt-2 text-ink-500 text-sm">Version {consent.version}</p>
-
-      <div className="mt-5">
+      <div className="mt-3">
         {standing !== null ? (
           // Consent to doing business electronically is not per document, and re-asking for it
           // between two orders in the same sitting is ritual, not evidence. The record still
           // gets its own `consent.accepted` for this envelope, naming the one it leans on.
           <p
-            className="flex items-start gap-2.5 rounded-lg bg-accent-wash px-4 py-3.5 text-ink-900"
+            className="flex items-start gap-2 rounded-md bg-accent-wash px-3 py-2.5 text-ink-900 text-sm"
             data-testid="standing-consent"
           >
-            <CheckIcon className="mt-1 text-accent-600" />
+            <CheckIcon className="mt-0.5 text-accent-600" />
             <span>
               You agreed to sign electronically at{" "}
               <span className="font-semibold">
@@ -169,7 +173,7 @@ function Chevron({ open }: { open: boolean }) {
     <svg
       aria-hidden="true"
       viewBox="0 0 20 20"
-      className={`size-4 shrink-0 fill-none stroke-current transition-transform duration-150 ${open ? "-rotate-180" : ""}`}
+      className={`size-3.5 shrink-0 fill-none stroke-current transition-transform duration-150 ${open ? "-rotate-180" : ""}`}
       strokeWidth="2"
       strokeLinecap="round"
       strokeLinejoin="round"

@@ -8,8 +8,9 @@ import {
   useRef,
   useState,
 } from "react";
-import { Button, Notice, useAnnounce } from "@/components/ui";
+import { Notice, useAnnounce } from "@/components/ui";
 import { type HostLink, HostLinkContext, useNow } from "@/flow/context";
+import { DocumentWorkspace } from "@/flow/DocumentWorkspace";
 import { type Draft, emptyDraft, withoutAdopted } from "@/flow/draft";
 import { flowReducer, initialFlowState, STEPS, type Step } from "@/flow/machine";
 import { DeclineStep } from "@/flow/steps/DeclineStep";
@@ -21,6 +22,7 @@ import {
   ExpiredScreen,
   HandBackScreen,
   LoadFailedScreen,
+  LoadingWorkspace,
   UnavailableScreen,
 } from "@/flow/steps/EndScreens";
 import { ReadStep } from "@/flow/steps/ReadStep";
@@ -37,6 +39,12 @@ import {
 
 export const CONNECT_TIMEOUT_MS = 15_000;
 const WARN_BEFORE_MS = 120_000;
+/**
+ * The most content the UI asks a host for, in CSS pixels, before it would rather scroll inside
+ * the frame: about one full page of a document at reading width plus the bars. `esign:resize`
+ * reports the smaller of this and what is actually there (INTEGRATION.md section 3).
+ */
+export const NATURAL_CONTENT_MAX = 1_200;
 
 const STEP_LABELS: Record<Step, string> = {
   read: "Read",
@@ -94,6 +102,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   const [submissionKeys] = useState(() => new SubmissionKeys());
   const reauthListeners = useRef(new Set<() => void>());
   const shell = useRef<HTMLDivElement>(null);
+  const [toolbarNode, setToolbarNode] = useState<HTMLElement | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
 
@@ -235,24 +244,11 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   });
 
   // ------------------------------------------------------------------ iframe height
-  useEffect(() => {
-    const node = shell.current;
-    if (node === null || typeof ResizeObserver === "undefined") {
-      return;
-    }
-    let last = 0;
-    const observer = new ResizeObserver(() => {
-      const height = Math.ceil(node.getBoundingClientRect().height);
-      if (height !== last) {
-        last = height;
-        channel.post({ type: "esign:resize", height });
-      }
-    });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [channel]);
+  const activeStep = state.phase === "active" ? state.step : null;
+  useNaturalHeight(shell, (height) => channel.post({ type: "esign:resize", height }));
 
   const go = (step: Step) => dispatch({ type: "GO", step });
+  const openPaperPath = () => dispatch({ type: "DECLINE_OPENED" });
 
   let body: React.ReactNode;
   if (state.phase === "connecting") {
@@ -274,184 +270,196 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
         onRetry={() => void sessionQuery.refetch()}
       />
     ) : (
-      <ConnectingScreen />
+      // The same shell, with the document's place already drawn: between two documents of a run
+      // the frame never goes blank.
+      <LoadingWorkspace />
     );
   } else {
     const kiosk = session.session.kiosk;
-    const steps: Record<Step, React.ReactNode> = {
-      read: (
-        <ReadStep
-          session={session}
-          changed={readAgain}
-          seen={pagesSeen}
-          onSeen={setPagesSeen}
-          viewedPosted={viewedPosted}
-          onViewedPosted={markViewed}
-          onContinue={() => {
-            setReadAgain(false);
-            go("sign");
-          }}
-        />
-      ),
-      sign: (
-        <SignStep
-          session={session}
-          locale={locale}
-          draft={draft}
-          submissionKeys={submissionKeys}
-          signatureGone={signatureGone}
-          onDraft={(next) => {
-            setDraft(next);
-            // The "your saved signature is gone" notice is answered by choosing another one,
-            // not by ticking a box further down the screen.
-            if (next.adopted !== null) {
-              setSignatureGone(false);
-            }
-          }}
-          onReadAgain={() => {
-            setReadAgain(true);
-            // These are the old document's pages. Nothing about them is a claim about this one.
-            readFromScratch();
-            announce("The document has changed. Please read it again before you sign.");
-            go("read");
-          }}
-          onSignatureUnavailable={() => {
-            // The signature they chose is gone, so the marks made with it go too; everything
-            // else they filled in stays. Nothing has been signed.
-            setDraft((current) => withoutAdopted(current));
-            setSignatureGone(true);
-            announce("Your saved signature is no longer available. Please choose a signature.");
-          }}
-          onSigned={() => {
-            channel.post({ type: "esign:signed" });
-            setDraft(emptyDraft);
-            announce("The document has been signed.");
-            dispatch({ type: "SIGNED", kiosk });
-          }}
-        />
-      ),
-      done: <DoneStep session={session} locale={locale} queue={queue} />,
-    };
-    /**
-     * The paper path is a detour, not a step: the step stays mounted behind it. Replacing it
-     * would throw away everything the step is holding that the draft is not -- ink on the
-     * signature pad, chiefly -- so somebody who opens "I'd rather sign on paper" to read what it
-     * means and comes back finds an empty box where their signature was. The flow already hoisted
-     * `pagesSeen` out of the Read step for exactly this reason.
-     */
-    body = (
-      <>
-        <div hidden={state.declining}>{steps[state.step]}</div>
-        {state.declining ? (
-          <DeclineStep
+    const declining = state.declining;
+    if (state.step === "done") {
+      body = <DoneStep session={session} locale={locale} queue={queue} />;
+    } else {
+      const step =
+        state.step === "read" ? (
+          <ReadStep
             session={session}
-            onBack={() => dispatch({ type: "DECLINE_CLOSED" })}
-            onDeclined={() => dispatch({ type: "DECLINED", kiosk: session.session.kiosk })}
+            changed={readAgain}
+            seen={pagesSeen}
+            viewedPosted={viewedPosted}
+            onViewedPosted={markViewed}
+            onContinue={() => {
+              setReadAgain(false);
+              go("sign");
+            }}
+            onPaper={openPaperPath}
           />
-        ) : null}
-      </>
-    );
+        ) : (
+          <SignStep
+            session={session}
+            locale={locale}
+            draft={draft}
+            submissionKeys={submissionKeys}
+            signatureGone={signatureGone}
+            onDraft={(next) => {
+              setDraft(next);
+              // The "your saved signature is gone" notice is answered by choosing another one,
+              // not by ticking a box further down the screen.
+              if (next.adopted !== null) {
+                setSignatureGone(false);
+              }
+            }}
+            onReadAgain={() => {
+              setReadAgain(true);
+              // These are the old document's pages. Nothing about them is a claim about this one.
+              readFromScratch();
+              announce("The document has changed. Please read it again before you sign.");
+              go("read");
+            }}
+            onSignatureUnavailable={() => {
+              // The signature they chose is gone, so the marks made with it go too; everything
+              // else they filled in stays. Nothing has been signed.
+              setDraft((current) => withoutAdopted(current));
+              setSignatureGone(true);
+              announce("Your saved signature is no longer available. Please choose a signature.");
+            }}
+            onSigned={() => {
+              channel.post({ type: "esign:signed" });
+              setDraft(emptyDraft);
+              announce("The document has been signed.");
+              dispatch({ type: "SIGNED", kiosk });
+            }}
+            onPaper={openPaperPath}
+          />
+        );
+      /**
+       * The paper path is a detour, not a step: the workspace stays mounted behind it, hidden.
+       * Replacing it would throw away everything it is holding that the draft is not -- the
+       * drawn pages, the ink on the signature pad -- so somebody who opens "I'd rather sign on
+       * paper" to read what it means and comes back finds everything where they left it.
+       */
+      body = (
+        <>
+          <DocumentWorkspace
+            // Keyed on the document, not the step: the viewer must survive Read becoming Sign,
+            // and must not survive one document becoming the next.
+            key={session.envelope.id}
+            session={session}
+            step={state.step}
+            onSeen={setPagesSeen}
+            draft={draft}
+            toolbarNode={toolbarNode}
+            hidden={declining}
+          >
+            {/* Keyed so each step mounts fresh and its heading takes focus. */}
+            <StepSlot key={state.step}>{step}</StepSlot>
+          </DocumentWorkspace>
+          {declining ? (
+            <DeclineStep
+              session={session}
+              onBack={() => dispatch({ type: "DECLINE_CLOSED" })}
+              onDeclined={() => dispatch({ type: "DECLINED", kiosk: session.session.kiosk })}
+            />
+          ) : null}
+        </>
+      );
+    }
   }
-
-  const activeStep = state.phase === "active" ? state.step : null;
-  const declining = state.phase === "active" && state.declining;
-  const showPaperPath =
-    session !== undefined && activeStep !== null && activeStep !== "done" && !declining;
 
   return (
     <HostLinkContext.Provider value={hostLink}>
-      <div ref={shell} className="flex flex-col">
-        <Masthead
+      <div ref={shell} className="app-shell">
+        <TopBar
           session={state.phase === "active" ? session : undefined}
           step={activeStep}
           queue={queue}
+          toolbarRef={setToolbarNode}
         />
-        <main className="w-full px-4 pt-6 pb-10 sm:px-6 sm:pt-8">
+        <main className="relative flex min-h-0 flex-1 flex-col overflow-clip">
           {state.phase === "active" && session !== undefined && activeStep !== "done" ? (
             <DeadlineWatch session={session} />
           ) : null}
-          {/* Keyed so each step mounts fresh and its heading takes focus. The paper-path detour
-              is deliberately not part of the key: it leaves the step mounted underneath. */}
-          <div key={`${state.phase}:${activeStep ?? ""}`}>{body}</div>
-          {/* Visible on both screens before Done, as the addendum requires: the way out of an
-              electronic signature is never more than one quiet link away. */}
-          {showPaperPath ? (
-            <p className="mx-auto mt-10 max-w-xl border-edge border-t pt-5 text-center text-ink-700">
-              Changed your mind?{" "}
-              <Button
-                variant="quiet"
-                className="px-1"
-                onClick={() => dispatch({ type: "DECLINE_OPENED" })}
-              >
-                I'd rather sign on paper
-              </Button>
-            </p>
-          ) : null}
+          {body}
         </main>
       </div>
     </HostLinkContext.Provider>
   );
 }
 
-// --------------------------------------------------------------------------- masthead
+/** A step's pieces, laid into the workspace grid without a wrapper of their own. */
+function StepSlot({ children }: { children: React.ReactNode }) {
+  return <div className="contents">{children}</div>;
+}
 
-function Masthead({
+// --------------------------------------------------------------------------- top bar
+
+function TopBar({
   session,
   step,
   queue,
+  toolbarRef,
 }: {
   session: SigningSession | undefined;
   step: Step | null;
   queue: QueuePosition | null;
+  toolbarRef: (node: HTMLElement | null) => void;
 }) {
   const index = step === null ? -1 : STEPS.indexOf(step);
   const actingFor =
     session === undefined ? null : onBehalfOfPhrase(session.signer.on_behalf_of_label);
   return (
-    <header className="border-edge border-b bg-sheet px-4 py-3 sm:px-6">
-      <div className="mx-auto flex max-w-3xl flex-wrap items-end justify-between gap-x-6 gap-y-2">
-        <div className="min-w-0">
-          <p className="flex items-center gap-2 font-semibold text-accent-600 text-sm tracking-wide">
-            <Seal /> Secure document signing
-            {queue !== null ? (
-              <>
-                <span aria-hidden="true" className="text-edge-strong">
-                  ·
-                </span>
-                <span className="text-ink-700" data-testid="queue-progress">
-                  {queue.index} of {queue.total}
-                </span>
-              </>
-            ) : null}
+    <header className="top-bar" data-shell-chrome>
+      <div className="flex min-h-11 items-center gap-3 px-3 sm:px-4">
+        <span className="text-accent-600" title="Secure document signing">
+          <Seal />
+          <span className="sr-only">Secure document signing.</span>
+        </span>
+        <div className="min-w-0 flex-1 leading-tight">
+          <p className="truncate font-semibold text-ink-900 text-sm">
+            {session ? session.envelope.title : "Sign document"}
           </p>
           {session ? (
-            <>
-              <p className="mt-0.5 truncate font-serif text-ink-900 text-lg leading-tight">
-                {session.envelope.title}
-              </p>
-              <p className="text-ink-700 text-sm" data-testid="signing-as">
-                Signing as {session.signer.display_name} · {session.signer.role_label}
-                {actingFor === null ? "" : `, ${actingFor}`}
-              </p>
-            </>
+            <p className="truncate text-ink-700 text-xs" data-testid="signing-as">
+              Signing as {session.signer.display_name} · {session.signer.role_label}
+              {actingFor === null ? "" : `, ${actingFor}`}
+            </p>
           ) : null}
         </div>
+        {queue !== null ? (
+          <span
+            className="shrink-0 rounded-full bg-accent-wash px-2.5 py-0.5 font-semibold text-accent-700 text-xs tabular-nums"
+            data-testid="queue-progress"
+          >
+            <span className="sr-only">Document </span>
+            {queue.index} of {queue.total}
+          </span>
+        ) : null}
         {step !== null ? (
-          <nav aria-label="Progress" className="w-full sm:w-56">
-            <p className="text-ink-700 text-sm" data-testid="step-progress">
-              Step {index + 1} of {STEPS.length}:{" "}
-              <span className="font-semibold text-ink-900">{STEP_LABELS[step]}</span>
-            </p>
-            <ol aria-hidden="true" className="m-0 mt-1.5 flex list-none gap-1 p-0">
+          <nav aria-label="Progress" className="shrink-0">
+            {/* The words at every width; the pills only where there is room for them. */}
+            <p className="flex items-center gap-1.5 text-xs" data-testid="step-progress">
+              <span className="sr-only">
+                Step {index + 1} of {STEPS.length}: {STEP_LABELS[step]}
+              </span>
               {STEPS.map((name, i) => (
-                <li
+                <span
                   key={name}
-                  className={`h-1.5 flex-1 rounded-full ${i <= index ? "bg-accent-600" : "bg-edge"}`}
-                />
+                  aria-hidden="true"
+                  className={`hidden rounded px-1.5 py-0.5 sm:inline ${
+                    i === index
+                      ? "bg-ink-900 font-semibold text-paper"
+                      : i < index
+                        ? "text-ink-700"
+                        : "text-ink-500"
+                  }`}
+                >
+                  {STEP_LABELS[name]}
+                </span>
               ))}
-            </ol>
+            </p>
           </nav>
         ) : null}
+        <div ref={toolbarRef} className="flex shrink-0 items-center" />
       </div>
     </header>
   );
@@ -474,6 +482,66 @@ function Seal() {
   );
 }
 
+// --------------------------------------------------------------------------- natural height
+
+/**
+ * What `esign:resize` reports: not the frame's height, which the host chose, but what the UI
+ * would like at most -- its bars plus the content of whatever region scrolls, capped so that even
+ * a host that sizes the frame to the report never makes every page of a report "visible" at
+ * once (INTEGRATION.md section 3). Below it the UI scrolls inside; above it there is nothing to
+ * put.
+ */
+function useNaturalHeight(shell: RefObject<HTMLDivElement | null>, post: (height: number) => void) {
+  const last = useRef(0);
+  const report = useRef(post);
+  report.current = post;
+  useEffect(() => {
+    const node = shell.current;
+    if (
+      node === null ||
+      typeof ResizeObserver === "undefined" ||
+      typeof MutationObserver === "undefined"
+    ) {
+      return;
+    }
+    const measure = () => {
+      const chrome = [...node.querySelectorAll<HTMLElement>("[data-shell-chrome]")].reduce(
+        (sum, element) => sum + element.getBoundingClientRect().height,
+        0,
+      );
+      const regions = [...node.querySelectorAll<HTMLElement>("[data-scroll-region]")];
+      const content = regions.reduce((max, region) => Math.max(max, region.scrollHeight), 0);
+      const height = Math.ceil(chrome + Math.min(content, NATURAL_CONTENT_MAX));
+      if (height > 0 && height !== last.current) {
+        last.current = height;
+        report.current(height);
+      }
+    };
+    const sizes = new ResizeObserver(measure);
+    const watched = new Set<Element>();
+    const watch = () => {
+      for (const region of node.querySelectorAll<HTMLElement>("[data-scroll-region]")) {
+        for (const element of [region, region.firstElementChild]) {
+          if (element !== null && !watched.has(element)) {
+            watched.add(element);
+            sizes.observe(element);
+          }
+        }
+      }
+      measure();
+    };
+    // Screens come and go as the flow moves; whichever region is there now is the one measured.
+    const structure = new MutationObserver(watch);
+    structure.observe(node, { childList: true, subtree: true });
+    sizes.observe(node);
+    watch();
+    return () => {
+      sizes.disconnect();
+      structure.disconnect();
+    };
+  }, [shell]);
+}
+
 // --------------------------------------------------------------------------- session deadline
 
 /**
@@ -483,8 +551,8 @@ function Seal() {
  *  - it never ends the flow. The deadline is server time; this is the device's clock, and a tablet
  *    whose clock runs half an hour fast would land a signer on "this session has ended" before
  *    they had read a word. Only the server's 401 (wired through `sessionGone`) may do that.
- *  - it does not scroll away. Read is a long scroller, and the patient who needs this warning is
- *    the one who has been reading for two minutes, far below the top of the page.
+ *  - it does not move anything. It floats over the top of the document region, so the reader
+ *    who needs it -- two minutes in, far down a long report -- sees it without the page shifting.
  */
 function DeadlineWatch({ session }: { session: SigningSession }) {
   const now = useNow(5_000);
@@ -501,9 +569,9 @@ function DeadlineWatch({ session }: { session: SigningSession }) {
   return (
     <div
       data-testid="deadline-banner"
-      className="sticky top-[env(safe-area-inset-top,0px)] z-30 mx-auto mb-5 max-w-xl"
+      className="pointer-events-none absolute inset-x-0 top-2 z-30 mx-auto max-w-md px-3"
     >
-      <Notice tone="warn" alert className="shadow-sheet">
+      <Notice tone="warn" alert className="pointer-events-auto shadow-sheet">
         {left > 0 ? (
           <span>
             For your security, this session closes in about {minutes}{" "}

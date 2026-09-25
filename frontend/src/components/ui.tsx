@@ -44,25 +44,33 @@ export const useAnnounce = () => useContext(AnnounceContext);
 // --------------------------------------------------------------------------- buttons
 
 type Variant = "primary" | "secondary" | "quiet" | "danger";
+type Size = "sm" | "md" | "lg";
 
 const base =
-  "inline-flex min-h-12 min-w-12 items-center justify-center gap-2 rounded-lg px-5 py-2.5 " +
-  "text-center font-semibold text-base leading-snug transition-colors duration-150 " +
-  "select-none touch-manipulation";
+  "inline-flex items-center justify-center gap-2 rounded-md text-center font-semibold " +
+  "leading-snug transition-colors duration-150 select-none touch-manipulation";
+
+const sizes: Record<Size, string> = {
+  sm: "min-h-9 px-3 text-sm",
+  md: "min-h-11 min-w-11 px-4 text-[0.95rem]",
+  lg: "min-h-12 min-w-12 px-5 text-base",
+};
 
 const variants: Record<Variant, string> = {
   primary:
     "bg-accent-600 text-on-accent hover:bg-accent-700 active:bg-accent-700 " +
     "aria-disabled:bg-sunk aria-disabled:text-ink-500 aria-disabled:ring-1 aria-disabled:ring-edge",
   secondary:
-    "bg-sheet text-ink-900 ring-[1.5px] ring-edge-strong ring-inset hover:bg-sunk " +
+    "bg-sheet text-ink-900 ring-1 ring-edge-strong ring-inset hover:bg-sunk " +
     "aria-disabled:text-ink-500 aria-disabled:ring-edge",
-  quiet: "text-accent-600 underline decoration-1 underline-offset-4 hover:text-accent-700 px-3",
+  quiet:
+    "text-accent-600 underline decoration-1 underline-offset-4 hover:text-accent-700 px-2 font-medium",
   danger: "bg-danger-600 text-on-accent hover:opacity-90",
 };
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: Variant;
+  size?: Size;
   /**
    * Shown but inert: `onClick` does not run. The button stays focusable and clickable — a
    * disabled button tells a keyboard or screen-reader user nothing about why it will not work —
@@ -81,6 +89,7 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 export function Button({
   variant = "primary",
+  size = "md",
   inert = false,
   onInertClick,
   busy = false,
@@ -97,7 +106,7 @@ export function Button({
       type={type}
       aria-disabled={blocked || undefined}
       aria-busy={busy || undefined}
-      className={`${base} ${variants[variant]} ${blocked ? "cursor-not-allowed" : "cursor-pointer"} ${className}`}
+      className={`${base} ${sizes[size]} ${variants[variant]} ${blocked ? "cursor-not-allowed" : "cursor-pointer"} ${className}`}
       onClick={(event) => {
         // A blocked button never reaches `onClick`. The guard lives here, not in each caller's
         // own `if` at the top of its handler: every action in this flow is either a step towards
@@ -112,6 +121,47 @@ export function Button({
       }}
     >
       {busy ? <Dots /> : null}
+      {children}
+    </button>
+  );
+}
+
+interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  /** Required: an icon button says nothing on its own. */
+  "aria-label": string;
+  /** `lg` is 44px: for the buttons a patient presses with a finger. */
+  size?: "md" | "lg";
+  inert?: boolean;
+  onInertClick?: MouseEventHandler<HTMLButtonElement>;
+  ref?: Ref<HTMLButtonElement>;
+}
+
+/** A square secondary button for one glyph: zoom, previous page, next page. */
+export function IconButton({
+  size = "md",
+  inert = false,
+  onInertClick,
+  className = "",
+  children,
+  onClick,
+  type = "button",
+  ...rest
+}: IconButtonProps) {
+  return (
+    <button
+      {...rest}
+      type={type}
+      aria-disabled={inert || undefined}
+      className={`inline-flex ${size === "lg" ? "size-11" : "size-9"} shrink-0 items-center justify-center rounded-md bg-sheet text-ink-900 ring-1 ring-edge-strong ring-inset transition-colors hover:bg-sunk aria-disabled:text-ink-500 aria-disabled:ring-edge ${inert ? "cursor-not-allowed" : "cursor-pointer"} ${className}`}
+      onClick={(event) => {
+        if (inert) {
+          event.preventDefault();
+          onInertClick?.(event);
+          return;
+        }
+        onClick?.(event);
+      }}
+    >
       {children}
     </button>
   );
@@ -137,8 +187,6 @@ interface StepScreenProps {
   title: string;
   lead?: ReactNode;
   children?: ReactNode;
-  /** Wider for the document; text screens stay at a comfortable measure. */
-  wide?: boolean;
   /**
    * Somewhere other than the heading to put focus. For a screen that acts on its own after a few
    * seconds, the way to stop it has to be under the signer's hands rather than several Tab
@@ -149,45 +197,76 @@ interface StepScreenProps {
 }
 
 /**
- * Every screen is one of these. The heading takes focus when the screen appears, so a keyboard
- * or screen-reader user always lands at the top of the new step rather than wherever the last
- * button was.
+ * A screen made of words: the endings, the decline sheet, the connecting state. It fills the
+ * frame's middle and scrolls inside it if it must. The heading takes focus when the screen
+ * appears, so a keyboard or screen-reader user always lands at the top of the new step rather
+ * than wherever the last button was.
  */
-export function StepScreen({
-  title,
-  lead,
-  children,
-  wide = false,
-  focus,
-  testId,
-}: StepScreenProps) {
+export function StepScreen({ title, lead, children, focus, testId }: StepScreenProps) {
   const heading = useRef<HTMLHeadingElement>(null);
   const target = useRef(focus);
   target.current = focus;
   useEffect(() => {
     (target.current?.current ?? heading.current)?.focus({ preventScroll: true });
-    window.scrollTo({ top: 0 });
   }, []);
   return (
     <section
       data-testid={testId}
       aria-labelledby={`${testId}-title`}
-      className={`step-enter mx-auto w-full ${wide ? "max-w-3xl" : "max-w-xl"}`}
+      className="scroll-pane step-enter"
+      data-scroll-region
     >
-      <h1
-        id={`${testId}-title`}
-        ref={heading}
-        tabIndex={-1}
-        data-step-heading
-        className="text-[1.6rem] text-ink-900 leading-tight sm:text-[1.9rem]"
-      >
-        {title}
-      </h1>
-      {lead ? (
-        <div className="mt-3 text-[1.05rem] text-ink-700 leading-relaxed sm:text-lg">{lead}</div>
-      ) : null}
-      <div className="mt-6">{children}</div>
+      <div className="mx-auto w-full max-w-xl px-4 py-5 sm:px-6">
+        <h1
+          id={`${testId}-title`}
+          ref={heading}
+          tabIndex={-1}
+          data-step-heading
+          className="text-[1.35rem] text-ink-900 leading-tight"
+        >
+          {title}
+        </h1>
+        {lead ? <div className="mt-2 text-ink-700 leading-normal">{lead}</div> : null}
+        <div className="mt-4">{children}</div>
+      </div>
     </section>
+  );
+}
+
+/**
+ * The heading of a screen that is mostly not words -- the document, the signing panel -- kept
+ * for assistive technology and focus management and out of the way of the document itself.
+ */
+export function StepHeading({ id, children }: { id: string; children: ReactNode }) {
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    heading.current?.focus({ preventScroll: true });
+  }, []);
+  return (
+    <h1 id={id} ref={heading} tabIndex={-1} data-step-heading className="sr-only">
+      {children}
+    </h1>
+  );
+}
+
+/**
+ * The bar at the foot of the frame that always holds the next action. Its height is its own:
+ * whatever a step puts in its status line, the bar reserves the line, so the document above it
+ * never moves when the state changes.
+ */
+export function ActionBar({
+  children,
+  className = "",
+  testId,
+}: {
+  children: ReactNode;
+  className?: string;
+  testId?: string;
+}) {
+  return (
+    <footer data-testid={testId} data-shell-chrome className={`action-bar ${className}`}>
+      {children}
+    </footer>
   );
 }
 
@@ -203,7 +282,7 @@ export function Sheet({ children, className = "", flush = false, testId }: Sheet
   return (
     <div
       data-testid={testId}
-      className={`rounded-xl bg-sheet shadow-sheet ${flush ? "" : "p-5 sm:p-6"} ${className}`}
+      className={`rounded-lg bg-sheet shadow-sheet ${flush ? "" : "p-4"} ${className}`}
     >
       {children}
     </div>
@@ -223,16 +302,19 @@ export function Notice({
   children,
   alert = false,
   className = "",
+  testId,
 }: {
   tone?: NoticeTone;
   children: ReactNode;
   alert?: boolean;
   className?: string;
+  testId?: string;
 }) {
   return (
     <div
       role={alert ? "alert" : undefined}
-      className={`rounded-lg border-l-4 px-4 py-3 text-base leading-relaxed ${noticeTones[tone]} ${className}`}
+      data-testid={testId}
+      className={`rounded-md border-l-[3px] px-3 py-2 text-sm leading-normal ${noticeTones[tone]} ${className}`}
     >
       {children}
     </div>
@@ -278,9 +360,9 @@ export function CheckRow({ checked, onChange, children, describedBy, invalid }: 
   return (
     <label
       htmlFor={id}
-      className={`flex min-h-14 cursor-pointer items-start gap-4 rounded-lg bg-sheet p-4 ring-[1.5px] ring-inset transition-colors ${
+      className={`flex min-h-11 cursor-pointer items-start gap-3 rounded-md bg-sheet p-3 ring-1 ring-inset transition-colors ${
         checked ? "bg-accent-wash ring-accent-600" : "ring-edge-strong hover:bg-sunk"
-      }`}
+      } ${invalid ? "ring-2 ring-warn-edge" : ""}`}
     >
       <input
         id={id}
@@ -289,12 +371,9 @@ export function CheckRow({ checked, onChange, children, describedBy, invalid }: 
         aria-describedby={describedBy}
         aria-invalid={invalid || undefined}
         onChange={(event) => onChange(event.target.checked)}
-        className="size-7 shrink-0 cursor-pointer accent-accent-600"
+        className="mt-0.5 size-5 shrink-0 cursor-pointer accent-accent-600"
       />
-      {/* Same min-height as the box, so one line of text is centred on it and a wrapped label starts level with it. */}
-      <span className="flex min-h-7 items-center text-ink-900 text-lg leading-snug">
-        {children}
-      </span>
+      <span className="flex min-h-6 items-center text-ink-900 leading-snug">{children}</span>
     </label>
   );
 }

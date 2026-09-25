@@ -1,14 +1,45 @@
 import type { ReactNode } from "react";
-import { Button, Dots, Sheet, StepScreen } from "@/components/ui";
+import { ActionBar, Button, Dots, Sheet, StepScreen } from "@/components/ui";
 import type { UnavailableReason } from "@/flow/machine";
 
 export function ConnectingScreen() {
   return (
     <StepScreen testId="screen-connecting" title="Getting your document ready">
-      <p role="status" className="flex items-center gap-3 text-ink-700 text-lg">
+      <p role="status" className="flex items-center gap-3 text-ink-700">
         <Dots /> This should only take a moment.
       </p>
     </StepScreen>
+  );
+}
+
+/**
+ * The document's place, before there is a document: the token has arrived and the session is on
+ * its way. Between two documents of a run this is what the frame shows for the half second in
+ * between, in the same shell, so nothing goes blank and nothing jumps when the pages arrive.
+ */
+export function LoadingWorkspace() {
+  return (
+    <div className="workspace" data-testid="screen-loading" data-step="read">
+      <div className="doc-scroller" data-scroll-region aria-hidden="true">
+        <div className="doc-column" style={{ maxWidth: "932px" }}>
+          <div className="flex flex-col gap-3">
+            {[0, 1].map((n) => (
+              <div
+                key={n}
+                className="page-skeleton relative w-full bg-white shadow-sheet"
+                style={{ aspectRatio: "612 / 792", padding: "11% 10%" }}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+      <ActionBar>
+        <p role="status" className="status-line flex items-center gap-2 text-ink-700 text-sm">
+          <Dots /> Opening the document
+        </p>
+        <p className="status-line mt-1 text-sm" />
+      </ActionBar>
+    </div>
   );
 }
 
@@ -28,7 +59,7 @@ export function ConnectFailedScreen({ onRetry }: { onRetry: () => void }) {
         Try again. If it still doesn't open, go back and start again from your records page, or ask
         a member of staff for a paper copy.
       </NextStep>
-      <Button className="mt-5" onClick={onRetry}>
+      <Button className="mt-4" onClick={onRetry}>
         Try again
       </Button>
     </StepScreen>
@@ -53,7 +84,7 @@ export function LoadFailedScreen({ network, onRetry }: { network: boolean; onRet
         Try again in a moment. If it keeps happening, a member of staff can give you a paper copy to
         sign instead.
       </NextStep>
-      <Button className="mt-5" onClick={onRetry}>
+      <Button className="mt-4" onClick={onRetry}>
         Try again
       </Button>
     </StepScreen>
@@ -143,10 +174,10 @@ export function HandBackScreen({ outcome }: { outcome: "signed" | "declined" }) 
       }
     >
       <Sheet className="border-accent-600 border-l-4">
-        <p className="font-serif text-2xl text-ink-900 leading-snug">
+        <p className="font-serif text-ink-900 text-xl leading-snug">
           Please hand this tablet back to a member of staff.
         </p>
-        <p className="mt-2 text-ink-700">
+        <p className="mt-1 text-ink-700 text-sm">
           Your details have been cleared from this screen. There's nothing else you need to do.
         </p>
       </Sheet>
@@ -157,8 +188,8 @@ export function HandBackScreen({ outcome }: { outcome: "signed" | "declined" }) 
 function NextStep({ children }: { children: ReactNode }) {
   return (
     <Sheet>
-      <h2 className="text-ink-900 text-xl">What to do next</h2>
-      <p className="mt-2 text-ink-700">{children}</p>
+      <h2 className="text-ink-900">What to do next</h2>
+      <p className="mt-1 text-ink-700 text-sm">{children}</p>
     </Sheet>
   );
 }
