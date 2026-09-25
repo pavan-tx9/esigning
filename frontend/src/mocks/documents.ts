@@ -268,3 +268,72 @@ export function procedurePdf(options: { earlierSigned: boolean; sealed?: boolean
   }
   return buildPdf([p1, p2, p3]);
 }
+
+// --------------------------------------------------------------------------- long generated report
+
+/** How many pages the report has: the shape of the packets a full-screen host signs one after another. */
+export const REPORT_PAGES = 22;
+
+export const reportFields: MockField[] = [
+  {
+    id: "clinician_sig",
+    type: "signature",
+    page: REPORT_PAGES,
+    rect: { x: 72, y: 300, w: 220, h: 48 },
+    required: true,
+    label: "Attending clinician signature",
+    role: "clinician",
+  },
+  {
+    id: "clinician_date",
+    type: "date_signed",
+    page: REPORT_PAGES,
+    rect: { x: 330, y: 300, w: 120, h: 24 },
+    required: true,
+    label: "Date signed",
+    role: "clinician",
+  },
+];
+
+/**
+ * A long report of the kind an EHR generates for one patient and asks a clinician to sign at the
+ * end: many pages, dense text, tables drawn as rules, and the signature on the last page. This is
+ * what the reading progress and the render budget were built against.
+ */
+export function reportPdf(sealed = false): Uint8Array {
+  const pages: PageWriter[] = [];
+  for (let n = 1; n <= REPORT_PAGES; n += 1) {
+    const page = new PageWriter();
+    header(page, n === 1 ? "Discharge summary (sample)" : `Section ${n - 1}`, n, REPORT_PAGES);
+    let y = 650;
+    for (let block = 0; block < 4 && y > 200; block += 1) {
+      page.text(72, y, 12, `${n}.${block + 1}  Findings and course`, "bold");
+      y = page.paragraph(72, y - 20, 10, [...FILLER, ...FILLER], 14);
+      // A ruled table, so the page is not only text.
+      for (let row = 0; row < 4; row += 1) {
+        page.line(72, y - row * 16, 540, y - row * 16);
+        page.text(78, y - row * 16 + 4, 9, `Observation ${row + 1}`);
+        page.text(300, y - row * 16 + 4, 9, "within expected range (sample)");
+      }
+      page.line(72, y - 64, 540, y - 64);
+      y -= 92;
+    }
+    if (n === REPORT_PAGES) {
+      page.paragraph(72, 360, 11, [
+        "By signing this report you confirm that it reflects your clinical assessment of this",
+        "patient and that you have reviewed every section above.",
+      ]);
+      signatureBlock(page, 300, "Attending clinician", sealed ? "Dr. Priya Raman" : undefined);
+      if (sealed) {
+        page.text(
+          72,
+          80,
+          9,
+          "Sealed copy (mock). Certificate of completion follows in the real service.",
+        );
+      }
+    }
+    pages.push(page);
+  }
+  return buildPdf(pages);
+}

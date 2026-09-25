@@ -6,6 +6,8 @@
 
 import type { PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { PageSize } from "@/lib/geometry";
+import { backingScale } from "@/lib/render-budget";
+import { RenderQueue } from "@/lib/render-queue";
 
 export type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist/legacy/build/pdf.mjs";
 
@@ -15,6 +17,12 @@ export interface LoadedPdf {
   pages: PageSize[];
   destroy: () => void;
 }
+
+/** US Letter, in points: what a page is assumed to be until the document says otherwise. */
+export const LETTER_SIZE: PageSize = { width: 612, height: 792 };
+
+/** One queue for every page drawn anywhere on the screen: the document and the close-ups alike. */
+export const renderQueue = new RenderQueue(2);
 
 async function pdfjs() {
   const [lib, worker] = await Promise.all([
@@ -32,16 +40,22 @@ export async function loadPdf(bytes: Uint8Array): Promise<LoadedPdf> {
     data: bytes.slice(),
     enableXfa: false,
     disableAutoFetch: true,
+    // The bytes are already here in full (`GET /signing/document` is what records that the
+    // document was presented, and it is fetched once): there is nothing to stream.
     disableStream: true,
     useSystemFonts: true,
   });
   const doc = await task.promise;
-  const pages: PageSize[] = [];
-  for (let n = 1; n <= doc.numPages; n += 1) {
-    const page = await doc.getPage(n);
-    const viewport = page.getViewport({ scale: 1 });
-    pages.push({ width: viewport.width, height: viewport.height });
-  }
+  // Page sizes are needed before anything is laid out, and they are cheap: asked for together
+  // rather than one after another, so a thirty-page report is ready in one round trip to the
+  // worker instead of thirty.
+  const pages = await Promise.all(
+    Array.from({ length: doc.numPages }, async (_, index) => {
+      const page = await doc.getPage(index + 1);
+      const viewport = page.getViewport({ scale: 1 });
+      return { width: viewport.width, height: viewport.height };
+    }),
+  );
   return {
     doc,
     pages,
@@ -66,8 +80,5 @@ export async function pageText(doc: PDFDocumentProxy, pageNumber: number): Promi
 
 /** Canvas backing-store scale: sharp on retina, bounded so a phone does not run out of memory. */
 export function outputScale(cssWidth: number, cssHeight: number): number {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-  const maxPixels = 9_000_000;
-  const wanted = cssWidth * cssHeight * dpr * dpr;
-  return wanted <= maxPixels ? dpr : Math.max(1, Math.sqrt(maxPixels / (cssWidth * cssHeight)));
+  return backingScale(cssWidth, cssHeight, window.devicePixelRatio || 1);
 }
