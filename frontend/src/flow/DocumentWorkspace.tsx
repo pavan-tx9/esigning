@@ -4,6 +4,7 @@ import {
   type ReactNode,
   useCallback,
   useContext,
+  useEffect,
   useId,
   useMemo,
   useRef,
@@ -24,8 +25,12 @@ export interface Workspace {
   pageCount: number;
   /** The page with the most of itself on screen. */
   current: number;
-  /** Scroll to a page and say so; silently when the move is the screen's own, not the reader's. */
-  goToPage: (page: number, options?: { silent?: boolean }) => void;
+  /**
+   * Scroll to a page and say so. `silent` when the move is the screen's own, not the reader's;
+   * `focus` only when the reader asked to be taken there from the page itself, never from a
+   * button that should keep the focus it has.
+   */
+  goToPage: (page: number, options?: { silent?: boolean; focus?: boolean }) => void;
   /** Scroll to what sits under the last page: the consent block. */
   goToEnd: () => void;
   /** Where a step may put something before the first page, in the same scroll. */
@@ -89,9 +94,9 @@ export function DocumentWorkspace({
   const zoomReadout = useId();
 
   const goToPage = useCallback(
-    (page: number, options: { silent?: boolean } = {}) => {
+    (page: number, options: { silent?: boolean; focus?: boolean } = {}) => {
       const target = Math.min(pageCount, Math.max(1, page));
-      viewer.current?.goToPage(target);
+      viewer.current?.goToPage(target, { focus: options.focus === true });
       if (!options.silent) {
         announce(`Page ${target} of ${pageCount}`);
       }
@@ -117,6 +122,10 @@ export function DocumentWorkspace({
   };
 
   const documentFailed = document_.isError || pdf.status === "failed" || pageFailed;
+  // Below this the sign panel takes the document's place (styles.css), and a zoom control for a
+  // document nobody can see is a control that does nothing.
+  const wide = useMediaQuery("(min-width: 1024px)");
+  const documentShown = !hidden && !documentFailed && (step === "read" || wide);
 
   const workspace = useMemo<Workspace>(
     () => ({
@@ -206,7 +215,7 @@ export function DocumentWorkspace({
           state: rendered there through a portal rather than lifted out of here. The level is read
           out on every change and named by both buttons, so someone who cannot see the page still
           knows where the zoom stands and when a press did nothing. */}
-      {toolbarNode !== null && !hidden && !documentFailed
+      {toolbarNode !== null && documentShown
         ? createPortal(
             <div className="flex items-center gap-1" data-testid="zoom-controls">
               <span
@@ -244,6 +253,28 @@ export function DocumentWorkspace({
       {toolbarNode === null ? <span id={zoomReadout} className="sr-only" /> : null}
     </WorkspaceContext.Provider>
   );
+}
+
+/** Whether a media query matches now, following it as the frame is resized. */
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(
+    () => typeof window.matchMedia !== "function" || window.matchMedia(query).matches,
+  );
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return;
+    }
+    const list = window.matchMedia(query);
+    const update = () => setMatches(list.matches);
+    update();
+    // A stand-in `matchMedia` (a test's) may answer without ever changing.
+    if (typeof list.addEventListener !== "function") {
+      return;
+    }
+    list.addEventListener("change", update);
+    return () => list.removeEventListener("change", update);
+  }, [query]);
+  return matches;
 }
 
 /** A 20x20 stroke glyph for the icon buttons. */

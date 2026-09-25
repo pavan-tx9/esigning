@@ -140,24 +140,30 @@ notices. Nothing in sections A to E changes; this is how the same three screens 
   never scrolls, so a host that sizes the frame to its content cannot make every page "visible"
   at once, and `esign:resize` reports what the UI would like at most (its bars plus up to about
   1200px of content), not the length of the document (INTEGRATION.md section 3).
-- **Read and Sign share one viewer.** The document stays mounted, and drawn, from Read into Sign.
-  On a wide frame Sign is a panel beside the document, whose pages show each mark in place as it
-  is applied; on a narrow one the panel takes the frame. The consent block still sits directly
-  under the last page, in the same scroll.
+- **Read and Sign share one viewer.** On a wide frame (1024px and up) the document stays on
+  screen, mounted and drawn, from Read into Sign, and Sign is a panel beside it whose pages show
+  each mark in place as it is applied. On a narrow frame the panel takes the frame and the
+  document is hidden behind it: its pages are released (a hidden page is not a drawn page), what
+  was seen stays seen, and coming back to Read draws again. The consent block still sits
+  directly under the last page, in the same scroll.
 - **Reading progress is visible.** The rule for a page being displayed is unchanged (drawn, at
   least half on screen, for 700 ms: `lib/pages-seen.ts`); what changed is that the reader can see
   what it has decided. The action bar carries one mark per page, filled once the page counts, and
-  the primary button is "Next unseen page (n)" until none are left. A fling through a report
-  therefore costs a few presses of the one button rather than a page-by-page search: the claim
-  the signature rests on -- every page displayed -- is the same claim, made the same way, and
-  `POST /signing/viewed` still goes only when the count equals the page count.
+  the primary button is "Next unseen page (n)" until none are left, always naming and going to
+  the first page not yet counted, from the top. A fling through a report therefore costs a
+  press per page it skipped rather than a page-by-page search: the claim the signature rests on
+  -- every page displayed -- is the same claim, made the same way (drawn, half on screen, 700 ms;
+  a page whose canvas has been released or hidden is not drawn), and `POST /signing/viewed`
+  still goes only when the count equals the page count.
 - **Nothing shifts.** Each bar reserves its one line of status; what would have been a notice
   inserted above the document is said there, or floats over the document region (the
   session-deadline warning) without moving it.
 - **The document is drawn to a budget.** Pages are laid out in a column of at most 900 CSS pixels
-  (zoom still goes past it), drawn at a capped backing scale within a per-page pixel budget, a
-  few at a time and nearest to the reader first, well ahead of the screen, and kept while they
-  are within a bounded neighbourhood of the page on screen. Every page has its size from the
+  (zoom still goes past it), drawn at a capped backing scale within a per-page pixel budget --
+  never below 1x, so a page zoomed to 3x is over the budget and sharp rather than under it and
+  blurred, with the retention window shrinking to its neighbours instead -- a few at a time and
+  nearest to the reader first, well ahead of the screen, and kept while they are within a
+  bounded neighbourhood of the page on screen. Every page has its size from the
   first frame, so nothing below it moves when it is drawn. The bytes are still fetched once, in
   full, from `GET /signing/document` -- that request is what records `document.presented`, and
   range requests against it would be a change to what the record means, so they were not made.

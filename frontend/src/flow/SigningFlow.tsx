@@ -435,16 +435,17 @@ function TopBar({
           </span>
         ) : null}
         {step !== null ? (
-          <nav aria-label="Progress" className="hidden shrink-0 sm:block">
+          <nav aria-label="Progress" className="shrink-0">
+            {/* The words at every width; the pills only where there is room for them. */}
             <p className="flex items-center gap-1.5 text-xs" data-testid="step-progress">
               <span className="sr-only">
-                Step {index + 1} of {STEPS.length}:{" "}
+                Step {index + 1} of {STEPS.length}: {STEP_LABELS[step]}
               </span>
               {STEPS.map((name, i) => (
                 <span
                   key={name}
-                  aria-hidden={i !== index}
-                  className={`rounded px-1.5 py-0.5 ${
+                  aria-hidden="true"
+                  className={`hidden rounded px-1.5 py-0.5 sm:inline ${
                     i === index
                       ? "bg-ink-900 font-semibold text-paper"
                       : i < index

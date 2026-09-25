@@ -106,7 +106,7 @@ export function ReadStep({
 
   const unseen = unseenPages(seen, pageCount);
   const allSeen = unseen.length === 0;
-  const next = nextUnseenPage(seen, pageCount, current);
+  const next = nextUnseenPage(seen, pageCount);
   const consentGiven = standing !== null || agreed;
 
   // The claim is about the pages, so it is made when the pages have been displayed.
@@ -149,12 +149,15 @@ export function ReadStep({
     },
   });
 
-  /** "Next unseen page": go there, and say how much is left in words. */
+  /**
+   * "Next unseen page": go there, and say how much is left in words -- once. Focus stays on the
+   * button, so the next press is the same press; the page is scrolled to, not focused.
+   */
   const goToNextUnseen = () => {
     if (next === null) {
       return;
     }
-    goToPage(next);
+    goToPage(next, { silent: true });
     const left = unseen.length;
     setNudge(null);
     announce(
@@ -232,6 +235,7 @@ export function ReadStep({
             {pageCount > 1 ? (
               <div className="flex gap-1">
                 <IconButton
+                  size="lg"
                   aria-label="Previous page"
                   inert={current <= 1}
                   onClick={() => goToPage(current - 1)}
@@ -239,6 +243,7 @@ export function ReadStep({
                   <Glyph d="m5 12 5-5 5 5" />
                 </IconButton>
                 <IconButton
+                  size="lg"
                   aria-label="Next page"
                   inert={current >= pageCount}
                   onClick={() => goToPage(current + 1)}
@@ -258,15 +263,23 @@ export function ReadStep({
                 </span>
                 <span className="text-ink-700"> · {seenLabel}</span>
               </p>
-              {/* One line, reserved: what stops the press from working, or nothing. */}
+              {/* Reserved: what stops the press from working, or -- while nothing does -- the
+                  paper alternative in words (SPEC section 11). One line on a wide frame, two on
+                  a phone, and never cut short: a sentence that explains a failed press has to be
+                  read in full. Only the problem is an alert; the standing hint is not news. */}
               <p
                 id={consentHint}
-                role="alert"
-                className={`status-line truncate text-sm max-sm:text-xs ${problem !== null ? "text-danger-600" : "text-ink-900"}`}
+                className={`status-line status-wrap text-sm max-sm:text-xs ${problem !== null ? "text-danger-600" : "text-ink-900"}`}
                 data-testid="read-status"
-                title={problem ?? nudge ?? undefined}
               >
-                {problem ?? nudge ?? ""}
+                {problem !== null || nudge !== null ? (
+                  <span role="alert">{problem ?? nudge}</span>
+                ) : (
+                  <span className="text-ink-700">
+                    Would you rather read this on paper? A member of staff can give you a printed
+                    copy.
+                  </span>
+                )}
               </p>
             </div>
           </div>

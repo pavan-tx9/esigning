@@ -16,20 +16,13 @@ export function unseenPages(seen: ReadonlySet<number>, pageCount: number): numbe
 }
 
 /**
- * Where "Next unseen page" goes: the first unseen page at or after the one on screen, so a
- * reader working down the document keeps going down it, and otherwise the first unseen page
- * from the top, so nothing left behind by a fling is missed. `null` once everything is seen.
+ * Where "Next unseen page" goes: the first page not yet counted, from the top. Always the
+ * lowest, never "the next one down from here": a page a fling skipped is then never left
+ * behind, and the button's own label says which page it is about to show. `null` once every
+ * page is seen.
  */
-export function nextUnseenPage(
-  seen: ReadonlySet<number>,
-  pageCount: number,
-  current: number,
-): number | null {
-  const unseen = unseenPages(seen, pageCount);
-  if (unseen.length === 0) {
-    return null;
-  }
-  return unseen.find((page) => page >= current) ?? unseen[0] ?? null;
+export function nextUnseenPage(seen: ReadonlySet<number>, pageCount: number): number | null {
+  return unseenPages(seen, pageCount)[0] ?? null;
 }
 
 /**

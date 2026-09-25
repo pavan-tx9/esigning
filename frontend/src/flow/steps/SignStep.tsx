@@ -590,13 +590,13 @@ export function SignStep({
               By pressing this you are signing this document. It counts the same as signing on
               paper, and you will get a copy.
             </p>
-            {/* One line, reserved: what stops the press from working, or nothing. */}
+            {/* Reserved: what stops the press from working, or nothing. One line on a wide
+                frame, two on a phone, never cut short. */}
             <p
               id={signHint}
               role="alert"
               data-testid="sign-nudge"
-              className="status-line truncate text-danger-600 text-sm max-sm:text-xs"
-              title={nudge ?? undefined}
+              className="status-line status-wrap text-danger-600 text-sm max-sm:text-xs"
             >
               {nudge ?? ""}
             </p>

@@ -25,7 +25,12 @@ export function readingWidth(frameWidth: number, zoom: number): number {
 
 /**
  * Canvas backing-store scale for a page of the given CSS size: the device pixel ratio, capped,
- * and reduced further so the canvas stays inside the per-page pixel budget. Never below 1.
+ * and reduced further so the canvas stays inside the per-page pixel budget.
+ *
+ * Never below 1, on purpose: zoomed to 3x a page is nine million CSS pixels and over the budget
+ * at any scale, and drawing it blurred would defeat the zoom. The retention window is what
+ * bounds memory there -- computed from the same page size, it shrinks to the current page and
+ * its neighbours (`retainedWindow`), so a zoomed document holds three canvases, not thirty.
  */
 export function backingScale(
   cssWidth: number,

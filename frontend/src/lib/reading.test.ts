@@ -3,29 +3,28 @@ import { describePages, nextUnseenPage, unseenPages } from "@/lib/reading";
 
 describe("nextUnseenPage", () => {
   it("is null once every page has been seen", () => {
-    expect(nextUnseenPage(new Set([1, 2, 3]), 3, 2)).toBeNull();
+    expect(nextUnseenPage(new Set([1, 2, 3]), 3)).toBeNull();
   });
 
-  it("goes on down the document from where the reader is", () => {
-    expect(nextUnseenPage(new Set([1, 2, 3, 5]), 8, 3)).toBe(4);
-    expect(nextUnseenPage(new Set([1, 2, 3, 4]), 8, 4)).toBe(5);
+  it("goes on down the document when the reader has read it in order", () => {
+    expect(nextUnseenPage(new Set([1, 2, 3]), 8)).toBe(4);
   });
 
-  it("goes back for a page a fling skipped once everything below is seen", () => {
-    // Pages 5 and 6 were flung past; the reader is now on the last page.
-    expect(nextUnseenPage(new Set([1, 2, 3, 4, 7, 8]), 8, 8)).toBe(5);
+  it("goes back for the first page a fling skipped, wherever the reader is now", () => {
+    // Pages 5 and 6 were flung past; the reader is on the last page.
+    expect(nextUnseenPage(new Set([1, 2, 3, 4, 7, 8]), 8)).toBe(5);
+    // Page 2 was skipped early: it comes before anything further down.
+    expect(nextUnseenPage(new Set([1, 7, 8, 9]), 9)).toBe(2);
   });
 
   it("after a fling, presses land on each remaining page in turn", () => {
     const pageCount = 22;
     const seen = new Set([1]);
-    let current = 22;
     let presses = 0;
-    for (let next = nextUnseenPage(seen, pageCount, current); next !== null; ) {
+    for (let next = nextUnseenPage(seen, pageCount); next !== null; ) {
       presses += 1;
-      current = next;
       seen.add(next); // the reader looks at the page the button took them to
-      next = nextUnseenPage(seen, pageCount, current);
+      next = nextUnseenPage(seen, pageCount);
     }
     expect(presses).toBe(21);
     expect(unseenPages(seen, pageCount)).toEqual([]);

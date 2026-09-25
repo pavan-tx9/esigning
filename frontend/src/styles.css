@@ -181,6 +181,18 @@
     line-height: 1.25rem;
   }
 
+  /* A status that may run to a second line rather than be cut off; a phone reserves both. */
+  .status-wrap {
+    overflow-wrap: anywhere;
+  }
+
+  @media (max-width: 639.98px) {
+    .status-wrap {
+      min-height: 2.5rem;
+      line-height: 1.25rem;
+    }
+  }
+
   .doc-scroller {
     min-height: 0;
     overflow: auto;
@@ -192,7 +204,8 @@
   /* ------------------------------------------------------------------ the document workspace
      Read and Sign share it. The document is one grid cell, the sign panel another beside it on a
      wide frame, and the bar runs under both. On a narrow frame the panel takes the document's
-     cell while signing; the document stays mounted (and drawn) behind it. */
+     cell while signing: the document is hidden (display: none), which unmounts its pages and
+     releases their canvases; what was seen stays seen, and coming back draws again. */
   .workspace {
     flex: 1 1 auto;
     min-height: 0;

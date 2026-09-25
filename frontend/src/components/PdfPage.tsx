@@ -97,6 +97,10 @@ export function PdfPage({
         canvas.width = buffer.width;
         canvas.height = buffer.height;
         canvas.getContext("2d")?.drawImage(buffer, 0, 0);
+        // The off-screen copy has done its job: on iOS a canvas keeps its backing store until it
+        // is resized, and a dozen of these would count against the page's memory before GC ran.
+        buffer.width = 0;
+        buffer.height = 0;
         hasDrawn.current = true;
         setDrawnWidth(width);
         callbacks.current.onRendered?.(pageNumber, true);
@@ -128,6 +132,19 @@ export function PdfPage({
       task?.cancel();
     };
   }, [doc, pageNumber, width, height, size.width, active, queueKey]);
+
+  // Going away is a release too. The viewer unmounts its pages whenever it has no width (a
+  // sheet over it, the frame too narrow to show the document beside the sign panel), and a page
+  // that comes back as a skeleton must not still count as drawn: "seen" is drawn *and* looked at.
+  useEffect(
+    () => () => {
+      if (hasDrawn.current) {
+        hasDrawn.current = false;
+        callbacks.current.onRendered?.(pageNumber, false);
+      }
+    },
+    [pageNumber],
+  );
 
   return (
     <div

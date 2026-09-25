@@ -257,7 +257,8 @@ describe("the whole flow for one patient", () => {
     await screen.findByTestId("step-read");
     expect(screen.getByRole("heading", { level: 1 })).toHaveFocus();
     expect(screen.getByTestId("step-progress")).toHaveTextContent("Step 1 of 3");
-    // The paper path is one press away, in the bar, on this screen and the next.
+    // The paper alternative, in words and as the press that takes it, on this screen and the next.
+    expect(screen.getByText(/A member of staff can give you a printed copy/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "I'd rather sign on paper" })).toBeInTheDocument();
 
     // The consent block is in the same scroll as the document, not a screen after it.

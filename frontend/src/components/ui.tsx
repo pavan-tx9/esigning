@@ -129,6 +129,8 @@ export function Button({
 interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   /** Required: an icon button says nothing on its own. */
   "aria-label": string;
+  /** `lg` is 44px: for the buttons a patient presses with a finger. */
+  size?: "md" | "lg";
   inert?: boolean;
   onInertClick?: MouseEventHandler<HTMLButtonElement>;
   ref?: Ref<HTMLButtonElement>;
@@ -136,6 +138,7 @@ interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 /** A square secondary button for one glyph: zoom, previous page, next page. */
 export function IconButton({
+  size = "md",
   inert = false,
   onInertClick,
   className = "",
@@ -149,7 +152,7 @@ export function IconButton({
       {...rest}
       type={type}
       aria-disabled={inert || undefined}
-      className={`inline-flex size-9 shrink-0 items-center justify-center rounded-md bg-sheet text-ink-900 ring-1 ring-edge-strong ring-inset transition-colors hover:bg-sunk aria-disabled:text-ink-500 aria-disabled:ring-edge ${inert ? "cursor-not-allowed" : "cursor-pointer"} ${className}`}
+      className={`inline-flex ${size === "lg" ? "size-11" : "size-9"} shrink-0 items-center justify-center rounded-md bg-sheet text-ink-900 ring-1 ring-edge-strong ring-inset transition-colors hover:bg-sunk aria-disabled:text-ink-500 aria-disabled:ring-edge ${inert ? "cursor-not-allowed" : "cursor-pointer"} ${className}`}
       onClick={(event) => {
         if (inert) {
           event.preventDefault();

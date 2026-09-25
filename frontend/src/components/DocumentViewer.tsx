@@ -13,7 +13,7 @@ import { prefersReducedMotion, useStableCallback } from "@/components/ui";
 import type { PageSize } from "@/lib/geometry";
 import { rectToPercentBox } from "@/lib/geometry";
 import { isSubstantiallyVisible, PagesSeenTracker } from "@/lib/pages-seen";
-import { LETTER_SIZE, type LoadedPdf, pageText } from "@/lib/pdf";
+import { LETTER_SIZE, type LoadedPdf, type PDFDocumentProxy, pageText } from "@/lib/pdf";
 import {
   pagePixels,
   RENDER_AHEAD_PX,
@@ -24,7 +24,8 @@ import {
 import type { SigningField } from "@/lib/signing-api";
 
 export interface DocumentViewerHandle {
-  goToPage: (page: number) => void;
+  /** Scroll a page to the top of the region. `focus` moves keyboard focus onto it as well. */
+  goToPage: (page: number, options?: { focus?: boolean }) => void;
   /** Scroll whatever sits under the last page (the consent block) into view. */
   goToEnd: () => void;
 }
@@ -62,7 +63,22 @@ const GUTTER = 16;
  * The scroll container is this component, not the window: the frame it lives in is a fixed
  * size, so the page can never grow to make the whole document "visible" at once.
  */
-export function DocumentViewer({
+export function DocumentViewer(props: DocumentViewerProps) {
+  // Everything below is per document -- what is drawn, what is near, the text for screen
+  // readers, the heights, the seen tracker -- and a new document (the bytes arriving, or the
+  // document moving on under the signer) must start all of it again. Keying the whole thing on
+  // the document is what guarantees that no state of one revision survives into the next.
+  const serial = useRef(0);
+  const lastDoc = useRef<PDFDocumentProxy | null | undefined>(undefined);
+  const doc = props.pdf?.doc ?? null;
+  if (lastDoc.current !== doc) {
+    lastDoc.current = doc;
+    serial.current += 1;
+  }
+  return <DocumentViewerForDocument key={serial.current} {...props} />;
+}
+
+function DocumentViewerForDocument({
   pdf,
   pageCount,
   fields,
@@ -96,15 +112,11 @@ export function DocumentViewer({
   );
   const doc = pdf?.doc ?? null;
 
-  // A tracker per document, not per mount: the viewer stays mounted from Read into Sign and
-  // back (the document moved on under the signer), and what was seen of the old bytes is not a
-  // claim about the new ones. A new document starts the count again.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `doc` is the reset, on purpose
-  const tracker = useMemo(
-    () => new PagesSeenTracker((_, seen) => reportSeen(seen)),
-    [reportSeen, doc],
-  );
+  // One tracker for the life of this document (the component is keyed on it, above).
+  const tracker = useMemo(() => new PagesSeenTracker((_, seen) => reportSeen(seen)), [reportSeen]);
   useEffect(() => () => tracker.dispose(), [tracker]);
+  /** Text requests already made, so a page near the screen is not asked for twice. */
+  const textRequests = useRef(new Set<number>());
 
   useEffect(() => {
     if (scroller === null) {
@@ -179,6 +191,12 @@ export function DocumentViewer({
       observers.current = null;
       nearby.disconnect();
       visible.disconnect();
+      // Nothing is on screen once nobody is watching: a dwell timer that was running when the
+      // pages went behind a sheet, or lost their width, must not complete in the dark.
+      for (const page of pageNodes.current.keys()) {
+        tracker.setVisible(page, false);
+      }
+      heights.current.clear();
     };
   }, [frameWidth, tracker, reportCurrent, scroller]);
 
@@ -187,25 +205,17 @@ export function DocumentViewer({
     if (doc === null) {
       return;
     }
-    let cancelled = false;
     for (const page of near) {
-      if (texts[page] === undefined) {
-        pageText(doc, page).then(
-          (text) => {
-            if (!cancelled) {
-              setTexts((previous) =>
-                previous[page] === undefined ? { ...previous, [page]: text } : previous,
-              );
-            }
-          },
-          () => {},
-        );
+      if (textRequests.current.has(page)) {
+        continue;
       }
+      textRequests.current.add(page);
+      pageText(doc, page).then(
+        (text) => setTexts((previous) => ({ ...previous, [page]: text })),
+        () => textRequests.current.delete(page),
+      );
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [near, doc, texts]);
+  }, [near, doc]);
 
   const scrollTo = useCallback(
     (node: HTMLElement) => {
@@ -225,11 +235,13 @@ export function DocumentViewer({
   useImperativeHandle(
     ref,
     () => ({
-      goToPage: (page: number) => {
+      goToPage: (page: number, options = {}) => {
         const node = pageNodes.current.get(page);
         if (node !== undefined) {
           scrollTo(node);
-          node.focus({ preventScroll: true });
+          if (options.focus === true) {
+            node.focus({ preventScroll: true });
+          }
         }
       },
       goToEnd: () => {
