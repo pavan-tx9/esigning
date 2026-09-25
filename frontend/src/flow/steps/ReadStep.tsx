@@ -168,7 +168,7 @@ export function ReadStep({
    * inert-button pattern, not a dead button.
    */
   const nudgeConsent = () => {
-    setNudge("To continue, tick the box under the last page to show you agree.");
+    setNudge("To continue, tick the box under the last page.");
     goToEnd();
   };
 
