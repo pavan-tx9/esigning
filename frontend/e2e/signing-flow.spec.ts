@@ -131,13 +131,17 @@ test("a patient reads, agrees, draws a signature, signs and gets the sealed copy
   await expect(ui.locator("canvas[data-rendered]").first()).toBeVisible();
   await shot(page, "01-read");
 
-  // Continue is inert until every page has been displayed, and says why.
-  // (aria-disabled rather than disabled, so it stays focusable; Playwright needs `force`.)
-  await ui.getByRole("button", { name: "Continue to sign" }).click({ force: true });
-  await expect(ui.getByRole("alert")).toContainText(/Please look at page/);
-  await expect(ui.getByTestId("page-progress")).toContainText(/Still to see: page/);
-  await ui.getByRole("button", { name: "Next page" }).click();
+  // Until every page has been displayed, the one button is the way to the next page that has
+  // not been: "Continue to sign" is not on the screen yet, and the bar says how far along the
+  // reader is. Pressing it goes to that page and the page then counts.
+  await expect(ui.getByRole("button", { name: "Continue to sign" })).toHaveCount(0);
+  await expect(ui.getByTestId("page-progress")).toContainText(/1 of 2 seen/);
+  await ui.getByRole("button", { name: "Next unseen page (2)" }).click();
   await expect(ui.getByTestId("page-progress")).toContainText("Page 2 of 2");
+  await expect(ui.getByTestId("page-progress")).toContainText("All pages seen");
+  await expect(ui.getByRole("button", { name: "Continue to sign" })).toBeVisible();
+  await ui.getByRole("button", { name: "Previous page" }).click();
+  await expect(ui.getByTestId("page-progress")).toContainText("Page 1 of 2");
   await readEveryPage(ui, 2);
 
   // The highlight sits on the signature rule of page 2, wherever the zoom puts it.
@@ -170,7 +174,8 @@ test("a patient reads, agrees, draws a signature, signs and gets the sealed copy
   await shot(page, "03-read-consent-open");
   await ui.getByRole("button", { name: "Hide the full notice" }).click();
 
-  // Inert until the box is ticked as well, and it says which of the two is missing.
+  // Inert until the box is ticked as well, and it says so (aria-disabled rather than disabled,
+  // so it stays focusable; Playwright needs `force`).
   await ui.getByRole("button", { name: "Continue to sign" }).click({ force: true });
   await expect(ui.getByRole("alert")).toContainText("tick the box");
   await ui.getByRole("checkbox", { name: /I agree to sign this document electronically/ }).check();
@@ -343,7 +348,7 @@ test("a clinician is handed to the host on the press, then signs without pressin
   const ui = await open(page, "reauth-press");
   await readOnePage(ui);
   await ui.getByRole("button", { name: "Continue to sign" }).click();
-  await expect(ui.getByTestId("reauth-needed")).toContainText("when you press this");
+  await expect(ui.getByTestId("reauth-needed")).toContainText("when you press the button");
   await ui.getByRole("button", { name: "Sign here" }).click();
   await shot(page, "30-sign-before-reauth");
 
@@ -401,7 +406,7 @@ test("an agreement that has run out falls back to the checkbox, in place", async
   await expect(ui.getByTestId("standing-consent")).toBeVisible();
   await ui.getByRole("button", { name: "Continue to sign" }).click();
 
-  await expect(ui.getByText("Please agree once more.")).toBeVisible();
+  await expect(ui.getByText(/no longer covers this document/)).toBeVisible();
   await expect(ui.getByTestId("step-read")).toBeVisible();
   await expect(ui.getByTestId("standing-consent")).toHaveCount(0);
   await shot(page, "34-read-consent-not-standing");

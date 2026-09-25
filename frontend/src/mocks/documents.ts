@@ -306,7 +306,9 @@ export function reportPdf(sealed = false): Uint8Array {
     const page = new PageWriter();
     header(page, n === 1 ? "Discharge summary (sample)" : `Section ${n - 1}`, n, REPORT_PAGES);
     let y = 650;
-    for (let block = 0; block < 4 && y > 200; block += 1) {
+    // The last page stops short of the signature block, so the two never overlap.
+    const floor = n === REPORT_PAGES ? 420 : 200;
+    for (let block = 0; block < 4 && y > floor; block += 1) {
       page.text(72, y, 12, `${n}.${block + 1}  Findings and course`, "bold");
       y = page.paragraph(72, y - 20, 10, [...FILLER, ...FILLER], 14);
       // A ruled table, so the page is not only text.

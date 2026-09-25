@@ -2,11 +2,12 @@
 
 /* Tailwind v4 is configured here, in CSS. There is no tailwind.config.js.
 
-   The signing UI is read by patients, some elderly or anxious, often on a clinic tablet. The
+   The signing UI is read by patients, some elderly or anxious, often on a clinic tablet, and by
+   clinicians working through a queue of reports in a frame the host has fixed the size of. The
    look is stationery rather than software: warm paper, dark ink, one quiet pine-green accent, a
-   serif for headings so the screen reads like a letter from the clinic. No fonts are downloaded
-   (the CSP forbids it and a clinic network should not be asked to); the stacks below resolve to
-   good faces on iOS, Android, Windows and macOS.
+   serif for the few headings. No fonts are downloaded (the CSP forbids it and a clinic network
+   should not be asked to); the stacks below resolve to good faces on iOS, Android, Windows and
+   macOS.
 
    Every colour is a token, and dark mode only redefines tokens. The PDF itself is always paper
    white, so anything drawn on top of a page uses the fixed --color-page-* values. */
@@ -79,25 +80,39 @@
 
   html {
     -webkit-text-size-adjust: 100%;
-    /* Slightly larger than the browser default, and in rem everywhere so 200% zoom just works. */
-    font-size: 106.25%;
+    /* In rem everywhere so 200% zoom just works. */
+    font-size: 100%;
+  }
+
+  /* The frame is the size the host made it and nothing inside grows past it: the one thing that
+     scrolls is the document (or a screen's own pane), never the page. */
+  html,
+  body,
+  #root {
+    height: 100%;
   }
 
   body {
     background: var(--color-paper);
     color: var(--color-ink-900);
     font-family: var(--font-sans);
-    line-height: 1.55;
+    line-height: 1.5;
     margin: 0;
+    overflow: hidden;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
 
-  h1,
-  h2 {
+  h1 {
     font-family: var(--font-serif);
     font-weight: 600;
     letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  h2 {
+    font-weight: 600;
+    letter-spacing: -0.005em;
     text-wrap: balance;
   }
 
@@ -108,21 +123,135 @@
   /* Someone is signing a legal document. Focus must always be obvious. */
   :focus-visible {
     outline: 3px solid var(--color-accent-600);
-    outline-offset: 3px;
+    outline-offset: 2px;
     border-radius: 4px;
   }
 
   /* Headings receive focus when a step changes so a screen reader starts in the right place.
-     They are not interactive, so they do not need a ring. */
+     They are not interactive, so they do not need a ring. The document region is scrolled by
+     keyboard, so it keeps its ring but on the inside, where the frame edge cannot clip it. */
   [data-step-heading]:focus {
     outline: none;
+  }
+
+  .doc-scroller:focus-visible {
+    outline-offset: -3px;
   }
 }
 
 @layer components {
+  /* ------------------------------------------------------------------ the shell
+     Top bar, one region that scrolls, action bar. It is exactly the height of the frame. */
+  .app-shell {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    /* Clipped, not hidden: `overflow: hidden` still makes a scroll container, and a
+       `scrollIntoView` from anywhere can then push the top bar off the frame for good. */
+    overflow: clip;
+    background: var(--color-paper);
+  }
+
+  .top-bar {
+    flex: none;
+    min-height: 2.75rem;
+    border-bottom: 1px solid var(--color-edge);
+    background: var(--color-sheet);
+  }
+
+  .scroll-pane {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .action-bar {
+    flex: none;
+    border-top: 1px solid var(--color-edge);
+    background: var(--color-sheet);
+    padding: 0.5rem 1rem calc(0.5rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* One line of status in a bar, whatever it says: reserved even when empty. */
+  .status-line {
+    min-height: 1.25rem;
+    line-height: 1.25rem;
+  }
+
+  .doc-scroller {
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    background: var(--color-paper);
+  }
+
+  /* ------------------------------------------------------------------ the document workspace
+     Read and Sign share it. The document is one grid cell, the sign panel another beside it on a
+     wide frame, and the bar runs under both. On a narrow frame the panel takes the document's
+     cell while signing; the document stays mounted (and drawn) behind it. */
+  .workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "doc panel"
+      "bar bar";
+  }
+
+  .workspace .doc-scroller {
+    grid-area: doc;
+  }
+
+  .workspace .side-panel {
+    grid-area: panel;
+    width: 25rem;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-left: 1px solid var(--color-edge);
+    background: var(--color-paper);
+  }
+
+  .workspace .action-bar {
+    grid-area: bar;
+  }
+
+  @media (max-width: 1023.98px) {
+    .workspace[data-step="sign"] .doc-scroller {
+      display: none;
+    }
+    .workspace .side-panel {
+      grid-area: doc;
+      width: auto;
+      border-left: 0;
+    }
+  }
+
+  .doc-column {
+    box-sizing: border-box;
+    width: 100%;
+    margin: 0 auto;
+    padding: 1rem;
+  }
+
+  /* A page that is not drawn yet: white paper with faint lines, the size the page will be. */
+  .page-skeleton {
+    background-image: repeating-linear-gradient(
+      to bottom,
+      oklch(0.955 0.004 85) 0 0.4rem,
+      transparent 0.4rem 1.1rem
+    );
+    background-clip: content-box;
+  }
+
   /* A step arriving: a short settle, nothing that slides across the screen. */
   .step-enter {
-    animation: step-enter 260ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+    animation: step-enter 220ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
   }
 
   .quiet-pulse {
@@ -132,7 +261,7 @@
   /* The baseline a signature sits on, in the pad and in previews. */
   .signature-line {
     background-image: linear-gradient(var(--color-edge-strong), var(--color-edge-strong));
-    background-position: 1rem calc(100% - 2.25rem);
+    background-position: 1rem calc(100% - 1.75rem);
     background-repeat: no-repeat;
     background-size: calc(100% - 2rem) 1px;
   }
@@ -164,7 +293,7 @@
 @keyframes step-enter {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(4px);
   }
   to {
     opacity: 1;

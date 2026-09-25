@@ -27,7 +27,7 @@ import { exportSignaturePng, inkProblem, type Stroke } from "@/lib/strokes";
 import { calendarDate } from "@/lib/time";
 
 /**
- * "Your signature", at the top of the Sign screen (addendum 3 A 1). It used to be a screen of its
+ * "Your signature", at the top of the Sign panel (addendum 3 A 1). It used to be a screen of its
  * own between agreeing and placing marks, which meant a clinician with a signature already on file
  * had to look at a whole screen to say "yes, that one".
  *
@@ -44,11 +44,6 @@ const METHODS: { kind: Method; title: string; detail: string }[] = [
   { kind: "typed", title: "Type it", detail: "Type your name and we'll set it in handwriting." },
   { kind: "click", title: "Use my printed name", detail: "No drawing or typing needed." },
 ];
-
-const cardClass = (selected: boolean) =>
-  `flex min-h-14 cursor-pointer items-start gap-3 rounded-lg bg-sheet p-4 text-left ring-[1.5px] ring-inset transition-colors ${
-    selected ? "bg-accent-wash ring-accent-600" : "ring-edge-strong hover:bg-sunk"
-  }`;
 
 /**
  * The answer to "what should I place?". A refusal carries its own sentence so the caller can say
@@ -88,6 +83,9 @@ interface SignaturePanelProps {
   onDraft: (draft: Draft) => void;
   ref?: Ref<SignaturePanelHandle>;
 }
+
+const inputClass =
+  "block min-h-11 w-full rounded-md bg-sheet px-3 py-2 text-ink-900 ring-1 ring-edge-strong ring-inset";
 
 export function SignaturePanel({
   session,
@@ -256,9 +254,9 @@ export function SignaturePanel({
 
   /**
    * The refusal is at the foot of a panel that can be a whole screen tall, and the press that
-   * caused it happened at a field's own button below it. Bring it to the signer, as the Read
-   * screen does with its own. Optional call: this is a convenience, and a runtime without it must
-   * not take the screen down on the one path where something has already gone wrong.
+   * caused it happened at a field's own button below it. Bring it to the signer. Optional call:
+   * this is a convenience, and a runtime without it must not take the screen down on the one path
+   * where something has already gone wrong.
    */
   useEffect(() => {
     if (problem !== null) {
@@ -269,13 +267,16 @@ export function SignaturePanel({
     }
   }, [problem]);
 
+  const activeMethod = METHODS.find((option) => option.kind === method);
+
   return (
-    <Sheet testId="signature-panel">
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-        <h2 className="text-ink-900 text-xl">Your signature</h2>
+    <Sheet testId="signature-panel" className="p-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-ink-900 text-sm">Your signature</h2>
         {!choosing && showing !== null ? (
           <Button
             variant="secondary"
+            size="sm"
             onClick={() => {
               setChoosing(true);
               setProblem(null);
@@ -302,7 +303,7 @@ export function SignaturePanel({
       </div>
 
       {signatureGone ? (
-        <Notice tone="warn" alert className="mt-4">
+        <Notice tone="warn" alert className="mt-2">
           <p className="font-semibold" data-testid="signature-gone">
             Your saved signature is no longer available.
           </p>
@@ -314,15 +315,15 @@ export function SignaturePanel({
       ) : null}
 
       {!choosing && showing !== null ? (
-        <div className="mt-4" data-testid="signature-showing">
+        <div className="mt-2" data-testid="signature-showing">
           <Preview adopted={showing} displayName={session.signer.display_name} />
           {showing.kind === "adopted" && saved !== null ? (
-            <p className="mt-2 text-ink-700 text-sm" data-testid="saved-signature">
+            <p className="mt-1.5 text-ink-700 text-xs" data-testid="saved-signature">
               Saved {saved.kind === "drawn" ? "drawing" : "name"} · kept from{" "}
               {calendarDate(saved.created_at, locale)} · only you can use it
             </p>
           ) : (
-            <p className="mt-2 text-ink-700 text-sm">
+            <p className="mt-1.5 text-ink-700 text-xs">
               This is what will go in each signature box you sign.
             </p>
           )}
@@ -330,14 +331,16 @@ export function SignaturePanel({
       ) : null}
 
       {choosing ? (
-        <div className="mt-4">
+        <div className="mt-2">
           <fieldset className="m-0 border-0 p-0">
-            <legend className="mb-3 font-semibold text-ink-900">
+            <legend className="sr-only">
               {saved !== null ? "Sign with" : "How would you like to sign?"}
             </legend>
-            <div className={`grid gap-3 ${saved === null ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
+            {/* A segmented row rather than three cards with a sentence each: the sentence for
+                the chosen way is printed once, under the row, where it is needed. */}
+            <div className="flex gap-1 rounded-md bg-sunk p-1" role="presentation">
               {saved !== null ? (
-                <label className={cardClass(false)}>
+                <label className={segmentClass(false)}>
                   <input
                     type="radio"
                     name="signature-method"
@@ -350,20 +353,15 @@ export function SignaturePanel({
                       setChoosing(false);
                       setProblem(null);
                     }}
-                    className="mt-1 size-5 shrink-0 accent-accent-600"
+                    className="absolute inset-0 cursor-pointer appearance-none rounded"
                   />
-                  <span>
-                    <span className="block font-semibold text-ink-900">My saved signature</span>
-                    <span className="block text-ink-700 text-sm leading-snug">
-                      The one kept from last time.
-                    </span>
-                  </span>
+                  My saved signature
                 </label>
               ) : null}
               {METHODS.map((option) => {
                 const selected = method === option.kind;
                 return (
-                  <label key={option.kind} className={cardClass(selected)}>
+                  <label key={option.kind} className={segmentClass(selected)}>
                     <input
                       type="radio"
                       name="signature-method"
@@ -373,24 +371,19 @@ export function SignaturePanel({
                         setMethod(option.kind);
                         setProblem(null);
                       }}
-                      className="mt-1 size-5 shrink-0 accent-accent-600"
+                      className="absolute inset-0 cursor-pointer appearance-none rounded"
                     />
-                    <span>
-                      <span className="block font-semibold text-ink-900">{option.title}</span>
-                      <span className="block text-ink-700 text-sm leading-snug">
-                        {option.detail}
-                      </span>
-                    </span>
+                    {option.title}
                   </label>
                 );
               })}
             </div>
           </fieldset>
 
-          <div className="mt-5">
+          <div className="mt-2">
             {method === "drawn" ? (
               <>
-                <p id={ids.padHelp} className="mb-2 text-ink-700">
+                <p id={ids.padHelp} className="mb-1.5 text-ink-700 text-xs">
                   Draw your signature in the box. If drawing is awkward, typing your name or using
                   your printed name counts exactly the same.
                 </p>
@@ -407,7 +400,10 @@ export function SignaturePanel({
 
             {method === "typed" ? (
               <div>
-                <label htmlFor={ids.typed} className="mb-2 block font-semibold text-ink-900">
+                <label
+                  htmlFor={ids.typed}
+                  className="mb-1 block font-semibold text-ink-900 text-sm"
+                >
                   Type your full name
                 </label>
                 <input
@@ -418,18 +414,21 @@ export function SignaturePanel({
                   autoComplete="off"
                   autoCapitalize="words"
                   spellCheck={false}
-                  aria-describedby={problem ? ids.error : undefined}
+                  aria-describedby={problem ? ids.error : ids.padHelp}
                   onChange={(event) => {
                     setTyped(event.target.value);
                     setProblem(null);
                   }}
-                  className="block min-h-12 w-full rounded-lg bg-sheet px-4 py-2.5 text-ink-900 text-lg ring-[1.5px] ring-edge-strong ring-inset"
+                  className={inputClass}
                 />
+                <p id={ids.padHelp} className="sr-only">
+                  {activeMethod?.detail}
+                </p>
                 <div
                   aria-hidden="true"
-                  className="signature-line mt-3 flex h-28 items-center justify-center overflow-hidden rounded-lg bg-sheet px-4 ring-1 ring-edge"
+                  className="signature-line mt-2 flex h-20 items-center justify-center overflow-hidden rounded-md bg-sheet px-3 ring-1 ring-edge"
                 >
-                  <span className="truncate pb-4 font-script text-4xl text-pen">
+                  <span className="truncate pb-3 font-script text-3xl text-pen">
                     {typed.trim() || " "}
                   </span>
                 </div>
@@ -437,11 +436,11 @@ export function SignaturePanel({
             ) : null}
 
             {method === "click" ? (
-              <div className="rounded-lg bg-sheet p-5 ring-1 ring-edge">
-                <p className="text-ink-700">
+              <div className="rounded-md bg-sheet p-3 ring-1 ring-edge">
+                <p className="text-ink-700 text-xs">
                   Each signature box will show your name, printed like this:
                 </p>
-                <p className="signature-line mt-2 flex h-24 items-center justify-center pb-4 font-semibold text-2xl text-pen">
+                <p className="signature-line mt-1 flex h-16 items-center justify-center pb-3 font-semibold text-pen text-xl">
                   {session.signer.display_name}
                 </p>
               </div>
@@ -453,21 +452,21 @@ export function SignaturePanel({
       {/* Only a signature made here can be kept, and never from a shared tablet: a patient on
           a clinic kiosk must not leave their signature behind. Off by default, always. */}
       {canSave ? (
-        <div className="mt-5" data-testid="save-signature">
+        <div className="mt-2" data-testid="save-signature">
           <CheckRow checked={draft.save} onChange={setSave} describedBy={ids.save}>
-            Save this signature for next time
+            <span className="text-sm">Save this signature for next time</span>
           </CheckRow>
-          <p id={ids.save} className="mt-2 text-ink-700 text-sm">
-            It will be offered the next time you sign with this clinic. Only you can use it, and you
-            can remove it whenever you like.
+          <p id={ids.save} className="mt-1 px-1 text-ink-700 text-xs">
+            Offered the next time you sign with this clinic. Only you can use it, and you can remove
+            it whenever you like.
             {saved !== null ? " It replaces the one you saved before." : ""}
           </p>
         </div>
       ) : null}
 
       {needsInitials ? (
-        <div className="mt-5">
-          <label htmlFor={ids.initials} className="mb-2 block font-semibold text-ink-900">
+        <div className="mt-2 flex items-center gap-3">
+          <label htmlFor={ids.initials} className="font-semibold text-ink-900 text-sm">
             Your initials
           </label>
           <input
@@ -479,16 +478,17 @@ export function SignaturePanel({
             autoCapitalize="characters"
             spellCheck={false}
             onChange={(event) => setInitials(event.target.value)}
-            className="block min-h-12 w-28 rounded-lg bg-sheet px-4 py-2.5 text-ink-900 text-lg ring-[1.5px] ring-edge-strong ring-inset"
+            className={`${inputClass} w-24`}
           />
-          <p className="mt-1 text-ink-700 text-sm">Used where the document asks for initials.</p>
+          <p className="text-ink-700 text-xs">Used where the document asks for initials.</p>
         </div>
       ) : null}
 
       {saved !== null ? (
-        <div className="mt-5 border-edge border-t pt-4">
+        <div className="mt-2 border-edge border-t pt-2">
           <Button
             variant="quiet"
+            size="sm"
             className="px-0"
             aria-expanded={removing}
             onClick={() => {
@@ -501,7 +501,7 @@ export function SignaturePanel({
           </Button>
           {removing ? (
             <div
-              className="mt-3 rounded-lg bg-warn-wash px-4 py-4 ring-1 ring-warn-edge"
+              className="mt-2 rounded-md bg-warn-wash px-3 py-2.5 text-sm ring-1 ring-warn-edge"
               data-testid="remove-saved"
             >
               <p className="font-semibold text-ink-900">Remove your saved signature?</p>
@@ -510,15 +510,16 @@ export function SignaturePanel({
                 sign. Documents you have already signed with it are not affected.
               </p>
               {revoke.isError ? (
-                <Notice tone="error" alert className="mt-3">
+                <Notice tone="error" alert className="mt-2">
                   {isNetworkError(revoke.error)
                     ? "We couldn't reach the server. Check the connection and try again, or carry on: you can still sign without it."
                     : "We couldn't remove it just now. You can still sign without using it, and try again later."}
                 </Notice>
               ) : null}
-              <div className="mt-4 flex flex-wrap gap-3">
+              <div className="mt-2 flex flex-wrap gap-2">
                 <Button
                   variant="danger"
+                  size="sm"
                   busy={revoke.isPending}
                   onClick={() => {
                     // The marks made with it go too: they would stand for a signature that is
@@ -531,6 +532,7 @@ export function SignaturePanel({
                 </Button>
                 <Button
                   variant="secondary"
+                  size="sm"
                   inert={revoke.isPending}
                   onClick={() => setRemoving(false)}
                 >
@@ -548,7 +550,7 @@ export function SignaturePanel({
           ref={refusal}
           role="alert"
           data-testid="signature-problem"
-          className="mt-4 font-medium text-danger-600"
+          className="mt-2 font-medium text-danger-600 text-sm"
         >
           {problem}
         </p>
@@ -557,28 +559,38 @@ export function SignaturePanel({
   );
 }
 
+/**
+ * One segment of the chooser. The radio itself is stretched over the whole segment, invisible
+ * but on top, so a press anywhere on it is a press on the control -- for a finger, a pointer
+ * and a test alike -- and its focus ring is the segment's.
+ */
+const segmentClass = (selected: boolean) =>
+  `relative flex min-h-9 flex-1 cursor-pointer items-center justify-center rounded px-2 text-center font-semibold text-sm leading-tight transition-colors has-[:focus-visible]:outline-3 has-[:focus-visible]:outline-accent-600 ${
+    selected ? "bg-sheet text-ink-900 shadow-sheet" : "text-ink-700 hover:text-ink-900"
+  }`;
+
 const withoutMarks = (draft: Draft) =>
   Object.fromEntries(Object.entries(draft.values).filter(([, value]) => value.type !== "mark"));
 
 function Preview({ adopted, displayName }: { adopted: AdoptedSignature; displayName: string }) {
   if (adopted.kind === "click") {
     return (
-      <div className="signature-line flex h-28 items-center justify-center overflow-hidden rounded-lg bg-sunk px-4 ring-1 ring-edge">
-        <span className="truncate pb-4 font-semibold text-2xl text-pen">{displayName}</span>
+      <div className="signature-line flex h-20 items-center justify-center overflow-hidden rounded-md bg-sunk px-3 ring-1 ring-edge">
+        <span className="truncate pb-3 font-semibold text-pen text-xl">{displayName}</span>
       </div>
     );
   }
   const look: SavedLook = adopted.kind === "adopted" ? adopted.look : adopted;
   return (
-    <div className="signature-line flex h-28 items-center justify-center overflow-hidden rounded-lg bg-sunk px-4 ring-1 ring-edge">
+    <div className="signature-line flex h-20 items-center justify-center overflow-hidden rounded-md bg-sunk px-3 ring-1 ring-edge">
       {look.kind === "drawn" ? (
         <img
           src={look.dataUrl}
           alt="Your signature, as drawn"
-          className="max-h-20 max-w-full object-contain pb-3 dark:invert dark:hue-rotate-180"
+          className="max-h-14 max-w-full object-contain pb-2 dark:invert dark:hue-rotate-180"
         />
       ) : (
-        <span className="truncate pb-4 font-script text-4xl text-pen">{look.text}</span>
+        <span className="truncate pb-3 font-script text-3xl text-pen">{look.text}</span>
       )}
     </div>
   );

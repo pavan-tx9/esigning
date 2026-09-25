@@ -595,7 +595,9 @@ a tablet held by a patient in a clinic. Addendum 3 A (section 16) merged what we
 screens onto three; the acts are the same acts, and it is normative for their arrangement:
 
 1. **Connecting**: waiting for the token. Clear failure if it never arrives.
-2. **Read**: the PDF rendered with pdf.js, page by page, with progress ("Page 2 of 3"). Directly
+2. **Read**: the PDF rendered with pdf.js, page by page, in the one region of the frame that
+   scrolls, with progress in the action bar ("Page 2 of 3", a mark per page seen; the primary
+   button is "Next unseen page (n)" until every page has been displayed -- addendum 3 F). Directly
    under the last page, in the same scroll, the consent block: the disclosure collapsed to its
    opening lines and expanding in place, and an unchecked checkbox — or, where an acceptance
    already stands (section 16 C), a line saying when it was given. One button, **Continue to

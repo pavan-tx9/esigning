@@ -14,6 +14,10 @@ export function usePdf(bytes: Uint8Array | undefined): PdfState {
   const [state, setState] = useState<PdfState>({ status: "loading" });
   useEffect(() => {
     if (bytes === undefined) {
+      // The bytes went away (the document moved on and the cache was dropped): whatever was
+      // parsed from them is gone with them, and saying "ready" over a destroyed document would
+      // draw a failure where a skeleton belongs.
+      setState({ status: "loading" });
       return;
     }
     let cancelled = false;

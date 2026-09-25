@@ -1,68 +1,124 @@
-import { type Ref, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  type Ref,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { PdfPage } from "@/components/PdfPage";
 import { prefersReducedMotion, useStableCallback } from "@/components/ui";
+import type { PageSize } from "@/lib/geometry";
 import { rectToPercentBox } from "@/lib/geometry";
 import { isSubstantiallyVisible, PagesSeenTracker } from "@/lib/pages-seen";
-import { type LoadedPdf, pageText } from "@/lib/pdf";
+import { LETTER_SIZE, type LoadedPdf, pageText } from "@/lib/pdf";
+import {
+  pagePixels,
+  RENDER_AHEAD_PX,
+  readingWidth,
+  retainedWindow,
+  shouldRetain,
+} from "@/lib/render-budget";
 import type { SigningField } from "@/lib/signing-api";
 
 export interface DocumentViewerHandle {
   goToPage: (page: number) => void;
+  /** Scroll whatever sits under the last page (the consent block) into view. */
+  goToEnd: () => void;
 }
 
 export interface DocumentViewerProps {
-  pdf: LoadedPdf;
+  /** Null while the bytes are being fetched or parsed: the pages are drawn as skeletons. */
+  pdf: LoadedPdf | null;
+  /** From the session, so the document has its length before the bytes arrive. */
+  pageCount: number;
   fields: SigningField[];
   zoom: number;
   onSeen: (seen: ReadonlySet<number>) => void;
   onCurrentPage: (page: number) => void;
   onPageFailed: () => void;
+  /** What sits in a field's box on the page: the applied mark, once there is one. */
+  fieldContent?: (field: SigningField) => ReactNode;
+  fieldDone?: (field: SigningField) => boolean;
+  /** Before the first page, in the same scroll. */
+  leading?: ReactNode;
+  /** After the last page, in the same scroll: the consent block. */
+  trailing?: ReactNode;
   ref?: Ref<DocumentViewerHandle>;
 }
 
 const RATIO_STEPS = Array.from({ length: 21 }, (_, i) => i / 20);
+/** Space either side of the page column, so the paper never touches the frame's edge. */
+const GUTTER = 16;
 
 /**
- * The whole document, one page under another, in the normal page scroll (no nested vertical
- * scroller: those are miserable on a phone). Pages are drawn as they come near the screen and
- * each is reported as seen only after it has been drawn and looked at.
+ * The document, one page under another, in the one region of the frame that scrolls. Pages are
+ * drawn as they come near the screen, a few at a time and nearest first, and kept while they
+ * stay within a bounded neighbourhood of where the reader is. Each is reported as seen only
+ * after it has been drawn and looked at.
+ *
+ * The scroll container is this component, not the window: the frame it lives in is a fixed
+ * size, so the page can never grow to make the whole document "visible" at once.
  */
 export function DocumentViewer({
   pdf,
+  pageCount,
   fields,
   zoom,
   onSeen,
   onCurrentPage,
   onPageFailed,
+  fieldContent,
+  fieldDone,
+  leading,
+  trailing,
   ref,
 }: DocumentViewerProps) {
-  const [frame, setFrame] = useState<HTMLElement | null>(null);
+  const [scroller, setScroller] = useState<HTMLElement | null>(null);
   const [frameWidth, setFrameWidth] = useState(0);
   const [near, setNear] = useState<ReadonlySet<number>>(new Set([1]));
+  const [rendered, setRendered] = useState<ReadonlySet<number>>(new Set());
   const [texts, setTexts] = useState<Record<number, string>>({});
   const pageNodes = useRef(new Map<number, HTMLElement>());
+  const observers = useRef<{ nearby: IntersectionObserver; visible: IntersectionObserver } | null>(
+    null,
+  );
   const heights = useRef(new Map<number, number>());
+  const current = useRef(1);
   const reportSeen = useStableCallback(onSeen);
   const reportCurrent = useStableCallback(onCurrentPage);
 
-  const tracker = useMemo(() => new PagesSeenTracker((_, seen) => reportSeen(seen)), [reportSeen]);
+  const sizes: PageSize[] = useMemo(
+    () => pdf?.pages ?? Array.from({ length: pageCount }, () => LETTER_SIZE),
+    [pdf, pageCount],
+  );
+  const doc = pdf?.doc ?? null;
+
+  // A tracker per document, not per mount: the viewer stays mounted from Read into Sign and
+  // back (the document moved on under the signer), and what was seen of the old bytes is not a
+  // claim about the new ones. A new document starts the count again.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `doc` is the reset, on purpose
+  const tracker = useMemo(
+    () => new PagesSeenTracker((_, seen) => reportSeen(seen)),
+    [reportSeen, doc],
+  );
   useEffect(() => () => tracker.dispose(), [tracker]);
 
   useEffect(() => {
-    if (frame === null) {
+    if (scroller === null) {
       return;
     }
-    const measure = () => setFrameWidth(Math.floor(frame.clientWidth));
+    const measure = () => setFrameWidth(Math.max(0, Math.floor(scroller.clientWidth) - GUTTER * 2));
     measure();
     const observer = new ResizeObserver(measure);
-    observer.observe(frame);
+    observer.observe(scroller);
     return () => observer.disconnect();
-  }, [frame]);
-
-  const pageCount = pdf.pages.length;
+  }, [scroller]);
 
   useEffect(() => {
-    if (frameWidth === 0) {
+    if (frameWidth === 0 || scroller === null) {
       return;
     }
     const pageOf = (target: Element) => Number((target as HTMLElement).dataset.page);
@@ -71,21 +127,24 @@ export function DocumentViewer({
         setNear((previous) => {
           const next = new Set(previous);
           for (const entry of entries) {
+            const page = pageOf(entry.target);
             if (entry.isIntersecting) {
-              next.add(pageOf(entry.target));
+              next.add(page);
+            } else {
+              next.delete(page);
             }
           }
-          return next.size === previous.size ? previous : next;
+          return next;
         });
       },
-      { rootMargin: "900px 0px" },
+      { root: scroller, rootMargin: `${RENDER_AHEAD_PX}px 0px` },
     );
     const visible = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
           const page = pageOf(entry.target);
-          const rootHeight = entry.rootBounds?.height ?? window.innerHeight;
-          heights.current.set(page, entry.intersectionRect.height);
+          const rootHeight = entry.rootBounds?.height ?? scroller.clientHeight;
+          heights.current.set(page, entry.isIntersecting ? entry.intersectionRect.height : 0);
           tracker.setVisible(
             page,
             entry.isIntersecting &&
@@ -104,28 +163,34 @@ export function DocumentViewer({
             bestHeight = height;
           }
         }
-        if (best > 0) {
+        if (best > 0 && best !== current.current) {
+          current.current = best;
           reportCurrent(best);
         }
       },
-      { threshold: RATIO_STEPS },
+      { root: scroller, threshold: RATIO_STEPS },
     );
+    observers.current = { nearby, visible };
     for (const node of pageNodes.current.values()) {
       nearby.observe(node);
       visible.observe(node);
     }
     return () => {
+      observers.current = null;
       nearby.disconnect();
       visible.disconnect();
     };
-  }, [frameWidth, tracker, reportCurrent]);
+  }, [frameWidth, tracker, reportCurrent, scroller]);
 
   // A text rendering of each page for screen readers, fetched once the page is near.
   useEffect(() => {
+    if (doc === null) {
+      return;
+    }
     let cancelled = false;
     for (const page of near) {
       if (texts[page] === undefined) {
-        pageText(pdf.doc, page).then(
+        pageText(doc, page).then(
           (text) => {
             if (!cancelled) {
               setTexts((previous) =>
@@ -140,96 +205,165 @@ export function DocumentViewer({
     return () => {
       cancelled = true;
     };
-  }, [near, pdf.doc, texts]);
+  }, [near, doc, texts]);
 
-  useImperativeHandle(ref, () => ({
-    goToPage: (page: number) => {
-      const node = pageNodes.current.get(page);
-      if (node !== undefined) {
-        node.scrollIntoView({
-          behavior: prefersReducedMotion() ? "auto" : "smooth",
-          block: "start",
-        });
-        node.focus({ preventScroll: true });
+  const scrollTo = useCallback(
+    (node: HTMLElement) => {
+      if (scroller === null) {
+        return;
+      }
+      const top = node.offsetTop - GUTTER;
+      if (typeof scroller.scrollTo === "function") {
+        scroller.scrollTo({ top, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+      } else {
+        scroller.scrollTop = top;
       }
     },
-  }));
+    [scroller],
+  );
 
-  const pageWidth = Math.max(0, frameWidth) * zoom;
+  useImperativeHandle(
+    ref,
+    () => ({
+      goToPage: (page: number) => {
+        const node = pageNodes.current.get(page);
+        if (node !== undefined) {
+          scrollTo(node);
+          node.focus({ preventScroll: true });
+        }
+      },
+      goToEnd: () => {
+        const node = scroller?.querySelector<HTMLElement>("[data-trailing]");
+        if (node !== undefined && node !== null) {
+          scrollTo(node);
+        }
+      },
+    }),
+    [scrollTo, scroller],
+  );
+
+  const pageWidth = readingWidth(frameWidth, zoom);
+  const first = sizes[0] ?? LETTER_SIZE;
+  const keep = retainedWindow(
+    pagePixels(
+      pageWidth,
+      (pageWidth * first.height) / first.width,
+      typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
+    ),
+  );
+
+  const onRendered = useCallback(
+    (page: number, isRendered: boolean) => {
+      tracker.setRendered(page, isRendered);
+      setRendered((previous) => {
+        if (previous.has(page) === isRendered) {
+          return previous;
+        }
+        const next = new Set(previous);
+        if (isRendered) {
+          next.add(page);
+        } else {
+          next.delete(page);
+        }
+        return next;
+      });
+    },
+    [tracker],
+  );
 
   return (
-    // When zoomed the region scrolls sideways, so it must be reachable by keyboard to be scrolled.
     <section
-      ref={setFrame}
+      ref={setScroller}
       aria-label={`Document, ${pageCount} ${pageCount === 1 ? "page" : "pages"}`}
-      tabIndex={zoom > 1 ? 0 : -1}
-      className="overflow-x-auto pb-2"
+      // The region is what scrolls, so it is what the keyboard scrolls: focusable, always, as a
+      // scrollable region has to be for arrow and page keys to reach it.
+      // biome-ignore lint/a11y/noNoninteractiveTabindex: a scroll container must be focusable
+      tabIndex={0}
+      className="doc-scroller"
       data-testid="document-viewer"
+      data-scroll-region
     >
-      <ol className="flex w-max min-w-full list-none flex-col items-center gap-5 p-0">
-        {pdf.pages.map((size, index) => {
-          const pageNumber = index + 1;
-          const pageFields = fields.filter((field) => field.page === pageNumber);
-          return (
-            <li key={pageNumber} className="scroll-mt-4">
-              <section
-                ref={(node) => {
-                  if (node === null) {
-                    pageNodes.current.delete(pageNumber);
-                  } else {
-                    pageNodes.current.set(pageNumber, node);
-                  }
-                }}
-                data-page={pageNumber}
-                tabIndex={-1}
-                aria-label={`Page ${pageNumber} of ${pageCount}`}
-                className="scroll-mt-4 outline-none"
-              >
-                <p aria-hidden="true" className="mb-1.5 text-ink-500 text-sm">
-                  Page {pageNumber} of {pageCount}
-                </p>
-                {frameWidth > 0 ? (
-                  <PdfPage
-                    doc={pdf.doc}
-                    pageNumber={pageNumber}
-                    size={size}
-                    width={pageWidth}
-                    active={near.has(pageNumber)}
-                    onRendered={(page) => tracker.setRendered(page, true)}
-                    onFailed={onPageFailed}
-                  >
-                    {pageFields.map((field) => {
-                      const box = rectToPercentBox(field.rect, size);
-                      return (
-                        <div
-                          key={field.id}
-                          aria-hidden="true"
-                          data-field-mark={field.id}
-                          className={`absolute rounded-sm border-page-mark-edge bg-page-mark ${
-                            field.rect.h > 20 ? "border-2 border-dashed" : "border"
-                          }`}
-                          style={{
-                            left: `${box.left}%`,
-                            top: `${box.top}%`,
-                            width: `${box.width}%`,
-                            height: `${box.height}%`,
-                          }}
-                        />
-                      );
-                    })}
-                  </PdfPage>
-                ) : null}
-                <div className="sr-only">
-                  {texts[pageNumber] ?? "The text of this page is loading."}
-                  {pageFields.length > 0
-                    ? ` You will be asked to complete on this page: ${pageFields.map((f) => f.label).join(", ")}.`
-                    : ""}
-                </div>
-              </section>
-            </li>
-          );
-        })}
-      </ol>
+      <div
+        className="doc-column"
+        style={{ maxWidth: `${Math.max(pageWidth, 320) + GUTTER * 2}px` }}
+      >
+        {leading}
+        <ol className="m-0 flex list-none flex-col gap-3 p-0">
+          {sizes.map((size, index) => {
+            const pageNumber = index + 1;
+            const pageFields = fields.filter((field) => field.page === pageNumber);
+            const active =
+              near.has(pageNumber) ||
+              (rendered.has(pageNumber) && shouldRetain(pageNumber, current.current, keep));
+            return (
+              <li key={pageNumber}>
+                <section
+                  ref={(node) => {
+                    if (node === null) {
+                      pageNodes.current.delete(pageNumber);
+                    } else {
+                      pageNodes.current.set(pageNumber, node);
+                      // A page that arrives after the observers did (the sizes came in from
+                      // the document) is watched from the moment it exists.
+                      observers.current?.nearby.observe(node);
+                      observers.current?.visible.observe(node);
+                    }
+                  }}
+                  data-page={pageNumber}
+                  tabIndex={-1}
+                  aria-label={`Page ${pageNumber} of ${pageCount}`}
+                  className="outline-none"
+                >
+                  {frameWidth > 0 ? (
+                    <PdfPage
+                      doc={doc}
+                      pageNumber={pageNumber}
+                      size={size}
+                      width={pageWidth}
+                      active={active}
+                      priority={() => Math.abs(pageNumber - current.current)}
+                      onRendered={onRendered}
+                      onFailed={onPageFailed}
+                    >
+                      {pageFields.map((field) => {
+                        const box = rectToPercentBox(field.rect, size);
+                        const done = fieldDone?.(field) ?? false;
+                        return (
+                          <div
+                            key={field.id}
+                            aria-hidden="true"
+                            data-field-mark={field.id}
+                            className={`absolute flex items-center justify-center overflow-hidden rounded-sm ${
+                              done
+                                ? "border-2 border-page-done-edge bg-page-done"
+                                : `border-page-mark-edge bg-page-mark ${field.rect.h > 20 ? "border-2 border-dashed" : "border"}`
+                            }`}
+                            style={{
+                              left: `${box.left}%`,
+                              top: `${box.top}%`,
+                              width: `${box.width}%`,
+                              height: `${box.height}%`,
+                            }}
+                          >
+                            {fieldContent?.(field)}
+                          </div>
+                        );
+                      })}
+                    </PdfPage>
+                  ) : null}
+                  <div className="sr-only">
+                    {texts[pageNumber] ?? "The text of this page is loading."}
+                    {pageFields.length > 0
+                      ? ` You will be asked to complete on this page: ${pageFields.map((f) => f.label).join(", ")}.`
+                      : ""}
+                  </div>
+                </section>
+              </li>
+            );
+          })}
+        </ol>
+        {trailing ? <div data-trailing>{trailing}</div> : null}
+      </div>
     </section>
   );
 }
