@@ -5,10 +5,11 @@ commit. It is multipart rather than JSON because the scan is a file -- ``scan`` 
 JSON document that is exactly ``NewArchive``. Converting a photograph or a TIFF into a PDF is the
 host's job: this route takes a PDF and says so, rather than guessing at an image.
 
-Like the last signature, the seal is attempted once inline after the commit and in a transaction
-of its own. If KMS, the timestamp authority or storage is down the archive still exists, the
-failure is recorded, and the worker retries; the response reports the state as of filing and never
-says "sealed" on the strength of an attempt.
+Filing queues a seal job and this route still attempts the seal once after the commit. A
+``NOTIFY esign_seal`` covers the case where that attempt is skipped or fails. If KMS, the
+timestamp authority or storage is down the archive still exists, the failure is recorded, and the
+worker retries; the response reports the state as of filing and never says "sealed" on the strength
+of an attempt.
 """
 
 from __future__ import annotations

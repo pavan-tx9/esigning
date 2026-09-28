@@ -11,13 +11,14 @@ two designs are otherwise equal, pick the one that produces better evidence.
 
 The contract lives in four files that module authors must not edit. They were revised once, at
 integration, from the module hand-off reports, and again for Addendum 1 (section 14), Addendum 2
-(section 15) and Addendum 3 (section 16, which adds no migration); every such revision is listed
-in section 13:
+(section 15), Addendum 3 (section 16, which adds no migration) and Addendum 4 (section 17); every
+such revision is listed in section 13:
 
 - `backend/src/esign/contracts.py`: every cross-module type and interface
 - `backend/migrations/0001_schema.sql`: the full schema
 - `backend/migrations/0700_addendum_1.sql`: the schema for Addendum 1 (section 14)
 - `backend/migrations/0800_addendum_2.sql`: the schema for Addendum 2 (section 15)
+- `backend/migrations/0900_addendum_4.sql`: the schema for Addendum 4 (section 17)
 
 ## 1. Scope
 
@@ -162,10 +163,11 @@ the state change.
    `(host_id, host_user_id)` in the same transaction (`signature.adopted`), replacing and revoking
    any earlier one (`signature.adoption_revoked`); never from a kiosk session.
 7. **Finalize and seal**: when the last signer signs, the envelope becomes
-   `completed_pending_seal` and a seal job is enqueued (and attempted once inline). The job builds
+   `completed_pending_seal` and a seal job is enqueued. The HTTP response is that stamp
+   (`completed_pending_seal`); a `NOTIFY esign_seal` wakes the worker, which builds
    the certificate of completion from the audit trail, appends it, applies one PAdES certification
    seal with an RFC 3161 timestamp using the KMS-held key, validates its own output, stores it
-   write-once, then marks the envelope `sealed`.
+   write-once, then marks the envelope `sealed`. The sign press never waits for that work.
 8. **Deliver**: the signer can download the sealed copy from the same session; the host is
    notified by webhook and fetches the sealed PDF to file in the chart.
 9. **Verify**: `esign verify <envelope_id>` and `GET /v1/envelopes/{id}/verification` re-check the
@@ -345,12 +347,15 @@ the paper original and the attesting staff member, and the cover page and the ce
   signed, scripted, XFA or attachment-bearing files and enforces size and page limits.
 - Field geometry uses displayed-page coordinates (`Rect`). Handle `/Rotate` and non-zero
   `MediaBox`/`CropBox` origins correctly and test them.
-- Stamping: drawn signatures as images scaled to fit the rect preserving aspect ratio; typed
-  signatures in an embedded script-style font with a plain fallback; click-to-sign renders the
-  signer's name in the plain font. Every signature gets a small caption: name, capacity (and "on
-  behalf of" where relevant), UTC time, signer id. `date_signed` fields are filled by the server
-  from `Clock`, never by the client. Signature and initials fields are at least 80x28pt, so the
-  caption never has to abbreviate the signer id (the link between the mark and the audit trail).
+- Stamping: drawn signatures as images scaled to fill the mark band (at least 60% of the field
+  height), left-aligned, preserving aspect ratio and cropped to the ink; typed and click-to-sign
+  text scaled to fill that band. Every signature gets a caption of at most two lines: name and
+  capacity (and "on behalf of" where relevant); then the date in the host's display timezone
+  (`hosts.display_timezone`, else `DEFAULT_DISPLAY_TIMEZONE`) and the full signer id. The
+  certificate keeps the UTC time. `date_signed` fields are filled by the server from `Clock`,
+  never by the client, in the same display format. Signature and initials fields are at least
+  80x28pt, so the caption never has to abbreviate the signer id (the link between the mark and
+  the audit trail).
 - A signer role may be declared `required: false` (an optional witness or interpreter); an
   envelope may omit such a role. Every role that is present must sign.
 - Embed fonts. Output must contain no JavaScript, no form fields, no annotations that can be edited.
@@ -454,7 +459,7 @@ never echo input. All ids are UUIDv4. Hashes are lowercase hex.
 | `POST /v1/archives` | section 14 A: file a scan of a paper-signed document. Multipart: `scan` (a PDF; converting images is the host's job) + `body` (JSON text: `{patient_ref, document_type, host_document_ref?, paper_signed_on, attestation: {staff_user_id, staff_display_name, statement: "true_copy", original_disposition, paper_signers: [{display_name, capacity}]}, supersedes_envelope_id?}`, i.e. `NewArchive`). Supports `Idempotency-Key`. Returns an `EnvelopeView` with `kind: "paper_archive"`. The request-size limit for this route is `MAX_SCAN_BYTES` plus multipart overhead, not `MAX_REQUEST_BYTES` |
 | `GET /v1/envelopes/{id}` | `EnvelopeView`. Gained `kind`; for a paper archive `template_key`, `template_version` and `signing_order` are `null`, `signers` is empty, and `paper_signed_on` and `attested_at` are set. Gained `source` (section 15): for a host document `template_key` and `template_version` are `null` and everything else is as for a template envelope. `/document`, `/audit`, `/verification` and `/void` apply to every kind and source |
 | `POST /v1/envelopes/{id}/void` | `{reason_code}` from the fixed list `contracts.VOID_REASON_CODES` (a host-invented code would be free text with underscores, and it reaches the audit trail) |
-| `POST /v1/envelopes/{id}/signers/{sid}/sessions` | `{auth: {method, auth_time}, kiosk?: {staff_user_id, identity_check}}` -> `{token, session_id, expires_at}` |
+| `POST /v1/envelopes/{id}/signers/{sid}/sessions` | `{auth: {method, auth_time}, kiosk?: {staff_user_id, identity_check}, client?: "iframe" \| "sdk"}` -> `{token, session_id, expires_at}`. `client` defaults to `iframe` (section 17 D) |
 | `POST /v1/sessions/{session_id}/reauth` | `{method, auth_time}` -> `{session_id, reauth_valid_until}`; another host's session is `not_found`. With the span on (section 14 C) the host still calls this once, on the first document |
 | `POST /v1/users/{host_user_id}/adopted-signature/revoke` | section 14 B: `{reason?}` (free text is not stored; the trail records `reason: host`). Revokes the user's live saved signature; 200 `{"revoked": bool}` whether or not there was one, so another host's user is indistinguishable from a user with none (both answer `false`) |
 | `GET /v1/envelopes/{id}/document` | sealed PDF, or 409 `not_sealed` |
@@ -472,7 +477,7 @@ sounds like "upload a PDF" is exactly what a signer-side upload would reach for.
 |---|---|
 | `GET /v1/signing/session` | everything the UI needs, shape below. `?locale=` picks the disclosure language |
 | `GET /v1/signing/document` | current revision PDF; records `document.presented` |
-| `POST /v1/signing/viewed` | `{pages_viewed: int}` must equal the page count |
+| `POST /v1/signing/viewed` | `{pages_viewed: int, pages_seen?: int[], reached_end?: bool}` must equal the page count; when `pages_seen` is present it must be exactly pages 1 to N (section 17 A) |
 | `POST /v1/signing/consent` | `{consent_version, accepted: true, locale?, relies_on_envelope_id?}` (`locale` as shown in the session payload; default locale when omitted). Section 16 C: `relies_on_envelope_id` is the envelope named by `consent.standing` in the session payload. The server re-finds that acceptance under the same rule that offered it and refuses with 409 `consent_not_standing` otherwise, on which the UI shows the checkbox and posts again without it. Omitted, the route behaves exactly as it did before the addendum |
 | `POST /v1/signing/sign` | `{intent_confirmed: true, captures: [...], save_adopted_signature?: bool}` + `Idempotency-Key`. `save_adopted_signature: true` (section 14 B) saves the drawn or typed signature just applied, after the signature succeeds and in the same transaction; what is saved is the first such capture landing on a **signature** field, never an initials one (initials are the signer's own typed text and a template may ask for them first); refused (422 `no_signature_to_save`) when the request has no such capture, and always (403) from a kiosk session |
 | `POST /v1/signing/adopted-signature/revoke` | section 14 B: the signer removes their own saved signature (`reason: user`). No body. 200 `{"revoked": bool}` whether or not there was one. Refused (403 `adoption_not_allowed`) from a kiosk session, as saving is: a shared tablet is not shown this signature and may not destroy it either, and the revocation is irreversible and would be recorded as the person's own request |
@@ -481,8 +486,8 @@ sounds like "upload a PDF" is exactly what a signer-side upload would reach for.
 
 Every signer `POST` answers `{"envelope": {"id", "status"}, "signer": {"id", "status"}}`: ids and
 statuses only. `sign` reports the state as of the signature (`completed_pending_seal` for the last
-signer) even when the inline seal attempt then succeeds; the UI learns of sealing from `copy` or
-the session. `sign` requires `Idempotency-Key` (422 `idempotency_key_required`). Request bodies
+signer); the seal is not attempted on that request. The UI learns of sealing from `copy` or the
+session. `sign` requires `Idempotency-Key` (422 `idempotency_key_required`). Request bodies
 forbid unknown keys, so a client that sends a hash, a timestamp, a PDF or a `date_signed` value is
 refused (422) rather than ignored.
 
@@ -550,6 +555,10 @@ UI to parent: `esign:reauth_required {session_id}`, `esign:signed`, `esign:seale
 `esign:declined`, `esign:expired`, `esign:resize {height}`. Parent to UI: `esign:reauth_done`.
 The token lives in memory only: not in the URL, not in storage.
 
+Section 17 D adds an opt-in SDK path that does not use this protocol: the host's page imports
+`@esign/sdk`, the same flow runs in that page, and the `esign:*` events are callbacks. The iframe
+protocol above is unchanged.
+
 ### Webhooks
 `envelope.completed`, `envelope.sealed`, `envelope.declined`, `envelope.voided`,
 `envelope.expired`. Payload: ids, status, hashes only (`id` of the delivery, `event`,
@@ -566,11 +575,12 @@ that changed the envelope and sent by the worker: at least once, in queue order 
 fails, retried with backoff (30s, 2m, 10m, 30m, then hourly) up to `WEBHOOK_MAX_ATTEMPTS`.
 
 ### Worker
-`esign worker` claims due `seal_jobs` with `FOR UPDATE SKIP LOCKED` in a short transaction that
-commits before sealing starts (the claim is `locked_at`; one older than
-`SEAL_JOB_LOCK_TIMEOUT_SECONDS` is taken over), runs `seal_pending` in a transaction of its own,
-sweeps expiries, and delivers webhooks. Any number of workers may run. The envelope row lock means
-two workers holding the same job still seal once.
+`esign worker` LISTENs for `NOTIFY esign_seal` (falling back to `worker_poll_seconds`), claims due
+`seal_jobs` with `FOR UPDATE SKIP LOCKED` in a short transaction that commits before sealing starts
+(the claim is `locked_at`; one older than `SEAL_JOB_LOCK_TIMEOUT_SECONDS` is taken over), runs
+`seal_pending` in a transaction of its own, sweeps expiries, and delivers webhooks only when the
+seal queue is idle. Any number of workers may run. The envelope row lock means two workers holding
+the same job still seal once.
 
 ## 10. Security and PHI rules
 
@@ -602,10 +612,11 @@ screens onto three; the acts are the same acts, and it is normative for their ar
    opening lines and expanding in place, and an unchecked checkbox — or, where an acceptance
    already stands (section 16 C), a line saying when it was given. One primary button: **Next
    unseen page (n)** until every page has been displayed, taking the reader to the first page
-   not yet counted; then **Continue to sign**, inert until the consent condition is met and
-   saying so when pressed. `POST /signing/viewed` goes when the last page has been displayed,
-   `POST /signing/consent` when the button is pressed. A text alternative in the bar explains
-   that staff can provide a paper copy, beside the press that asks for one.
+   not yet counted; then **Go to end** until the consent block has been on screen (section 17 A);
+   then **Continue to sign**, inert until the consent condition is met and
+   saying so when pressed. `POST /signing/viewed` goes when every page has been displayed and the
+   end has been reached, `POST /signing/consent` when the button is pressed. A text alternative
+   in the bar explains that staff can provide a paper copy, beside the press that asks for one.
 3. **Sign**: the signature panel at the top (the one on file, with "Change", or the
    draw / type / click-to-sign chooser inline), then this signer's fields as a list, each applied
    by an explicit action of its own, with how many remain. One primary button, "Sign as <name>",
@@ -1032,6 +1043,21 @@ what its shorter flow left on the screen; no change to `0001`, `0700` or `0800`:
   that does name them (`frontend/src/lib/signing-api.ts::onBehalfOfPhrase`). It is a display
   decision and reaches no request, event or column.
 
+Addendum 4 (section 17), made once by the architecture step before the four features were built:
+
+- **`contracts.py`**: `SignerStamp.display_tz`; `CertificateSigner` review and signing-client
+  fields; `Host.display_timezone`; `SessionInfo.client_mode`; `RequestContext.client` and
+  `origin`; `record_viewed` gained `pages_seen` and `reached_end`.
+- **`0900_addendum_4.sql`**: `hosts.display_timezone`; `signing_sessions.client_mode`
+  (`iframe | sdk`, default `iframe`). Grants are unchanged.
+- **`config.py`**: `default_display_timezone` (UTC), `revocation_timeout_seconds`.
+- **Audit allowlist**: `DocumentViewedData` gained `pages_seen`, `reached_end`, `review_seconds`,
+  `client`, `origin`; `DocumentPresentedData`, `ConsentAcceptedData` and `SignerSignedData` gained
+  `client` and `origin`; `SessionCreatedData` gained `client_mode`.
+- **API**: optional `client` on session creation; optional `pages_seen` and `reached_end` on
+  `/signing/viewed`; CORS middleware on `/v1/signing/*` only; `X-Esign-Client` required for SDK
+  sessions. The sign route no longer attempts the seal inline.
+
 ## 14. Addendum 1: paper archives, adopted signatures, re-authentication span
 
 `docs/SPEC-ADDENDUM-1.md` adds three features to this spec and is normative for them:
@@ -1166,3 +1192,30 @@ Its contract changes were made once, up front (section 13, "Addendum 3"), in `co
 `config.py` and this document; the sections above that changed say so inline. There is no
 migration: standing consent is found in rows the base schema already writes. The addendum's
 Frontend, Demo host and Tests headings apply to sections 11 and 12 without restating them here.
+
+## 17. Addendum 4: review evidence, the signing date, a faster sign press, and SDK mode
+
+`docs/SPEC-ADDENDUM-4.md` is normative for these four changes. Nothing that produces evidence is
+removed. New fields are optional; the iframe protocol is unchanged.
+
+- **A. Every page reviewed, plus reaching the end**: Continue to sign requires every page
+  displayed and the consent block under the last page on screen. `POST /signing/viewed` may carry
+  `pages_seen` and `reached_end`; `review_seconds` is computed from `Clock`. The certificate
+  prints the review line when the data is present. The old `pages_viewed` path still works.
+- **B. Signature size and date**: the mark takes at least 60% of the field; the caption is two
+  lines with the date in the host's IANA timezone. `signed_at` stays UTC.
+- **C. The sign press no longer waits for the seal**: the response is `completed_pending_seal`;
+  `NOTIFY esign_seal` wakes the worker. Never fail open: Done still says whether the copy is
+  sealed or sealing.
+- **D. SDK mode**: opt-in `client: sdk` at session creation, CORS only on `/v1/signing/*`,
+  `X-Esign-Client` required and recorded. `@esign/sdk` reuses the same `SigningFlow`. The framed
+  UI is unchanged.
+
+**What this weakens.** A and C weaken nothing in the chain. B changes only how a UTC instant is
+printed. D replaces the frame's origin check with session mode plus CORS plus a self-declared
+library header; the host's declaration of `sdk` and its `allowed_origins` are what bind it, and
+the checklist records that for counsel.
+
+Everything in sections 1 to 16 still applies; where the addendum is silent, this document decides.
+Its contract and schema changes were made once, up front (section 13, "Addendum 4"), in
+`contracts.py`, `0900_addendum_4.sql`, `config.py` and this document.

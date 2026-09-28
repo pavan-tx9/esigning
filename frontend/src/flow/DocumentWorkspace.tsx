@@ -22,15 +22,22 @@ const ZOOMS = [1, 1.5, 2, 3] as const;
 
 export interface Workspace {
   pdf: PdfState;
+  /** Pages the tracker has counted as displayed, for this document only. */
+  seen: ReadonlySet<number>;
+  /** The consent block under the last page has been on screen. */
+  reachedEnd: boolean;
+  /**
+   * The page count to gate on: the loaded PDF's length once it is ready, otherwise the
+   * session's. `pageCountMismatch` is set when those two disagree.
+   */
   pageCount: number;
+  pageCountMismatch: boolean;
   /** The page with the most of itself on screen. */
   current: number;
   /**
-   * Scroll to a page and say so. `silent` when the move is the screen's own, not the reader's;
-   * `focus` only when the reader asked to be taken there from the page itself, never from a
-   * button that should keep the focus it has.
+   * Scroll to a page and say so. `silent` when the move is the screen's own, not the reader's.
    */
-  goToPage: (page: number, options?: { silent?: boolean; focus?: boolean }) => void;
+  goToPage: (page: number, options?: { silent?: boolean }) => void;
   /** Scroll to what sits under the last page: the consent block. */
   goToEnd: () => void;
   /** Where a step may put something before the first page, in the same scroll. */
@@ -54,7 +61,8 @@ export function useWorkspace(): Workspace {
 interface DocumentWorkspaceProps {
   session: SigningSession;
   step: "read" | "sign";
-  onSeen: (seen: ReadonlySet<number>) => void;
+  /** The document identity changed (new bytes, a retry): forget that viewed was posted. */
+  onReviewReset: () => void;
   /** What the signer has placed so far: shown in the fields' boxes on the page itself. */
   draft: Draft;
   /** The top bar's slot for the document controls (zoom), owned by the shell. */
@@ -74,17 +82,23 @@ interface DocumentWorkspaceProps {
 export function DocumentWorkspace({
   session,
   step,
-  onSeen,
+  onReviewReset,
   draft,
   toolbarNode,
   hidden = false,
   children,
 }: DocumentWorkspaceProps) {
-  const pageCount = session.envelope.page_count;
+  const sessionPageCount = session.envelope.page_count;
   const announce = useAnnounce();
   const viewer = useRef<DocumentViewerHandle>(null);
   const document_ = useQuery(documentQueryOptions());
   const pdf = usePdf(document_.data);
+  const loadedPageCount =
+    pdf.status === "ready" && pdf.pdf.pages.length > 0 ? pdf.pdf.pages.length : null;
+  const pageCountMismatch = loadedPageCount !== null && loadedPageCount !== sessionPageCount;
+  const pageCount = loadedPageCount ?? sessionPageCount;
+  const [seen, setSeen] = useState<ReadonlySet<number>>(() => new Set());
+  const [reachedEnd, setReachedEnd] = useState(false);
   const [current, setCurrent] = useState(1);
   const [zoomIndex, setZoomIndex] = useState(0);
   const [pageFailed, setPageFailed] = useState(false);
@@ -92,11 +106,37 @@ export function DocumentWorkspace({
   const [trailingNode, setTrailingNode] = useState<HTMLElement | null>(null);
   const zoom = ZOOMS[zoomIndex] ?? 1;
   const zoomReadout = useId();
+  const [generation, setGeneration] = useState(0);
+  const lastLoadedAt = useRef(0);
+  /**
+   * The viewer's own state (drawn pages, the tracker) is per document. A new generation is only
+   * started when bytes we already had are replaced -- a retry after a failed fetch, or a new
+   * revision. The first arrival of the PDF must not wipe pages the tracker has already counted.
+   */
+  useEffect(() => {
+    if (document_.data === undefined) {
+      return;
+    }
+    if (lastLoadedAt.current === 0) {
+      lastLoadedAt.current = document_.dataUpdatedAt;
+      return;
+    }
+    if (document_.dataUpdatedAt === lastLoadedAt.current) {
+      return;
+    }
+    lastLoadedAt.current = document_.dataUpdatedAt;
+    setGeneration((n) => n + 1);
+    setSeen(new Set());
+    setReachedEnd(false);
+    setCurrent(1);
+    onReviewReset();
+  }, [document_.data, document_.dataUpdatedAt, onReviewReset]);
+  const viewerKey = `${session.envelope.id}:${generation}`;
 
   const goToPage = useCallback(
-    (page: number, options: { silent?: boolean; focus?: boolean } = {}) => {
+    (page: number, options: { silent?: boolean } = {}) => {
       const target = Math.min(pageCount, Math.max(1, page));
-      viewer.current?.goToPage(target, { focus: options.focus === true });
+      viewer.current?.goToPage(target);
       if (!options.silent) {
         announce(`Page ${target} of ${pageCount}`);
       }
@@ -130,7 +170,10 @@ export function DocumentWorkspace({
   const workspace = useMemo<Workspace>(
     () => ({
       pdf,
+      seen,
+      reachedEnd,
       pageCount,
+      pageCountMismatch,
       current,
       goToPage,
       goToEnd,
@@ -138,7 +181,19 @@ export function DocumentWorkspace({
       trailingNode,
       documentFailed,
     }),
-    [pdf, pageCount, current, goToPage, goToEnd, leadingNode, trailingNode, documentFailed],
+    [
+      pdf,
+      seen,
+      reachedEnd,
+      pageCount,
+      pageCountMismatch,
+      current,
+      goToPage,
+      goToEnd,
+      leadingNode,
+      trailingNode,
+      documentFailed,
+    ],
   );
 
   const fieldDone = (field: SigningSession["fields"][number]) =>
@@ -195,12 +250,14 @@ export function DocumentWorkspace({
           </div>
         ) : (
           <DocumentViewer
+            key={viewerKey}
             ref={viewer}
             pdf={pdf.status === "ready" ? pdf.pdf : null}
             pageCount={pageCount}
             fields={session.fields}
             zoom={zoom}
-            onSeen={onSeen}
+            onSeen={setSeen}
+            onReachedEnd={setReachedEnd}
             onCurrentPage={setCurrent}
             onPageFailed={() => setPageFailed(true)}
             fieldDone={fieldDone}

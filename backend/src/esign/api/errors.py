@@ -82,6 +82,8 @@ _BY_CODE: Final[dict[str, str]] = {
     "document_type_not_approved": "That document type cannot be signed here.",
     "signer_roles_required": "A supplied document needs at least one signer role.",
     "duplicate_role": "Two signer roles share a key.",
+    "origin_not_allowed": "This page is not allowed to call the signing service.",
+    "client_required": "This session must be driven by the signing library.",
 }
 
 _BY_STATUS: Final[dict[int, str]] = {

@@ -465,6 +465,16 @@ def build_store() -> Store:
             },
             note="The one to run on the clinic tablet: the front desk starts it, the patient signs it there, and the tablet comes back.",
         ),
+        Task(
+            id=str(uuid4()),
+            title="Acknowledgement of privacy practices (this page)",
+            template_key="hipaa_acknowledgement",
+            patient_id=maria.id,
+            signing_order="parallel",
+            signers=(TaskSigner(role_key="patient", role_label="Patient", user_id="u-maria", capacity="self"),),
+            prefill={"patient_name": maria.name, "notice_version": "2026-09"},
+            note="Sign this one in the page itself: the library runs here, not in an iframe.",
+        ),
         # Sam's own documents (he is old enough to have a portal login of his own in this demo):
         # one to sign on the portal, one for the clinic tablet, one for afterwards. Together they
         # show that a signature saved on the portal is never offered on a shared tablet, and that

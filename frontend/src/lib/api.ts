@@ -90,7 +90,30 @@ export interface ApiOptions {
   timeoutMs?: number;
 }
 
-const BASE_URL = "/v1";
+const BASE_URL_DEFAULT = "/v1";
+
+let baseUrl = BASE_URL_DEFAULT;
+let clientLabel: string | null = null;
+
+/**
+ * Point the fetch seam at a different origin and name the library on every call (Addendum 4).
+ * The iframe UI never calls this: it talks to `/v1` on the same origin.
+ */
+export function configureApi(options: { baseUrl?: string; client?: string | null }): void {
+  if (options.baseUrl !== undefined) {
+    const trimmed = options.baseUrl.replace(/\/$/, "");
+    baseUrl = trimmed === "" ? BASE_URL_DEFAULT : trimmed;
+  }
+  if (options.client !== undefined) {
+    clientLabel = options.client;
+  }
+}
+
+/** Tests restore the iframe defaults after an SDK-style configuration. */
+export function resetApiConfig(): void {
+  baseUrl = BASE_URL_DEFAULT;
+  clientLabel = null;
+}
 
 /**
  * A stalled connection -- Wi-Fi dropped mid-POST, a captive portal swallowing the request -- is
@@ -150,6 +173,9 @@ function buildHeaders(options: ApiOptions, accept: string): Headers {
   if (options.idempotencyKey !== undefined) {
     headers.set("Idempotency-Key", options.idempotencyKey);
   }
+  if (clientLabel !== null) {
+    headers.set("X-Esign-Client", clientLabel);
+  }
   return headers;
 }
 
@@ -197,7 +223,7 @@ async function send(
 ): Promise<Response> {
   try {
     return await fetch(
-      `${BASE_URL}${path}`,
+      `${baseUrl}${path}`,
       buildInit(options, buildHeaders(options, accept), signal),
     );
   } catch (error) {

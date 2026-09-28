@@ -84,7 +84,9 @@ def _hosts_create(args: argparse.Namespace, rt_factory: RuntimeFactory) -> int:
 
     rt = rt_factory()
     with rt.transaction() as db:
-        key, host = create_host(db, args.name, tuple(args.origin or ()), args.webhook_url, clock=rt.clock)
+        key, host = create_host(
+            db, args.name, tuple(args.origin or ()), args.webhook_url, clock=rt.clock, display_timezone=args.timezone
+        )
         secret = rotate_webhook_secret(db, host.id) if args.webhook_url else None
     _say(f"host id:        {host.id}")
     _say(f"api key:        {key}")
@@ -103,6 +105,19 @@ def _hosts_rotate_key(args: argparse.Namespace, rt_factory: RuntimeFactory) -> i
     _say(f"host id: {host.id}")
     _say(f"api key: {key}")
     _say("The previous key no longer works. This one is shown once and is not stored.")
+    return 0
+
+
+def _hosts_set_timezone(args: argparse.Namespace, rt_factory: RuntimeFactory) -> int:
+    from esign.identity import set_host_timezone
+
+    rt = rt_factory()
+    name = None if args.timezone.strip() == "" else args.timezone
+    with rt.transaction() as db:
+        host = set_host_timezone(db, args.host_id, name)
+    shown = host.display_timezone or "(process default)"
+    _say(f"host id:   {host.id}")
+    _say(f"timezone:  {shown}")
     return 0
 
 
@@ -265,10 +280,15 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--name", required=True)
     create.add_argument("--origin", action="append", help="origin allowed to embed the signing UI (repeatable)")
     create.add_argument("--webhook-url")
+    create.add_argument("--timezone", help="IANA timezone for dates printed under a signature")
     create.set_defaults(run=_hosts_create)
     rotate = hosts.add_parser("rotate-key", help="replace a host's API key")
     rotate.add_argument("host_id", type=UUID)
     rotate.set_defaults(run=_hosts_rotate_key)
+    tz = hosts.add_parser("set-timezone", help="set the timezone printed under this host's signatures")
+    tz.add_argument("host_id", type=UUID)
+    tz.add_argument("--timezone", required=True, help="IANA name, or empty to use the process default")
+    tz.set_defaults(run=_hosts_set_timezone)
 
     consent = commands.add_parser("consent", help="manage disclosure texts").add_subparsers(
         dest="action", required=True

@@ -25,12 +25,10 @@ interface ReadStepProps {
    */
   changed?: boolean;
   /**
-   * Which pages have been displayed, and whether the server has been told. Both are held by the
-   * flow rather than this screen, because this screen is unmounted by a detour that changes
-   * neither: opening the paper-path sheet and coming back must not make somebody scroll thirty
-   * pages again to reach a button they had already earned.
+   * Whether the server has been told every page was displayed. Held by the flow rather than this
+   * screen so a remount of the step (the paper-path sheet) does not send the same claim twice.
+   * The pages themselves live on the workspace: the viewer's tracker is the only source.
    */
-  seen: ReadonlySet<number>;
   viewedPosted: boolean;
   onViewedPosted: () => void;
   onContinue: () => void;
@@ -41,29 +39,39 @@ interface ReadStepProps {
  * Screen 1 of 3 (addendum 3 A): the document, with the consent block directly under the last
  * page in the same scroll, and one button out of here.
  *
- * What the server is told is unchanged. `POST /signing/viewed` goes the moment the last page has
- * been displayed -- that claim is about the pages, not about the button -- and `POST
- * /signing/consent` goes when Continue is pressed. Merging the two screens did not merge the two
- * acts.
+ * `POST /signing/viewed` goes once every page has been displayed *and* the end of the document
+ * (the consent block under the last page) has been on screen -- that claim is about the pages,
+ * not about the button -- and `POST /signing/consent` goes when Continue is pressed. Merging the
+ * two screens did not merge the two acts.
  *
  * The rule for "displayed" is `lib/pages-seen.ts` and is not touched here. What this screen adds
  * is that the reader can see what the rule has decided -- a mark per page in the bar -- and that
- * the one button takes them to the next page it has not counted, so a fling through a long
- * report costs a few presses rather than a page-by-page search for what was missed.
+ * the one button takes them to the next page it has not counted, or to the end once every page
+ * has been, so a fling through a long report costs a few presses rather than a page-by-page
+ * search for what was missed.
  */
 export function ReadStep({
   session,
   changed = false,
-  seen,
   viewedPosted,
   onViewedPosted,
   onContinue,
   onPaper,
 }: ReadStepProps) {
-  const pageCount = session.envelope.page_count;
   const queryClient = useQueryClient();
   const announce = useAnnounce();
-  const { current, goToPage, goToEnd, leadingNode, trailingNode, documentFailed } = useWorkspace();
+  const {
+    current,
+    goToPage,
+    goToEnd,
+    leadingNode,
+    trailingNode,
+    documentFailed,
+    seen,
+    reachedEnd,
+    pageCount,
+    pageCountMismatch,
+  } = useWorkspace();
   const [agreed, setAgreed] = useState(false);
   const [nudge, setNudge] = useState<string | null>(null);
   const [viewedFailed, setViewedFailed] = useState(false);
@@ -88,7 +96,10 @@ export function ReadStep({
     if (viewedPosted) {
       return Promise.resolve(null);
     }
-    viewedOnce.current ??= postViewed(pageCount).then(
+    viewedOnce.current ??= postViewed(pageCount, {
+      pagesSeen: Array.from({ length: pageCount }, (_, i) => i + 1),
+      reachedEnd: true,
+    }).then(
       (answer) => {
         setViewedFailed(false);
         onViewedPosted();
@@ -105,18 +116,19 @@ export function ReadStep({
   }, [pageCount, queryClient, viewedPosted, onViewedPosted]);
 
   const unseen = unseenPages(seen, pageCount);
-  const allSeen = unseen.length === 0;
+  const allSeen = unseen.length === 0 && !pageCountMismatch;
   const next = nextUnseenPage(seen, pageCount);
+  const reviewed = allSeen && reachedEnd;
   const consentGiven = standing !== null || agreed;
 
-  // The claim is about the pages, so it is made when the pages have been displayed.
+  // The claim is about the pages and reaching the end, so it is made when both have happened.
   useEffect(() => {
-    if (allSeen) {
+    if (reviewed) {
       void sendViewed().catch(() => {
         // Said in the bar when Continue is pressed, and retried by that press.
       });
     }
-  }, [allSeen, sendViewed]);
+  }, [reviewed, sendViewed]);
 
   useEffect(() => {
     if (allSeen && pageCount > 1 && !announcedAllSeen.current) {
@@ -165,6 +177,12 @@ export function ReadStep({
     );
   };
 
+  const goToDocumentEnd = () => {
+    goToEnd();
+    setNudge(null);
+    announce("The end of the document. Please look at the last page, then continue.");
+  };
+
   /**
    * Pressing Continue with every page seen but the box unticked: the button says what is missing
    * and takes the reader to the box, which sits under the last page they just read. This is the
@@ -176,17 +194,25 @@ export function ReadStep({
   };
 
   const failedToContinue = consent.isError || viewedFailed;
-  const problem = failedToContinue
-    ? viewedFailed && !consent.isError
-      ? "We couldn't record that you've read the document. Press Continue to try again."
-      : isNetworkError(consent.error)
-        ? "We couldn't reach the server. Check the connection and press Continue to sign again."
-        : isConsentNotStanding(consent.error)
-          ? "The agreement you gave earlier no longer covers this document. Tick the box under the last page, then press Continue to sign."
-          : "We couldn't record your choice. Please try again, or ask a member of staff for help."
-    : null;
+  const problem = pageCountMismatch
+    ? "This document does not match what we were sent. Nothing has been signed. Please ask a member of staff for help."
+    : failedToContinue
+      ? viewedFailed && !consent.isError
+        ? "We couldn't record that you've read the document. Press Continue to try again."
+        : isNetworkError(consent.error)
+          ? "We couldn't reach the server. Check the connection and press Continue to sign again."
+          : isConsentNotStanding(consent.error)
+            ? "The agreement you gave earlier no longer covers this document. Tick the box under the last page, then press Continue to sign."
+            : "We couldn't record your choice. Please try again, or ask a member of staff for help."
+      : null;
 
-  const seenLabel = allSeen ? "All pages seen" : `${seen.size} of ${pageCount} seen`;
+  const seenLabel = pageCountMismatch
+    ? "The document does not match what was sent"
+    : allSeen
+      ? reachedEnd
+        ? "All pages seen"
+        : "All pages seen · go to the end"
+      : `${seen.size} of ${pageCount} seen`;
 
   return (
     <>
@@ -294,7 +320,7 @@ export function ReadStep({
             >
               I'd rather sign on paper
             </Button>
-            {documentFailed ? null : next !== null ? (
+            {documentFailed || pageCountMismatch ? null : next !== null ? (
               <Button
                 size="lg"
                 className="max-sm:min-w-0 max-sm:flex-1 max-sm:px-3 sm:min-w-[13rem]"
@@ -302,6 +328,15 @@ export function ReadStep({
                 onClick={goToNextUnseen}
               >
                 Next unseen page ({next})
+              </Button>
+            ) : !reachedEnd ? (
+              <Button
+                size="lg"
+                className="max-sm:min-w-0 max-sm:flex-1 max-sm:px-3 sm:min-w-[13rem]"
+                data-testid="go-to-end"
+                onClick={goToDocumentEnd}
+              >
+                Go to end
               </Button>
             ) : (
               <Button

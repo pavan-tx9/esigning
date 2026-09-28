@@ -9,9 +9,10 @@ design that better proves who signed, what they saw, that they meant it, and tha
 - `frontend/` Bun, Vite, React 19, TypeScript strict, TanStack Query, Tailwind v4, Base UI, Zod, Biome.
 - `demo-host/` stand-in EHR used for end-to-end runs.
 - `backend/src/esign/contracts.py`, `backend/migrations/0001_schema.sql`,
-  `backend/migrations/0700_addendum_1.sql` and `backend/migrations/0800_addendum_2.sql` are the
-  cross-module contract. Changing them is an architecture change: update `docs/SPEC.md` in the
-  same commit.
+ `backend/migrations/0700_addendum_1.sql`, `backend/migrations/0800_addendum_2.sql` and
+ `backend/migrations/0900_addendum_4.sql` are the
+ cross-module contract. Changing them is an architecture change: update `docs/SPEC.md` in the
+ same commit.
 
 ## Commands
 - `make up` start Postgres (port 54329) · `make migrate` · `make check` (everything; must pass)

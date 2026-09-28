@@ -131,6 +131,9 @@ LOGGABLE_KEYS: Final[frozenset[str]] = frozenset(
         "path",
         "route",
         "duration_ms",
+        # Addendum 4: which step of `_seal` just finished. A closed set of tokens
+        # (`certificate`, `finalize`, `store_unsealed`, `pades`, `validate`, `store_sealed`).
+        "phase",
         "retry_in_seconds",
         "ok",
         "intact",

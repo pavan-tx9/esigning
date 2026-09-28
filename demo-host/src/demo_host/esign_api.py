@@ -193,10 +193,13 @@ class EsignClient:
         method: str,
         auth_time: datetime,
         kiosk: tuple[str, str] | None = None,
+        client: str = "iframe",
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"auth": {"method": method, "auth_time": _timestamp(auth_time)}}
         if kiosk is not None:
             body["kiosk"] = {"staff_user_id": kiosk[0], "identity_check": kiosk[1]}
+        if client != "iframe":
+            body["client"] = client
         return self._json("POST", f"/v1/envelopes/{envelope_id}/signers/{signer_id}/sessions", json=body)
 
     def reauth(self, *, session_id: str, method: str, auth_time: datetime) -> dict[str, Any]:

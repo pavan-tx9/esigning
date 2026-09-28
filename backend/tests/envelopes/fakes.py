@@ -45,6 +45,7 @@ from esign.contracts import (
     Capture,
     CertificateSummary,
     ChainReport,
+    ClientMode,
     ConsentText,
     EventType,
     FieldDef,
@@ -771,6 +772,7 @@ class FakeIdentityService:
         auth: AuthContext,
         kiosk: KioskContext | None,
         ctx: RequestContext,
+        client_mode: ClientMode = "iframe",
     ) -> tuple[str, SessionInfo]:
         signer_row = db.execute(
             text(
@@ -786,8 +788,10 @@ class FakeIdentityService:
         db.execute(
             text(
                 "INSERT INTO signing_sessions (id, signer_id, token_hash, auth_method, auth_time, "
-                "  kiosk_staff_user_id, kiosk_identity_check, ip, user_agent, created_at, expires_at) "
-                "VALUES (:id, :signer, :token, :method, :auth_time, :staff, :check, :ip, :ua, :now, :expires)"
+                "  kiosk_staff_user_id, kiosk_identity_check, ip, user_agent, created_at, expires_at, "
+                "  client_mode) "
+                "VALUES (:id, :signer, :token, :method, :auth_time, :staff, :check, :ip, :ua, :now, "
+                "        :expires, :client_mode)"
             ),
             {
                 "id": session_id,
@@ -801,6 +805,7 @@ class FakeIdentityService:
                 "ua": ctx.user_agent,
                 "now": self._clock.now(),
                 "expires": expires_at,
+                "client_mode": client_mode,
             },
         )
         host_id = signer_row.host_id
@@ -813,6 +818,7 @@ class FakeIdentityService:
             expires_at=expires_at,
             host_id=host_id if isinstance(host_id, UUID) else UUID(str(host_id)),
             host_user_id=str(signer_row.host_user_id),
+            client_mode=client_mode,
         )
         self._sessions[session_id] = _SessionRecord(info=info)
         return f"est_{session_id}", info

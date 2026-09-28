@@ -15,7 +15,7 @@ from esign.api.errors import error_response
 from esign.config import Settings
 from esign.logging import get_logger
 
-__all__ = ["API_CSP", "AccessLog", "BodySizeLimit", "SecurityHeaders", "ui_csp"]
+__all__ = ["API_CSP", "AccessLog", "BodySizeLimit", "SecurityHeaders", "SigningCors", "ui_csp"]
 
 log = get_logger("esign.api.access")
 
@@ -23,6 +23,16 @@ log = get_logger("esign.api.access")
 API_CSP: Final = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 
 _TEMPLATE_UPLOAD_SLACK: Final = 1024 * 1024  # multipart framing and the definitions JSON
+
+#: Public library files a host page loads from another origin (Addendum 4). JSON and PDFs stay
+#: ``same-origin``; these are the hashed worker, the IIFE, and its stylesheet.
+_LIBRARY_FILES: Final = frozenset({"/esign-sdk.js", "/esign-sdk.css", "/esign-frontend.css"})
+
+
+def _is_embeddable_library(path: str) -> bool:
+    if path in _LIBRARY_FILES:
+        return True
+    return path.startswith("/assets/") and "pdf.worker" in path
 
 
 def ui_csp(frame_ancestors: tuple[str, ...]) -> str:
@@ -159,11 +169,18 @@ class SecurityHeaders:
                 put(b"x-content-type-options", "nosniff")
                 put(b"referrer-policy", "no-referrer")
                 put(b"permissions-policy", "camera=(), microphone=(), geolocation=(), payment=()")
-                put(b"cross-origin-resource-policy", "same-origin")
+                if path.startswith("/v1/signing") or _is_embeddable_library(path):
+                    # SDK-mode callers are on another origin; iframe same-origin still works.
+                    put(b"cross-origin-resource-policy", "cross-origin")
+                    if _is_embeddable_library(path):
+                        # Classic scripts need CORP; the pdf.js module worker also needs CORS.
+                        put(b"access-control-allow-origin", "*")
+                else:
+                    put(b"cross-origin-resource-policy", "same-origin")
                 if b"content-security-policy" not in present:
                     put(b"content-security-policy", API_CSP)
                     put(b"x-frame-options", "DENY")
-                if not path.startswith("/assets/"):
+                if not path.startswith("/assets/") and not _is_embeddable_library(path):
                     # Nothing this service returns -- a PDF least of all -- belongs in a cache.
                     put(b"cache-control", "no-store")
                     put(b"pragma", "no-cache")
@@ -205,3 +222,118 @@ class AccessLog:
                 http_status=status["code"],
                 duration_ms=int((time.perf_counter() - began) * 1000),
             )
+
+
+_SIGNING_PREFIX = "/v1/signing"
+_CORS_ALLOW_HEADERS = "Authorization, Content-Type, Idempotency-Key, X-Esign-Client"
+_CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
+
+
+def _header(scope: Scope, name: bytes) -> str | None:
+    for key, value in scope.get("headers") or []:
+        if bytes(key).lower() == name:
+            raw = bytes(value).decode("latin-1").strip()
+            return raw or None
+    return None
+
+
+def _cors_header_list(origin: str) -> list[tuple[bytes, bytes]]:
+    return [
+        (b"access-control-allow-origin", origin.encode("latin-1")),
+        (b"access-control-allow-methods", _CORS_ALLOW_METHODS.encode("ascii")),
+        (b"access-control-allow-headers", _CORS_ALLOW_HEADERS.encode("ascii")),
+        (b"access-control-max-age", b"600"),
+        (b"vary", b"Origin"),
+    ]
+
+
+class SigningCors:
+    """CORS for ``/v1/signing/*`` only (Addendum 4).
+
+    Preflight is answered when ``Origin`` is in any host's ``allowed_origins``. Actual requests
+    from another origin are allowed only for an ``sdk`` session whose host listed that origin.
+    Iframe sessions are unchanged: same-origin, no CORS headers.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        path = str(scope.get("path", ""))
+        if not path.startswith(_SIGNING_PREFIX):
+            await self._app(scope, receive, send)
+            return
+
+        origin = _header(scope, b"origin")
+        method = str(scope.get("method", ""))
+        rt = scope.get("app")
+        runtime = None if rt is None else getattr(getattr(rt, "state", None), "runtime", None)
+
+        if method == "OPTIONS":
+            if origin is None or runtime is None or not _origin_known(runtime, origin):
+                await error_response(403, "origin_not_allowed")(scope, receive, send)
+                return
+            await _preflight(origin)(scope, receive, send)
+            return
+
+        allow_origin: str | None = None
+        if origin is not None and runtime is not None:
+            decision = _actual_request(runtime, origin, _header(scope, b"authorization"))
+            if decision == "deny":
+                await error_response(403, "origin_not_allowed")(scope, receive, send)
+                return
+            if decision == "allow":
+                allow_origin = origin
+
+        async def with_cors(message: Message) -> None:
+            if message["type"] == "http.response.start" and allow_origin is not None:
+                headers: list[tuple[bytes, bytes]] = list(message.get("headers") or [])
+                headers.extend(_cors_header_list(allow_origin))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self._app(scope, receive, with_cors)
+
+
+def _origin_known(runtime: Any, origin: str) -> bool:
+    from esign.identity.hosts import list_allowed_origins
+
+    with runtime.new_session() as db:
+        return origin in list_allowed_origins(db)
+
+
+def _actual_request(runtime: Any, origin: str, authorization: str | None) -> str:
+    """``allow`` (SDK + matching origin), ``pass`` (iframe / unauthenticated), or ``deny``."""
+    from esign.contracts import Unauthorized
+    from esign.identity.hosts import get_host
+
+    if authorization is None:
+        return "pass"
+    try:
+        with runtime.new_session() as db:
+            session = runtime.identity.authenticate_session(db, authorization)
+            if session.client_mode != "sdk":
+                return "pass"
+            host = get_host(db, session.host_id)
+    except Unauthorized:
+        return "pass"
+    except Exception:
+        return "deny"
+    if origin not in host.allowed_origins:
+        return "deny"
+    return "allow"
+
+
+def _preflight(origin: str) -> Any:
+    from starlette.responses import Response
+
+    headers = {name.decode("ascii"): value.decode("latin-1") for name, value in _cors_header_list(origin)}
+
+    async def send_preflight(scope: Scope, receive: Receive, send: Send) -> None:
+        response = Response(status_code=204, headers=headers)
+        await response(scope, receive, send)
+
+    return send_preflight

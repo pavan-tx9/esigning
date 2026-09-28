@@ -16,6 +16,7 @@ from ipaddress import ip_address
 from typing import Final
 from urllib.parse import urlsplit
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import RowMapping, text
 from sqlalchemy.orm import Session
@@ -30,9 +31,13 @@ __all__ = [
     "create_host",
     "disable_host",
     "embedding_origins",
+    "get_host",
+    "list_allowed_origins",
     "normalise_origin",
     "rotate_host_key",
     "rotate_webhook_secret",
+    "set_host_timezone",
+    "validate_timezone",
     "webhook_target",
 ]
 
@@ -63,7 +68,25 @@ def _is_host(hostname: str) -> bool:
 
 
 def _row_to_host(row: RowMapping) -> Host:
-    return Host(id=req_uuid(row, "id"), name=req_str(row, "name"), allowed_origins=str_tuple(row, "allowed_origins"))
+    tz = row.get("display_timezone")
+    return Host(
+        id=req_uuid(row, "id"),
+        name=req_str(row, "name"),
+        allowed_origins=str_tuple(row, "allowed_origins"),
+        display_timezone=str(tz) if tz else None,
+    )
+
+
+def validate_timezone(name: str) -> str:
+    """An IANA timezone name, or a refusal. Display only: it never becomes a ``Clock`` value."""
+    cleaned = name.strip()
+    if not cleaned or len(cleaned) > 64:
+        raise ValidationFailed("timezone is empty or too long", code="invalid_timezone")
+    try:
+        ZoneInfo(cleaned)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValidationFailed("unknown IANA timezone", code="invalid_timezone") from exc
+    return cleaned
 
 
 def normalise_origin(origin: str) -> str:
@@ -148,6 +171,7 @@ def create_host(
     webhook_url: str | None = None,
     *,
     clock: Clock,
+    display_timezone: str | None = None,
 ) -> tuple[str, Host]:
     """Register a host and mint its first key.
 
@@ -158,14 +182,16 @@ def create_host(
     clean_name = _validate_name(name)
     origins = _normalise_origins(allowed_origins)
     webhook = _validate_webhook_url(webhook_url)
+    tz = None if display_timezone is None else validate_timezone(display_timezone)
     key = mint_token(HOST_KEY_PREFIX)
     host_id = new_id()
     row = (
         db.execute(
             text(
-                "INSERT INTO hosts (id, name, api_key_hash, allowed_origins, webhook_url, webhook_secret, created_at) "
-                "VALUES (:id, :name, :key_hash, :origins, :webhook_url, :webhook_secret, :created_at) "
-                "RETURNING id, name, allowed_origins"
+                "INSERT INTO hosts (id, name, api_key_hash, allowed_origins, webhook_url, webhook_secret, "
+                "display_timezone, created_at) "
+                "VALUES (:id, :name, :key_hash, :origins, :webhook_url, :webhook_secret, :tz, :created_at) "
+                "RETURNING id, name, allowed_origins, display_timezone"
             ),
             {
                 "id": host_id,
@@ -174,6 +200,7 @@ def create_host(
                 "origins": origins,
                 "webhook_url": webhook,
                 "webhook_secret": secrets.token_bytes(_WEBHOOK_SECRET_BYTES) if webhook else None,
+                "tz": tz,
                 "created_at": _now(clock),
             },
         )
@@ -191,7 +218,7 @@ def rotate_host_key(db: Session, host_id: UUID) -> tuple[str, Host]:
             text(
                 "UPDATE hosts SET api_key_hash = :key_hash "
                 "WHERE id = :id AND disabled_at IS NULL "
-                "RETURNING id, name, allowed_origins"
+                "RETURNING id, name, allowed_origins, display_timezone"
             ),
             {"id": host_id, "key_hash": token_sha256(key)},
         )
@@ -242,6 +269,52 @@ def embedding_origins(db: Session, host_id: UUID) -> tuple[str, ...] | None:
     return None if row is None else tuple(str(origin) for origin in row["allowed_origins"] or ())
 
 
+def get_host(db: Session, host_id: UUID) -> Host:
+    """A live host by id. Unknown or disabled is ``NotFound``, never a disabled row."""
+    row = (
+        db.execute(
+            text(
+                "SELECT id, name, allowed_origins, display_timezone FROM hosts WHERE id = :id AND disabled_at IS NULL"
+            ),
+            {"id": host_id},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        raise NotFound("host", code="host_not_found")
+    return _row_to_host(row)
+
+
+def list_allowed_origins(db: Session) -> frozenset[str]:
+    """Every origin any live host has allowed. Used to answer CORS preflight without a token."""
+    rows = db.execute(text("SELECT allowed_origins FROM hosts WHERE disabled_at IS NULL")).all()
+    origins: set[str] = set()
+    for row in rows:
+        for origin in row.allowed_origins or ():
+            origins.add(str(origin))
+    return frozenset(origins)
+
+
+def set_host_timezone(db: Session, host_id: UUID, timezone: str | None) -> Host:
+    """Set or clear the timezone printed under this host's signatures."""
+    tz = None if timezone is None or timezone.strip() == "" else validate_timezone(timezone)
+    row = (
+        db.execute(
+            text(
+                "UPDATE hosts SET display_timezone = :tz WHERE id = :id AND disabled_at IS NULL "
+                "RETURNING id, name, allowed_origins, display_timezone"
+            ),
+            {"id": host_id, "tz": tz},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        raise NotFound("host", code="host_not_found")
+    return _row_to_host(row)
+
+
 def disable_host(db: Session, host_id: UUID, *, clock: Clock) -> None:
     """Stop a host's key from authenticating. Idempotent; nothing it created is deleted."""
     updated = db.execute(
@@ -268,7 +341,7 @@ def authenticate_host(db: Session, bearer: str) -> Host:
     row = (
         db.execute(
             text(
-                "SELECT id, name, allowed_origins, api_key_hash FROM hosts "
+                "SELECT id, name, allowed_origins, display_timezone, api_key_hash FROM hosts "
                 "WHERE api_key_hash = :h AND disabled_at IS NULL"
             ),
             {"h": presented},

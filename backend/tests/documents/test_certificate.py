@@ -143,6 +143,34 @@ def test_nothing_but_the_summary_reaches_the_page(documents: DocumentService) ->
     }
 
 
+def test_the_certificate_prints_the_review_and_the_signing_client_when_they_are_known(
+    documents: DocumentService,
+) -> None:
+    summary = certificate_summary(signers=1)
+    signer = summary.signers[0]
+    described = CertificateSummary(
+        **{
+            **{key: getattr(summary, key) for key in CertificateSummary.__dataclass_fields__},
+            "signers": (
+                type(signer)(
+                    **{
+                        **signer.__dict__,
+                        "review_reached_end": True,
+                        "review_page_count": 3,
+                        "review_seconds": 125,
+                        "signing_client": "esign-sdk/0.1.0",
+                        "signing_origin": "https://ehr.example",
+                    }
+                ),
+            ),
+        }
+    )
+    text = text_of(documents.build_certificate(described))
+    assert "Reviewed all 3 pages, reached end, 2 min" in text
+    assert "Signing client" in text
+    assert "esign-sdk 0.1.0 in https://ehr.example" in text
+
+
 def test_a_long_display_name_does_not_run_off_the_page(documents: DocumentService) -> None:
     summary = certificate_summary(signers=1)
     long_name = "Wolfeschlegelsteinhausenbergerdorff " * 4

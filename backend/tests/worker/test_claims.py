@@ -23,6 +23,27 @@ class DownSealer:
         raise AssertionError("nothing was sealed, so nothing is validated")
 
 
+def test_the_sign_press_returns_before_the_seal(
+    e2e_settings: Settings, clock: FixedClock, app_engine: Engine, db_factory: Sessions
+) -> None:
+    """Addendum 4: the HTTP response is the stamp, not the PAdES seal. The worker finishes it."""
+    world = build_world(e2e_settings, clock, app_engine, db_factory)
+    ehr = world.host()
+    ehr.publish_template("hipaa_acknowledgement")
+    envelope = ehr.create_envelope("hipaa_acknowledgement")
+    signer = ehr.open_session(envelope, "patient")
+    payload = signer.review_and_consent()
+    signed = signer.sign(payload, key="fast-sign", drive_seal=False)
+
+    assert signed.status_code == 200, signed.text
+    assert signed.json()["envelope"]["status"] == "completed_pending_seal"
+    assert ehr.envelope(envelope["id"])["status"] == "completed_pending_seal"
+    assert ehr.get(f"/envelopes/{envelope['id']}/document").status_code == 409
+
+    assert run_once(world.rt, send=ehr.receive).sealed == 1
+    assert ehr.envelope(envelope["id"])["status"] == "sealed"
+
+
 def test_a_claim_is_exclusive_until_it_goes_stale(
     e2e_settings: Settings, clock: FixedClock, app_engine: Engine, db_factory: Sessions
 ) -> None:

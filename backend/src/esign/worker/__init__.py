@@ -12,6 +12,9 @@ one worker may run at once:
   cannot both seal it: the second finds the envelope sealed and stands down.
 * expiry takes each envelope's row lock; webhook deliveries are leased the same way as seal jobs.
 
+``NOTIFY esign_seal`` wakes the worker as soon as a job is queued. If LISTEN is unavailable the
+worker falls back to ``worker_poll_seconds``. Webhooks run only when the seal queue is idle.
+
 Never fail open: whatever goes wrong in an attempt, the envelope stays ``completed_pending_seal``,
 the failure is recorded, and the job backs off (1m, 5m, 15m, 1h, then hourly).
 """
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import FrameType
@@ -34,7 +38,15 @@ from esign.logging import get_logger
 from esign.runtime import Runtime
 from esign.webhooks import HttpSender, Sender, deliver_due
 
-__all__ = ["TickResult", "claim_seal_job", "claim_seal_jobs", "run_forever", "run_once", "seal_one"]
+__all__ = [
+    "TickResult",
+    "claim_seal_job",
+    "claim_seal_jobs",
+    "run_forever",
+    "run_once",
+    "run_seals",
+    "seal_one",
+]
 
 log = get_logger(__name__)
 
@@ -85,10 +97,9 @@ def claim_seal_job(db: Session, envelope_id: UUID, *, now: datetime) -> bool:
 def seal_one(rt: Runtime, envelope_id: UUID, *, claimed_at: datetime | None = None) -> bool:
     """One sealing attempt in one transaction. True when the envelope is sealed afterwards.
 
-    Used by the worker for a claimed job and by the API for the single inline attempt after the
-    last signature. It never raises for an expected failure: the envelope service has already
-    recorded ``seal.failed`` and backed the job off, from a session of its own, by the time the
-    exception reaches here.
+    Used by the worker for a claimed job. It never raises for an expected failure: the envelope
+    service has already recorded ``seal.failed`` and backed the job off, from a session of its own,
+    by the time the exception reaches here.
     """
     try:
         with rt.transaction() as db:
@@ -171,8 +182,39 @@ def _ensure_backed_off(rt: Runtime, envelope_id: UUID, claimed_at: datetime, cod
     log.error("worker.seal_failure_unrecorded", envelope_id=envelope_id, error_code=code, attempts=attempts)
 
 
+def run_seals(rt: Runtime, *, batch: int = 20) -> TickResult:
+    """Claim and run due seal jobs. Webhooks are a separate tick so a slow host cannot delay a seal."""
+    return _run_seals(rt, batch=batch)
+
+
 def run_once(rt: Runtime, *, send: Sender | None = None, batch: int = 20) -> TickResult:
-    """One tick: due seal jobs, then expiries, then webhooks."""
+    """One tick: due seal jobs, then expiries, then webhooks.
+
+    Seals run to completion before any webhook is delivered, so a slow receiver cannot delay a
+    seal that is already due (Addendum 4).
+    """
+    seals = run_seals(rt, batch=batch)
+    hooks = _run_webhooks(rt, send)
+    result = TickResult(
+        sealed=seals.sealed,
+        seal_failures=seals.seal_failures,
+        expired=seals.expired,
+        webhooks_delivered=hooks.webhooks_delivered,
+        webhooks_failed=hooks.webhooks_failed,
+    )
+    if not result.idle:
+        log.info(
+            "worker.tick",
+            count=result.sealed
+            + result.seal_failures
+            + result.expired
+            + result.webhooks_delivered
+            + result.webhooks_failed,
+        )
+    return result
+
+
+def _run_seals(rt: Runtime, *, batch: int) -> TickResult:
     now = rt.clock.now()
     stale_before = now - timedelta(seconds=rt.settings.seal_job_lock_timeout_seconds)
     with rt.transaction() as db:
@@ -193,14 +235,15 @@ def run_once(rt: Runtime, *, send: Sender | None = None, batch: int = 20) -> Tic
         if swept == 0:
             break
 
-    # Housekeeping: idempotency keys past their window. A replay after that is a new request,
-    # which the envelope service still refuses to turn into a second signature.
     with rt.transaction() as db:
         db.execute(
             text("DELETE FROM idempotency_keys WHERE created_at < :cutoff"),
             {"cutoff": now - timedelta(hours=rt.settings.idempotency_ttl_hours)},
         )
+    return TickResult(sealed=sealed, seal_failures=failures, expired=expired)
 
+
+def _run_webhooks(rt: Runtime, send: Sender | None) -> TickResult:
     owned: HttpSender | None = None
     if send is None:
         owned = HttpSender(rt.settings)
@@ -210,21 +253,35 @@ def run_once(rt: Runtime, *, send: Sender | None = None, batch: int = 20) -> Tic
     finally:
         if owned is not None:
             owned.close()
+    return TickResult(webhooks_delivered=delivered, webhooks_failed=undelivered)
 
-    result = TickResult(
-        sealed=sealed,
-        seal_failures=failures,
-        expired=expired,
-        webhooks_delivered=delivered,
-        webhooks_failed=undelivered,
-    )
-    if not result.idle:
-        log.info("worker.tick", count=sealed + failures + expired + delivered + undelivered)
-    return result
+
+def _wait_for_seal_notify(rt: Runtime, timeout: float) -> bool:
+    """LISTEN esign_seal until a notify arrives or ``timeout`` seconds pass."""
+    if timeout <= 0:
+        return False
+    try:
+        with rt.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("LISTEN esign_seal"))
+            raw = conn.connection.driver_connection
+            if raw is None:
+                return False
+            notifies = getattr(raw, "notifies", None)
+            if notifies is None:
+                return False
+            return next(iter(notifies(timeout=timeout, stop_after=1)), None) is not None
+    except Exception:
+        log.warning("worker.listen_failed", error_code="listen_unavailable")
+        return False
 
 
 def run_forever(rt: Runtime, *, stop: threading.Event | None = None) -> None:
-    """Tick until told to stop. SIGINT and SIGTERM finish the current tick and exit cleanly."""
+    """Tick until told to stop. SIGINT and SIGTERM finish the current tick and exit cleanly.
+
+    Seal jobs are claimed as soon as ``NOTIFY esign_seal`` arrives, falling back to
+    ``worker_poll_seconds``. Webhooks run only when the seal queue is idle, so a slow host
+    cannot hold up sealing.
+    """
     stop = stop or threading.Event()
 
     def _stop(_signum: int, _frame: FrameType | None) -> None:
@@ -239,14 +296,24 @@ def run_forever(rt: Runtime, *, stop: threading.Event | None = None) -> None:
     try:
         while not stop.is_set():
             try:
-                result = run_once(rt, send=sender)
+                seals = _run_seals(rt, batch=20)
             except Exception:
-                # The loop outlives a bad tick (database restart, say). Nothing is lost: every
-                # job is a row, and the next tick finds it again.
                 log.error("worker.tick_failed", component="worker", error_code="internal_error")
-                result = TickResult()
-            if result.idle:
-                stop.wait(rt.settings.worker_poll_seconds)
+                seals = TickResult()
+            if not seals.idle:
+                continue
+            try:
+                _run_webhooks(rt, sender)
+            except Exception:
+                log.error("worker.webhook_tick_failed", component="worker", error_code="internal_error")
+            if stop.is_set():
+                break
+            began = time.perf_counter()
+            woke = _wait_for_seal_notify(rt, rt.settings.worker_poll_seconds)
+            if not woke:
+                leftover = rt.settings.worker_poll_seconds - (time.perf_counter() - began)
+                if leftover > 0.05:
+                    stop.wait(leftover)
     finally:
         sender.close()
         log.info("worker.stopped", component="worker")

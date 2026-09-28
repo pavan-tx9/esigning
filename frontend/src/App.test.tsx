@@ -45,10 +45,14 @@ vi.mock("@/components/DocumentViewer", async () => {
   return {
     DocumentViewer: ({
       onSeen,
+      onReachedEnd,
+      pageCount,
       leading,
       trailing,
     }: {
       onSeen: (seen: ReadonlySet<number>) => void;
+      onReachedEnd?: (reached: boolean) => void;
+      pageCount: number;
       leading?: React.ReactNode;
       trailing?: React.ReactNode;
     }) => {
@@ -56,8 +60,16 @@ vi.mock("@/components/DocumentViewer", async () => {
       // not re-fire it. Do the same here, or the report becomes a render loop.
       const report = useRef(onSeen);
       report.current = onSeen;
-      // A real viewer paints page 1 immediately and the observer marks it seen.
-      useEffect(() => report.current(new Set([1])), []);
+      const reportEnd = useRef(onReachedEnd);
+      reportEnd.current = onReachedEnd;
+      // A real viewer paints page 1 immediately and the observer marks it seen. A one-page
+      // document's last page *is* the end, so the consent block is on screen with it.
+      useEffect(() => {
+        report.current(new Set([1]));
+        if (pageCount <= 1) {
+          reportEnd.current?.(true);
+        }
+      }, [pageCount]);
       // The real viewer puts what the step hands it before the first page and after the last,
       // in the same scroll: the "document changed" notice and the consent block.
       return (
@@ -66,7 +78,21 @@ vi.mock("@/components/DocumentViewer", async () => {
           <button type="button" onClick={() => onSeen(new Set([1]))}>
             test: display page 1 only
           </button>
-          <button type="button" onClick={() => onSeen(new Set([1, 2, 3]))}>
+          <button
+            type="button"
+            onClick={() => {
+              onSeen(new Set(Array.from({ length: pageCount }, (_, i) => i + 1)));
+            }}
+          >
+            test: display every page without the end
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onSeen(new Set(Array.from({ length: pageCount }, (_, i) => i + 1)));
+              onReachedEnd?.(true);
+            }}
+          >
             test: display every page
           </button>
           {trailing}
@@ -344,6 +370,25 @@ describe("the whole flow for one patient", () => {
     // One fetch of the bytes for both screens: the Sign step reuses what Read already has.
     expect(record?.presented).toBe(1);
   }, 25_000);
+
+  it("does not offer Continue until every page has been seen and the end has been on screen", async () => {
+    await start("single");
+    await screen.findByTestId("step-read");
+    await screen.findByTestId("consent-block");
+    expect(screen.getByRole("button", { name: "Next unseen page (2)" })).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "test: display every page without the end" }),
+    );
+    expect(screen.getByTestId("page-progress")).toHaveTextContent("All pages seen");
+    expect(screen.getByRole("button", { name: "Go to end" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue to sign" })).toBeNull();
+    expect(mockDb.peek("single")?.signerStatus).toBe("pending");
+
+    await user.click(screen.getByRole("button", { name: "test: display every page" }));
+    await waitFor(() => expect(mockDb.peek("single")?.signerStatus).toBe("viewed"));
+    expect(screen.getByRole("button", { name: "Continue to sign" })).toBeInTheDocument();
+  });
 
   it("retries a lost sign reply with the same Idempotency-Key and signs exactly once", async () => {
     await start("flaky-sign");

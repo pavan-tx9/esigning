@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -128,6 +129,11 @@ class Settings(BaseSettings):
     #: it never does: consent is collected once per envelope, as the base spec has it. Capped at
     #: :data:`CONSENT_SPAN_MAX_SECONDS` by validation.
     consent_span_seconds: int = Field(default=0, ge=0, le=CONSENT_SPAN_MAX_SECONDS)
+    #: Addendum 4. IANA timezone used when a signature caption prints the date, if the host has
+    #: not set one of its own. Validated against the zoneinfo database.
+    default_display_timezone: str = "UTC"
+    #: Addendum 4. Per-request timeout for live revocation fetches (OCSP/CRL) while sealing.
+    revocation_timeout_seconds: float = 10.0
     #: Proxies whose X-Forwarded-For may be believed. Everything else uses the peer address.
     trusted_proxy_cidrs: tuple[str, ...] = ()
     default_locale: str = "en-US"
@@ -199,6 +205,16 @@ class Settings(BaseSettings):
             text = value.strip()
             return json.loads(text) if text else {}
         return value
+
+    @field_validator("default_display_timezone")
+    @classmethod
+    def _iana_timezone(cls, value: str) -> str:
+        name = value.strip()
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown IANA timezone: {name}") from exc
+        return name
 
     # ----------------------------------------------------------------- helpers
     def retention_years(self, document_type: str) -> int:

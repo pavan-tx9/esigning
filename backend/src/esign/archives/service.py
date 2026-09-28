@@ -21,6 +21,7 @@ from datetime import UTC, date, datetime
 from typing import Any, Final, get_args
 from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from esign.archives import repository as repo
@@ -175,10 +176,11 @@ class ArchiveService:
             )
 
         # Nobody signs an archive, so filing it completes it. The seal job is queued in this same
-        # transaction; the route attempts it once inline afterwards, exactly as the last signature
-        # does, and the worker retries on any failure.
+        # transaction; the route may attempt it once afterwards, and ``NOTIFY esign_seal`` wakes
+        # the worker on any remaining work.
         repo.mark_pending_seal(db, envelope_id, now)
         repo.enqueue_seal_job(db, envelope_id, now)
+        db.execute(text("SELECT pg_notify('esign_seal', :id)"), {"id": str(envelope_id)})
 
         log.info(
             "archive.created",

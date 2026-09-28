@@ -349,6 +349,24 @@ def test_opening_a_task_creates_an_envelope_and_a_session(
     assert sum(1 for method, path, _ in service.calls if method == "POST" and path == "/v1/envelopes") == 1
 
 
+def test_opening_a_task_in_sdk_mode_asks_for_an_sdk_session(
+    client: TestClient, store: Store, service: FakeService
+) -> None:
+    sign_in(client, "maria")
+    task = next(t for t in store.tasks.values() if t.title.endswith("(this page)"))
+
+    response = client.post(f"/tasks/{task.id}/open-sdk", follow_redirects=False)
+
+    assert response.headers["location"] == f"/sign/{task.id}/sdk"
+    created = next(body for method, path, body in service.calls if str(path).endswith("/sessions"))
+    assert created["client"] == "sdk"
+    page = client.get(f"/sign/{task.id}/sdk")
+    assert page.status_code == 200
+    assert b"esign-root" in page.content
+    assert b"esign-sdk.js" in page.content
+    assert b"est_" not in page.content
+
+
 def test_the_token_arrives_in_a_body_and_never_in_a_url(client: TestClient, store: Store) -> None:
     sign_in(client, "maria")
     task = next(t for t in store.tasks.values() if t.template_key == "hipaa_acknowledgement")

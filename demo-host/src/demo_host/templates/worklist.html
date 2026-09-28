@@ -64,6 +64,9 @@
           <form method="post" action="/tasks/{{ row.task.id }}/open">
             <button type="submit" data-testid="open-task">Read and sign</button>
           </form>
+          <form method="post" action="/tasks/{{ row.task.id }}/open-sdk">
+            <button type="submit" class="secondary" data-testid="open-task-sdk">Sign in this page</button>
+          </form>
         {% endif %}
       </div>
     </section>

@@ -8,6 +8,7 @@ import {
   onBehalfOfPhrase,
   postConsent,
   postSign,
+  postViewed,
   type SignRequest,
   SubmissionKeys,
   sessionQueryOptions,
@@ -471,5 +472,44 @@ describe("naming the person a guardian signs for", () => {
   it("says nothing at all for a signer acting for themselves", () => {
     expect(onBehalfOfPhrase(null)).toBe(null);
     expect(onBehalfOfPhrase("   ")).toBe(null);
+  });
+});
+
+describe("reporting what was reviewed", () => {
+  beforeEach(() => {
+    mockDb.reset();
+    setSessionToken(tokenFor("single"));
+  });
+
+  it("sends the pages seen and that the end was reached, when it has them", async () => {
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/v1/signing/viewed", async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({
+          envelope: { id: "abc", status: "in_progress" },
+          signer: { id: "def", status: "viewed" },
+        });
+      }),
+    );
+
+    await postViewed(2, { pagesSeen: [1, 2], reachedEnd: true });
+    expect(body).toEqual({ pages_viewed: 2, pages_seen: [1, 2], reached_end: true });
+  });
+
+  it("omits the new fields when the caller does not have them", async () => {
+    let body: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/v1/signing/viewed", async ({ request }) => {
+        body = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({
+          envelope: { id: "abc", status: "in_progress" },
+          signer: { id: "def", status: "viewed" },
+        });
+      }),
+    );
+
+    await postViewed(2);
+    expect(body).toEqual({ pages_viewed: 2 });
   });
 });

@@ -71,6 +71,23 @@ async function readEveryPage(ui: FrameLocator, pages: number) {
       .toContain(String(n));
   }
   await expect(ui.getByTestId("page-progress")).toContainText("All pages seen");
+  await reachEnd(ui);
+}
+
+/**
+ * The consent block under the last page has to be on screen as well as every page having been
+ * displayed. A one-page document can have its page seen while the block is still below the fold.
+ */
+async function reachEnd(ui: FrameLocator) {
+  const goToEnd = ui.getByRole("button", { name: "Go to end" });
+  if (await goToEnd.isVisible()) {
+    await goToEnd.click();
+  } else {
+    await ui
+      .getByTestId("consent-block")
+      .evaluate((node) => node.scrollIntoView({ block: "center" }));
+  }
+  await expect(ui.getByRole("button", { name: "Continue to sign" })).toBeVisible();
 }
 
 /**
@@ -82,6 +99,7 @@ async function readOnePage(ui: FrameLocator) {
   await expect(ui.getByTestId("step-read")).toBeVisible();
   await expect(ui.locator("canvas[data-rendered]").first()).toBeVisible();
   await expect(ui.getByTestId("page-progress")).toContainText("All pages seen");
+  await reachEnd(ui);
 }
 
 /** Read it, tick the box that is in the same scroll as it, and go on to sign. */
@@ -139,6 +157,7 @@ test("a patient reads, agrees, draws a signature, signs and gets the sealed copy
   await ui.getByRole("button", { name: "Next unseen page (2)" }).click();
   await expect(ui.getByTestId("page-progress")).toContainText("Page 2 of 2");
   await expect(ui.getByTestId("page-progress")).toContainText("All pages seen");
+  await reachEnd(ui);
   await expect(ui.getByRole("button", { name: "Continue to sign" })).toBeVisible();
   await ui.getByRole("button", { name: "Previous page" }).click();
   await expect(ui.getByTestId("page-progress")).toContainText("Page 1 of 2");
@@ -274,6 +293,10 @@ test("the short path is three taps: Continue to sign, Sign here, Sign as ...", a
   await expect(ui.locator("canvas[data-rendered]").first()).toBeVisible();
   // One page: it is displayed by being on the screen, and the agreement is already given.
   await expect(ui.getByTestId("page-progress")).toContainText("All pages seen");
+  await ui
+    .getByTestId("consent-block")
+    .evaluate((node) => node.scrollIntoView({ block: "center" }));
+  await expect(ui.getByRole("button", { name: "Continue to sign" })).toBeVisible();
   await expect(ui.getByTestId("standing-consent")).toContainText(
     /You agreed to sign electronically at \d{1,2}:\d{2}/,
   );

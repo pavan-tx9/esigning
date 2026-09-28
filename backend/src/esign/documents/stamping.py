@@ -9,9 +9,10 @@ Two rules that are load-bearing rather than cosmetic:
 * **Nothing overflows its rectangle.** Text is shrunk, then wrapped, then clipped. A field that
   spills over the sentence next to it changes what the document appears to say.
 * **The caption is not optional.** Every signature and set of initials carries who signed, in what
-  capacity and on whose behalf, when (UTC), and the signer id. The time comes from the
-  ``SignerStamp`` the envelope service built from ``Clock``; a ``date_signed`` field is filled from
-  the same value. Neither is ever taken from a capture, so a client cannot backdate a signature.
+  capacity and on whose behalf, when (in the host's display timezone), and the signer id. The time
+  comes from the ``SignerStamp`` the envelope service built from ``Clock``; a ``date_signed`` field
+  is filled from the same value. Neither is ever taken from a capture, so a client cannot backdate
+  a signature.
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ from __future__ import annotations
 import io
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pypdf import PdfWriter
 from reportlab.lib.utils import ImageReader
@@ -60,12 +61,14 @@ MAX_PREFILL_CHARS: Final[int] = 2000
 _CAPTION_SIZE: Final[float] = 6.0
 _CAPTION_LEADING: Final[float] = 1.12
 _CAPTION_GAP: Final[float] = 1.5
-_CAPTION_LINES: Final[int] = 3
+_CAPTION_LINES: Final[int] = 2
 #: The caption may shrink this far to keep the signer id whole. Narrower rects than
 #: ``MIN_MARK_RECT_WIDTH`` are refused at template-validation time so it never has to go lower.
 _CAPTION_MIN_SIZE: Final[float] = 3.5
 #: The mark itself never gets less than this, however cramped the rect.
 _MIN_MARK_HEIGHT: Final[float] = 5.0
+#: The mark gets at least this share of the field so a signature stays readable (Addendum 4).
+_MIN_MARK_SHARE: Final[float] = 0.60
 
 _INK = (0.06, 0.09, 0.16)
 _CAPTION_INK = (0.35, 0.38, 0.45)
@@ -89,12 +92,18 @@ def _caption_height(size: float = _CAPTION_SIZE, lines: int = _CAPTION_LINES) ->
 
 
 def _caption_size_for(height: float, lines: int) -> float:
-    """The largest caption size whose lines fit in ``height``, floored at the minimum."""
+    """The largest caption size whose lines fit in ``height``.
+
+    New templates never need to go below ``_CAPTION_MIN_SIZE``. An older, shorter field still
+    shrinks further so the caption cannot spill out of the rect.
+    """
     full = _caption_height(lines=lines)
-    if height >= full:
+    if height >= full or full <= 0:
         return _CAPTION_SIZE
-    ratio = height / full if full > 0 else 1.0
-    return max(_CAPTION_MIN_SIZE, _CAPTION_SIZE * ratio)
+    fitted = _CAPTION_SIZE * (height / full)
+    if height >= _caption_height(_CAPTION_MIN_SIZE, lines):
+        return max(_CAPTION_MIN_SIZE, fitted)
+    return max(0.5, fitted)
 
 
 def _split(rect: Rect, caption_lines: int) -> _Band:
@@ -105,22 +114,23 @@ def _split(rect: Rect, caption_lines: int) -> _Band:
     put there lands on top of it; a generated report the host supplies is the same, and worse,
     because nobody here has seen what is printed under its box. The rect is the whole claim.
 
-    ``validate_definitions`` keeps signature fields tall enough for this to be comfortable, but an
-    older template version could be smaller, so the split is clamped here rather than assumed
-    upstream. The caption shrinks before the mark does: an illegible signature is still a
-    signature, a missing caption is missing evidence.
+    The mark takes at least 60% of the field so the signature stays readable (Addendum 4). The
+    caption shrinks toward its floor to give the mark that share. An older, shorter field still
+    keeps a 5 pt mark floor so a cramped box is a small signature, not a missing one.
     """
+    mark_floor = max(_MIN_MARK_HEIGHT, rect.h * _MIN_MARK_SHARE)
     caption_h = _caption_height(lines=caption_lines)
     band = caption_h + _CAPTION_GAP
-    if rect.h - band >= _MIN_MARK_HEIGHT:
+    if rect.h - band >= mark_floor:
         return _Band(
             mark=Rect(x=rect.x, y=rect.y + band, w=rect.w, h=rect.h - band),
             caption=Rect(x=rect.x, y=rect.y, w=rect.w, h=caption_h),
         )
     tight = _caption_height(_CAPTION_MIN_SIZE, caption_lines) + _CAPTION_GAP
-    caption_band = min(tight, max(1.0, rect.h - _MIN_MARK_HEIGHT))
+    caption_band = min(tight, max(1.0, rect.h - mark_floor))
+    mark_h = rect.h - caption_band
     return _Band(
-        mark=Rect(x=rect.x, y=rect.y + caption_band, w=rect.w, h=max(1.0, rect.h - caption_band)),
+        mark=Rect(x=rect.x, y=rect.y + caption_band, w=rect.w, h=max(0.0, mark_h)),
         caption=Rect(x=rect.x, y=rect.y, w=rect.w, h=max(1.0, caption_band - _CAPTION_GAP)),
     )
 
@@ -167,33 +177,40 @@ def _draw_text_block(
     canvas.restoreState()
 
 
-def _caption_lines(stamp: SignerStamp) -> tuple[str, str, str]:
-    """Who, when, and which signer -- on three lines so none of them has to be abbreviated.
-
-    The signer id in particular is the link between this mark and the audit trail, so it gets a
-    line of its own: in a narrow field the name is what gets shortened, never the evidence.
-    """
+def _display_when(stamp: SignerStamp) -> str:
+    """The signing instant in the host's timezone, for the caption. The instant itself is UTC."""
     if stamp.signed_at.tzinfo is None:
         raise ValidationFailed("signature time is not timezone-aware", code="stamp_time_naive")
-    when = stamp.signed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    try:
+        zone = ZoneInfo(stamp.display_tz)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValidationFailed("signature timezone is unknown", code="stamp_timezone_unknown") from exc
+    local = stamp.signed_at.astimezone(zone)
+    # %-I is not portable; strip a leading zero from a 12-hour clock ourselves.
+    hour = local.strftime("%I").lstrip("0") or "12"
+    return f"{local.strftime('%m/%d/%Y')} {hour}:{local.strftime('%M %p %Z')}"
+
+
+def _caption_lines(stamp: SignerStamp) -> tuple[str, str]:
+    """Name on the first line; date and signer id on the second.
+
+    The signer id is the link between this mark and the audit trail, so it is never shortened.
+    A field too narrow for date and id on one line wraps them onto two, still under the name.
+    """
     who = f"{stamp.display_name} ({stamp.capacity})"
     if stamp.on_behalf_of_label:
         who = f"{who} on behalf of {stamp.on_behalf_of_label}"
-    return who, f"Signed {when}", f"Signer {stamp.signer_id}"
+    return who, f"Date: {_display_when(stamp)}  ·  Signer {stamp.signer_id}"
 
 
 def _caption_layout(stamp: SignerStamp, width: float) -> tuple[str, ...]:
-    """Two lines when the field is wide enough for who and when to share one, otherwise three.
-
-    The caption and the mark split the same rectangle, so every line the caption gives up is
-    height the signature gets back. Nothing is abbreviated to make the join fit: a field too
-    narrow for it simply keeps three lines.
-    """
+    """At most two lines: who, then date and signer id. Wrap the second line only if it must."""
     ensure_fonts_registered()
-    who, when, signer = _caption_lines(stamp)
-    joined = f"{who}  ·  {when}"
-    if text_width(joined, PLAIN_FONT, _CAPTION_SIZE) <= width:
-        return joined, signer
+    who, rest = _caption_lines(stamp)
+    if text_width(rest, PLAIN_FONT, _CAPTION_MIN_SIZE) <= width:
+        return who, rest
+    when = f"Date: {_display_when(stamp)}"
+    signer = f"Signer {stamp.signer_id}"
     return who, when, signer
 
 
@@ -208,9 +225,8 @@ def _draw_caption(canvas: Canvas, rect: Rect, lines: tuple[str, ...]) -> None:
     top = rect.y + rect.h - ink
     for index, line in enumerate(lines):
         line_size = shrink_to_width(line, PLAIN_FONT, size, rect.w, min_size=_CAPTION_MIN_SIZE)
-        # Only the name line may be abbreviated. The time and the signer id are the evidence.
-        # (When the name shares its line with the time, the join only happens if it fits whole.)
-        text = truncate_to_width(line, PLAIN_FONT, line_size, rect.w) if index == 0 and len(lines) == 3 else line
+        # Only the name line may be abbreviated. The date and the signer id are the evidence.
+        text = truncate_to_width(line, PLAIN_FONT, line_size, rect.w) if index == 0 else line
         canvas.setFont(PLAIN_FONT, line_size)
         canvas.drawString(rect.x, baseline_for_centre(PLAIN_FONT, line_size, top - index * leading, ink), text)
     canvas.restoreState()
@@ -477,7 +493,7 @@ def _draw_marks_page(
 
 def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp: SignerStamp) -> None:
     if field.type == "date_signed":
-        when = stamp.signed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        when = f"Date: {_display_when(stamp)}"
         _draw_text_block(canvas, field.rect, when, font=PLAIN_FONT, size=min(11.0, field.rect.h * 0.7), multiline=False)
         return
 
@@ -508,8 +524,8 @@ def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp:
         _draw_image(canvas, band.mark, capture.image_png)
     elif capture.kind == "typed" or (capture.kind == "adopted" and capture.typed_text):
         text = (capture.typed_text or "").strip()
-        _draw_text_block(canvas, band.mark, text, font=SCRIPT_FONT, size=band.mark.h * 0.8, multiline=False)
+        _draw_text_block(canvas, band.mark, text, font=SCRIPT_FONT, size=band.mark.h * 0.9, multiline=False)
     else:  # click-to-sign: the signer's name in the plain face, never the script one
         text = _initials(stamp.display_name) if field.type == "initials" else stamp.display_name
-        _draw_text_block(canvas, band.mark, text, font=PLAIN_FONT, size=band.mark.h * 0.55, multiline=False)
+        _draw_text_block(canvas, band.mark, text, font=PLAIN_FONT, size=band.mark.h * 0.85, multiline=False)
     _draw_caption(canvas, band.caption, caption)

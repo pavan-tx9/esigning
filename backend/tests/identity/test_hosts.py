@@ -8,7 +8,14 @@ from sqlalchemy.orm import Session
 
 from esign.clock import FixedClock
 from esign.contracts import NotFound, Unauthorized, ValidationFailed
-from esign.identity import HOST_KEY_PREFIX, create_host, disable_host, normalise_origin, rotate_host_key
+from esign.identity import (
+    HOST_KEY_PREFIX,
+    create_host,
+    disable_host,
+    normalise_origin,
+    rotate_host_key,
+    set_host_timezone,
+)
 from esign.identity.hosts import rotate_webhook_secret
 from esign.identity.service import SqlIdentityService
 from esign.identity.tokens import TOKEN_LENGTH
@@ -217,3 +224,20 @@ def test_two_hosts_do_not_share_a_key(db: Session, clock: FixedClock, identity: 
     assert first_key != second_key
     assert identity.authenticate_host(db, first_key).id == first.id
     assert identity.authenticate_host(db, second_key).id == second.id
+
+
+def test_a_host_timezone_is_an_iana_name_and_can_be_cleared(db: Session, clock: FixedClock) -> None:
+    _, host = create_host(
+        db, "Northside EHR", ["https://ehr.example.org"], clock=clock, display_timezone="America/New_York"
+    )
+    assert host.display_timezone == "America/New_York"
+    updated = set_host_timezone(db, host.id, "America/Chicago")
+    assert updated.display_timezone == "America/Chicago"
+    cleared = set_host_timezone(db, host.id, "")
+    assert cleared.display_timezone is None
+
+
+def test_an_unknown_timezone_is_refused(db: Session, clock: FixedClock) -> None:
+    with pytest.raises(ValidationFailed) as caught:
+        create_host(db, "Northside EHR", clock=clock, display_timezone="Not/AZone")
+    assert caught.value.code == "invalid_timezone"
