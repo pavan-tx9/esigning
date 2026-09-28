@@ -299,6 +299,9 @@ class KioskBody(_Body):
 class SessionBody(_Body):
     auth: AuthBody
     kiosk: KioskBody | None = None
+    #: Addendum 4. How the session is driven. Omitted, it is the framed UI, as every session
+    #: was before the addendum.
+    client: Literal["iframe", "sdk"] = "iframe"
 
     def kiosk_context(self) -> KioskContext | None:
         if self.kiosk is None:
@@ -315,6 +318,9 @@ class ReauthBody(AuthBody):
 
 class ViewedBody(_Body):
     pages_viewed: int = Field(ge=0, le=10_000)
+    #: Addendum 4. The 1-based pages the client claims were displayed. Omitted on the old path.
+    pages_seen: list[int] | None = Field(default=None, max_length=10_000)
+    reached_end: bool | None = None
 
 
 class ConsentBody(_Body):

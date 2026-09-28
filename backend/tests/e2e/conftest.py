@@ -85,13 +85,14 @@ class Signer:
     token: str
     session_id: str
     signer_id: str
+    ehr: Ehr | None = None
 
     @property
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
-    def get(self, path: str) -> httpx.Response:
-        response: httpx.Response = self.client.get(f"/v1/signing{path}", headers=self.headers)
+    def get(self, path: str, **headers: str) -> httpx.Response:
+        response: httpx.Response = self.client.get(f"/v1/signing{path}", headers={**self.headers, **headers})
         return response
 
     def post(self, path: str, body: dict[str, Any], **headers: str) -> httpx.Response:
@@ -140,9 +141,23 @@ class Signer:
                 out.append({"field_id": item["id"], "kind": "click"})
         return out
 
-    def sign(self, payload: dict[str, Any], *, key: str, kind: str = "drawn") -> httpx.Response:
+    def apply(self, body: dict[str, Any], *, key: str, drive_seal: bool = True) -> httpx.Response:
+        """POST /sign and, when this was the last signature, drive the worker's seal tick."""
+        response = self.post("/sign", body, **{"Idempotency-Key": key})
+        if (
+            drive_seal
+            and response.status_code == 200
+            and response.json().get("envelope", {}).get("status") == "completed_pending_seal"
+            and self.ehr is not None
+        ):
+            self.ehr.drive_seal()
+        return response
+
+    def sign(
+        self, payload: dict[str, Any], *, key: str, kind: str = "drawn", drive_seal: bool = True
+    ) -> httpx.Response:
         body = {"intent_confirmed": True, "captures": self.captures(payload, kind=kind)}
-        return self.post("/sign", body, **{"Idempotency-Key": key})
+        return self.apply(body, key=key, drive_seal=drive_seal)
 
 
 @dataclass
@@ -290,13 +305,21 @@ class Ehr:
         return next(str(s["id"]) for s in envelope["signers"] if s["role_key"] == role_key)
 
     def open_session_response(
-        self, envelope: dict[str, Any], role_key: str, *, method: str = "password", kiosk: dict[str, str] | None = None
+        self,
+        envelope: dict[str, Any],
+        role_key: str,
+        *,
+        method: str = "password",
+        kiosk: dict[str, str] | None = None,
+        client: str = "iframe",
     ) -> httpx.Response:
         body: dict[str, Any] = {
             "auth": {"method": method, "auth_time": (self.clock.now() - timedelta(minutes=2)).isoformat()}
         }
         if kiosk is not None:
             body["kiosk"] = kiosk
+        if client != "iframe":
+            body["client"] = client
         return self.post(f"/envelopes/{envelope['id']}/signers/{self.signer_id(envelope, role_key)}/sessions", body)
 
     def open_session(self, envelope: dict[str, Any], role_key: str, **kwargs: Any) -> Signer:
@@ -308,6 +331,7 @@ class Ehr:
             token=payload["token"],
             session_id=payload["session_id"],
             signer_id=self.signer_id(envelope, role_key),
+            ehr=self,
         )
 
     def reauth(self, signer: Signer, *, method: str = "password+mfa") -> httpx.Response:
@@ -329,6 +353,15 @@ class Ehr:
         assert response.status_code == 200, response.text
         payload: dict[str, Any] = response.json()
         return payload
+
+    def drive_seal(self) -> None:
+        """Seal due jobs the way the worker does after ``NOTIFY esign_seal``.
+
+        Webhooks stay queued: a slow host must not be how tests (or production) finish a seal.
+        """
+        from esign.worker import run_seals
+
+        run_seals(self.rt)
 
     def sign_everyone(self, envelope: dict[str, Any], roles: tuple[str, ...]) -> None:
         for index, role_key in enumerate(roles):

@@ -21,6 +21,7 @@ through it), so the two sides cannot drift apart silently.
 from __future__ import annotations
 
 import hashlib
+import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -689,6 +690,7 @@ class EnvelopeServiceImpl:
                 "revision_no": repo.latest_revision_no(db, loaded.envelope.id),
                 "page_count": self._page_count(db, loaded.envelope.id, sha),
                 "size_bytes": len(pdf),
+                **_client_fields(ctx),
             },
         )
         log.info(
@@ -700,7 +702,16 @@ class EnvelopeServiceImpl:
         )
         return pdf
 
-    def record_viewed(self, db: Session, session: SessionInfo, pages_viewed: int, ctx: RequestContext) -> None:
+    def record_viewed(
+        self,
+        db: Session,
+        session: SessionInfo,
+        pages_viewed: int,
+        ctx: RequestContext,
+        *,
+        pages_seen: tuple[int, ...] | None = None,
+        reached_end: bool | None = None,
+    ) -> None:
         loaded, signer = self._load_for_session(db, session)
         transition = self._decide(loaded, Command.VIEW, signer.id)
         now = self._clock.now()
@@ -718,6 +729,11 @@ class EnvelopeServiceImpl:
         page_count = self._page_count(db, loaded.envelope.id, presented)
         if pages_viewed != page_count:
             raise ValidationFailed("every page must be displayed before continuing", code="pages_not_all_viewed")
+        if pages_seen is not None and tuple(sorted(pages_seen)) != tuple(range(1, page_count + 1)):
+            raise ValidationFailed("every page must be displayed before continuing", code="pages_not_all_viewed")
+
+        presented_at = self._presented_at(db, loaded.envelope.id, signer.id)
+        review_seconds = None if presented_at is None else max(0, int((now - presented_at).total_seconds()))
 
         self._apply_envelope_transition(db, loaded, transition, now=now)
         repo.update_signer(
@@ -731,6 +747,18 @@ class EnvelopeServiceImpl:
             viewed_sha256=presented,
             only_if_unset=frozenset({"viewed_at"}),
         )
+        viewed_data: dict[str, Any] = {
+            "signer_id": signer.id,
+            "pages_viewed": pages_viewed,
+            "page_count": page_count,
+            **_client_fields(ctx),
+        }
+        if pages_seen is not None:
+            viewed_data["pages_seen"] = pages_seen
+        if reached_end is not None:
+            viewed_data["reached_end"] = reached_end
+        if review_seconds is not None:
+            viewed_data["review_seconds"] = review_seconds
         self._append(
             db,
             loaded.envelope.id,
@@ -738,7 +766,7 @@ class EnvelopeServiceImpl:
             actor=_signer_actor(signer),
             ctx=ctx,
             document_sha256=presented,
-            data={"signer_id": signer.id, "pages_viewed": pages_viewed, "page_count": page_count},
+            data=viewed_data,
         )
         log.info("document.viewed", envelope_id=loaded.envelope.id, signer_id=signer.id, session_id=session.id)
 
@@ -812,6 +840,7 @@ class EnvelopeServiceImpl:
                 "relied_on_envelope_id": None if standing is None else standing.envelope_id,
                 "relied_on_accepted_at": None if standing is None else standing.accepted_at,
                 "relied_on_root_accepted_at": None if standing is None else standing.root_accepted_at,
+                **_client_fields(ctx),
             },
         )
         log.info(
@@ -865,6 +894,7 @@ class EnvelopeServiceImpl:
             capacity=signer.capacity,
             on_behalf_of_label=_on_behalf_of_label(signer),
             signed_at=now,  # server time; the client never supplies a date_signed value
+            display_tz=self._display_tz(db, loaded.envelope.host_id),
         )
         stamped = self._documents.apply_signer_marks(base_pdf, list(mine), list(accepted), stamp)
         retain_until = self._settings.retain_until(loaded.envelope.document_type, now)
@@ -928,6 +958,7 @@ class EnvelopeServiceImpl:
                 "revision_sha256": revision.sha256,
                 "capture_count": len(accepted),
                 "captures": [_capture_ref(c, by_id[c.field_id]) for c in accepted],
+                **_client_fields(ctx),
             },
         )
 
@@ -947,6 +978,7 @@ class EnvelopeServiceImpl:
                 },
             )
             repo.enqueue_seal_job(db, loaded.envelope.id, now)
+            db.execute(text("SELECT pg_notify('esign_seal', :id)"), {"id": str(loaded.envelope.id)})
 
         # Signing ends this signer's ability to act. The session they signed from survives, for the
         # copy download only (see may_download_copy); every other session they hold is revoked.
@@ -1094,13 +1126,26 @@ class EnvelopeServiceImpl:
     def _seal(self, db: Session, loaded: _Loaded, transition: Transition) -> EnvelopeView:
         envelope = loaded.envelope
         now = self._clock.now()
+        t0 = time.perf_counter()
+
+        def _phase(name: str, began: float) -> float:
+            log.info(
+                "seal.phase",
+                envelope_id=envelope.id,
+                phase=name,
+                duration_ms=int((time.perf_counter() - began) * 1000),
+            )
+            return time.perf_counter()
+
         final_revision_sha = _require_revision(envelope.current_revision_sha256)
         summary = self._certificate_summary(db, loaded, final_revision_sha)
+        mark = _phase("certificate", t0)
 
         certificate = self._documents.build_certificate(summary)
         signed_pdf = self._blobs.get(db, final_revision_sha)
         body = self._archive_body(envelope, summary, signed_pdf) if envelope.kind == "paper_archive" else signed_pdf
         final_unsealed = self._documents.finalize(body, certificate)
+        mark = _phase("finalize", mark)
 
         retain_until = self._settings.retain_until(envelope.document_type, now)
         unsealed = self._blobs.put(db, final_unsealed, kind="final_unsealed_pdf", retain_until=retain_until)
@@ -1117,7 +1162,9 @@ class EnvelopeServiceImpl:
             created_at=now,
             page_count=final_pages,
         )
+        mark = _phase("store_unsealed", mark)
         result = self._sealer.seal(final_unsealed, reason=_SEAL_REASON, envelope_id=envelope.id)
+        mark = _phase("pades", mark)
 
         # The sealer's own word is not enough. If its output does not validate then we are not
         # sealed, whatever it returned: stay pending, record why, let the job back off.
@@ -1134,6 +1181,7 @@ class EnvelopeServiceImpl:
                 problems=list(validation.problems),
             )
             raise SealUnavailable("the seal did not validate", code="seal_validation_failed")
+        mark = _phase("validate", mark)
 
         sealed = self._blobs.put(db, result.sealed_pdf, kind="sealed_pdf", retain_until=retain_until)
         sealed_no = repo.next_revision_no(db, envelope.id)
@@ -1204,12 +1252,14 @@ class EnvelopeServiceImpl:
             },
         )
         repo.complete_seal_job(db, envelope.id, now)
+        _phase("store_sealed", mark)
         log.info(
             "document.sealed",
             envelope_id=envelope.id,
             seal_profile=result.profile,
             sealed_sha256=sealed.sha256,
             size_bytes=sealed.size_bytes,
+            duration_ms=int((time.perf_counter() - t0) * 1000),
         )
         view = self._view(db, self._reload(db, loaded))
         self._notify(db, "envelope.sealed", view)
@@ -1661,6 +1711,11 @@ class EnvelopeServiceImpl:
             user_agent=user_agent,
             kiosk_staff_user_id=kiosk_staff_user_id,
             kiosk_identity_check=kiosk_identity_check,
+            review_reached_end=_opt_bool(viewed.data.get("reached_end")),
+            review_seconds=_opt_int(viewed.data.get("review_seconds")),
+            review_page_count=_opt_int(viewed.data.get("page_count")),
+            signing_client=_opt_str(signed.data.get("client")),
+            signing_origin=_opt_str(signed.data.get("origin")),
         )
 
     def assert_reauth_allowed(self, db: Session, envelope_id: UUID, signer_id: UUID) -> None:
@@ -2294,6 +2349,20 @@ class EnvelopeServiceImpl:
             completed_at=now if transition.completes_envelope else None,
         )
 
+    def _presented_at(self, db: Session, envelope_id: UUID, signer_id: UUID) -> datetime | None:
+        """When this signer was served the document, from the trail. Used for ``review_seconds``."""
+        for event in self._audit.list(db, "envelope", envelope_id):
+            if event.event_type != EventType.DOCUMENT_PRESENTED:
+                continue
+            if str(event.data.get("signer_id")) == str(signer_id):
+                return event.occurred_at
+        return None
+
+    def _display_tz(self, db: Session, host_id: UUID) -> str:
+        row = db.execute(text("SELECT display_timezone FROM hosts WHERE id = :id"), {"id": host_id}).first()
+        name = None if row is None else row.display_timezone
+        return str(name) if name else self._settings.default_display_timezone
+
     def _append(
         self,
         db: Session,
@@ -2397,6 +2466,16 @@ def _requires_reauth(role: SignerRoleDef | None, capacity: str) -> bool:
     A role the template no longer has is not a licence to skip: the capacity alone still decides.
     """
     return (role.requires_reauth if role is not None else False) or capacity == "clinician"
+
+
+def _client_fields(ctx: RequestContext) -> dict[str, str]:
+    """Addendum 4: the library and origin, only when the request actually carried them."""
+    out: dict[str, str] = {}
+    if ctx.client:
+        out["client"] = ctx.client
+    if ctx.origin:
+        out["origin"] = ctx.origin
+    return out
 
 
 def _signer_actor(signer: repo.SignerRow) -> Actor:
@@ -2645,6 +2724,19 @@ def _age_seconds(now: datetime, auth_time: datetime) -> int:
 
 def _opt_str(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _opt_bool(value: Any) -> bool | None:
+    return None if value is None else bool(value)
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _opt_uuid(value: Any) -> UUID | None:

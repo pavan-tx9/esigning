@@ -3,7 +3,8 @@
 The full host-side walk-through, moved here from the README. Every command was run against `make demo`.
 
 Three things happen on the host side: the backend talks to the Host API with an API key, the page
-embeds the signing UI in an iframe and hands it a token by `postMessage`, and the backend receives
+embeds the signing UI in an iframe and hands it a token by `postMessage` (or, opt-in, imports
+`@esign/sdk` and calls the Signer API from the signer's browser), and the backend receives
 webhooks. `demo-host/` is a working implementation of all three, in about 1,300 lines of Python plus
 its templates, and it speaks HTTP rather than importing anything from `esign` — so it proves the
 integration rather than assuming it.
@@ -253,7 +254,8 @@ patient**, never to the staff member.
 The token is 256 bits, stored only as a hash, bound to one signer, and valid for
 `SESSION_TTL_SECONDS` (30 minutes). Creating a new session revokes the previous one. Return it to
 the browser over your own authenticated channel and hand it to the iframe by `postMessage` — never
-in a URL, never in storage.
+in a URL, never in storage. For SDK mode, add `"client": "sdk"` to the body (default `"iframe"`)
+and hand the token to `<EsignSigner />` instead; see §3b.
 
 ## 3. Embed the signing UI
 
@@ -334,6 +336,39 @@ of the document but what the UI would like at most: its bars plus up to about 12
 less when a screen has less. Above that it scrolls inside; a fixed-size host can ignore the
 message.
 
+## 3b. SDK mode (no iframe)
+
+Opt-in. The host's backend still opens the session (`"client": "sdk"`). The signer's browser then
+imports `@esign/sdk` and talks to `/v1/signing/*` itself. CORS is answered only for origins in
+that session's host's `allowed_origins`. Every call sends `X-Esign-Client: esign-sdk/<version>`;
+the server requires it and records the library and origin on the trail.
+
+```js
+import { EsignSigner } from "@esign/sdk";
+
+<EsignSigner
+  token={token}
+  baseUrl="https://esign.example/v1"
+  onSigned={() => { /* file the envelope */ }}
+  onSealed={() => { /* fetch the copy */ }}
+  onDeclined={() => {}}
+  onReauthRequired={(sessionId) => {
+    // Host backend: POST /v1/sessions/{sessionId}/reauth, then:
+    window.dispatchEvent(new Event("esign:reauth_done"));
+  }}
+/>
+```
+
+`createSigningClient({ baseUrl, token })` is the same API without the React tree. Re-authentication
+is still attested by the host backend; the UI never calls `/v1/sessions/.../reauth` itself.
+
+`baseUrl` is the signing service origin plus `/v1` (the same prefix the iframe talks to
+same-origin). Hosts without a bundler load `{ui}/esign-sdk.js` and `{ui}/esign-sdk.css` from the
+signing origin; those files are served so a page on an allowed origin can execute them.
+
+The framed path in §3 is unchanged. Do not mix them: an iframe session must not be driven by the
+SDK, and an SDK session must not be loaded in `/sign?host=`.
+
 ## 4. Re-authentication
 
 Roles with `requires_reauth` — every clinician, and any role the template marks — cannot sign
@@ -358,13 +393,15 @@ signature — a host cannot manufacture a re-authentication record after the fac
 
 ## 5. What the signer's browser does
 
-For completeness, this is the Signer API the UI drives. A host never calls it.
+For completeness, this is the Signer API the UI drives. A host backend never calls it: the framed
+UI does, same-origin, and so does `@esign/sdk` from the signer's browser when the host opened the
+session as `client: "sdk"` (§3b).
 
 ```sh
 SAUTH="Authorization: Bearer $TOKEN"
 curl -s $API/v1/signing/session -H "$SAUTH"                     # everything the UI needs
 curl -s $API/v1/signing/document -H "$SAUTH" -o document.pdf    # records document.presented
-curl -s -X POST $API/v1/signing/viewed  -H "$SAUTH" -d '{"pages_viewed": 1}'
+curl -s -X POST $API/v1/signing/viewed  -H "$SAUTH" -d '{"pages_viewed": 1, "pages_seen": [1], "reached_end": true}'
 curl -s -X POST $API/v1/signing/consent -H "$SAUTH" -d '{"consent_version": "2026-09", "accepted": true}'
 curl -s -X POST $API/v1/signing/sign    -H "$SAUTH" -H 'Idempotency-Key: sign-1' \
   -d '{"intent_confirmed": true,
@@ -488,7 +525,7 @@ curl -s -X POST $API/v1/archives -H "$AUTH" -H 'Idempotency-Key: paper-5531' \
 
 Nobody has to sign, so filing *is* completion: the scan is stored write-once as revision 1 (kind
 `scan`), `archive.created` and `archive.attested` are the first two events, and the envelope goes
-straight to `completed_pending_seal`. The seal is attempted once inline and retried by the worker
+straight to `completed_pending_seal`. The seal is retried by the worker
 exactly as for the last signature, `envelope.sealed` fires when it lands, and `/document`,
 `/audit`, `/verification` and `/void` work as for any envelope. (`expires_at` is filled in for
 every envelope; an archive never expires — it is complete the moment it is filed.)

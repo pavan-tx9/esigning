@@ -232,8 +232,19 @@ def _signer_block(cursor: _Cursor, index: int, signer: CertificateSigner) -> Non
         _row(cursor, "Saved signature", f"signed with a saved signature adopted on {_day(signer.adopted_at)}")
     _row(cursor, "Consent version", signer.consent_version)
     _row(cursor, "Viewed", _when(signer.viewed_at))
+    if signer.review_reached_end and signer.review_page_count is not None and signer.review_seconds is not None:
+        minutes = max(0, signer.review_seconds // 60)
+        _row(
+            cursor,
+            "Review",
+            f"Reviewed all {signer.review_page_count} pages, reached end, {minutes} min",
+        )
     _row(cursor, "Consented", _consented(signer))
     _row(cursor, "Signed", _when(signer.signed_at))
+    if signer.signing_client:
+        label = signer.signing_client.replace("/", " ")
+        where = signer.signing_origin or "unknown origin"
+        _row(cursor, "Signing client", f"{label} in {where}")
     _row(cursor, "IP address", signer.ip or "not recorded")
     _row(cursor, "User agent", signer.user_agent or "not recorded")
     if signer.kiosk_staff_user_id or signer.kiosk_identity_check:

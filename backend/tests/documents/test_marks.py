@@ -72,7 +72,7 @@ def test_a_drawn_signature_keeps_its_aspect_ratio(documents: DocumentService, st
 def test_the_caption_stays_inside_the_rect_below_the_mark(documents: DocumentService, stamp: SignerStamp) -> None:
     """Forms print their own label under the signing line; nothing of ours may land on it."""
     out = documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], stamp)
-    captions = [run for run in placed_text(out) if "Signed 2026-03-17" in run.text]
+    captions = [run for run in placed_text(out) if "Date: 03/17/2026" in run.text]
     assert captions
     box = captions[0].box(PLAIN_FONT)
     assert box.inside(SIG_RECT)
@@ -86,7 +86,7 @@ def test_a_field_at_the_very_bottom_still_gets_its_caption_on_the_page(
 ) -> None:
     rect = Rect(x=100, y=2, w=220, h=60)
     out = documents.apply_signer_marks(make_pdf(), [sig_field(rect=rect)], [typed()], stamp)
-    captions = [run for run in placed_text(out) if "Signed 2026-03-17" in run.text]
+    captions = [run for run in placed_text(out) if "Date: 03/17/2026" in run.text]
     assert captions
     box = captions[0].box(PLAIN_FONT)
     assert box.y0 >= 0
@@ -99,7 +99,7 @@ def test_the_caption_says_who_in_what_capacity_when_and_which_signer(
     out = documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], stamp)
     text = PdfReader(io.BytesIO(out)).pages[0].extract_text()
     assert "Ada Lovelace (self)" in text
-    assert "Signed 2026-03-17 14:30:00 UTC" in text
+    assert "Date: 03/17/2026 2:30 PM UTC" in text
     assert str(stamp.signer_id) in text
 
 
@@ -157,7 +157,8 @@ def test_date_signed_comes_from_the_stamp(documents: DocumentService, stamp: Sig
         signer_role="patient",
     )
     out = documents.apply_signer_marks(make_pdf(), [sig_field(), date_field], [typed()], stamp)
-    runs = [run for run in placed_text(out) if run.text == "2026-03-17 14:30 UTC"]
+    # The signature caption also contains this date; the date_signed field does not name the signer.
+    runs = [run for run in placed_text(out) if "Date: 03/17/2026 2:30 PM UTC" in run.text and "Signer" not in run.text]
     assert runs
     assert runs[0].box(PLAIN_FONT).inside(date_field.rect)
 
@@ -420,7 +421,7 @@ def test_a_rect_too_small_for_both_bands_keeps_everything_inside_it(
     rect = Rect(x=100, y=4, w=220, h=20)
     out = documents.apply_signer_marks(make_pdf(), [sig_field(rect=rect)], [typed()], stamp)
     for run in placed_text(out):
-        if run.text.startswith("Ada Lovelace") or ("Signed 2026" in run.text or run.text.startswith("Signer ")):
+        if run.text.startswith("Ada Lovelace") or ("Date: 03/17/2026" in run.text or run.text.startswith("Signer ")):
             font = SCRIPT_FONT if run.text == "Ada Lovelace" else PLAIN_FONT
             assert run.box(font).inside(rect, tolerance=1.5), run.text
 
@@ -441,4 +442,50 @@ def test_the_caption_never_abbreviates_the_signer_id(documents: DocumentService,
     out = documents.apply_signer_marks(make_pdf(), [field], [typed()], long_name)
     text = PdfReader(io.BytesIO(out)).pages[0].extract_text()
     assert str(stamp.signer_id) in text
-    assert "Signed 2026-03-17 14:30:00 UTC" in text
+    assert "Date: 03/17/2026 2:30 PM UTC" in text
+
+
+def test_the_mark_gets_at_least_sixty_percent_of_a_28pt_field(documents: DocumentService, stamp: SignerStamp) -> None:
+    rect = Rect(x=100, y=400, w=220, h=28)
+    out = documents.apply_signer_marks(make_pdf(), [sig_field(rect=rect)], [typed()], stamp)
+    marks = [run for run in placed_text(out) if run.text == "Ada Lovelace"]
+    assert marks
+    box = marks[0].box(SCRIPT_FONT)
+    # The script face's ink is taller than its point size; the band (the ink) is at least 60% of
+    # the field. 0.85 leaves room for the 90% fill and the face metrics.
+    assert (box.y1 - box.y0) >= 28 * 0.60 * 0.85
+    assert box.inside(rect)
+
+
+def test_the_caption_uses_the_host_timezone_including_across_dst(
+    documents: DocumentService,
+) -> None:
+    before = SignerStamp(
+        signer_id=UUID("11111111-2222-4333-8444-555555555555"),
+        display_name="Ada Lovelace",
+        capacity="self",
+        on_behalf_of_label=None,
+        signed_at=datetime(2026, 3, 8, 6, 59, tzinfo=UTC),
+        display_tz="America/New_York",
+    )
+    after = SignerStamp(
+        signer_id=before.signer_id,
+        display_name=before.display_name,
+        capacity="self",
+        on_behalf_of_label=None,
+        signed_at=datetime(2026, 3, 8, 7, 1, tzinfo=UTC),
+        display_tz="America/New_York",
+    )
+    early = (
+        PdfReader(io.BytesIO(documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], before)))
+        .pages[0]
+        .extract_text()
+    )
+    late = (
+        PdfReader(io.BytesIO(documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], after)))
+        .pages[0]
+        .extract_text()
+    )
+    assert "1:59 AM EST" in early
+    assert "3:01 AM EDT" in late
+    assert str(before.signer_id) in early and str(after.signer_id) in late

@@ -369,7 +369,34 @@ def create_app(
             f"/sign/{task.id}" + (f"?return_to={back}" if back != "/worklist" else ""), status_code=303
         )
 
-    def start_session(task: Task, user: User, session_key: str | None) -> TaskSigner | None:
+    @app.post("/tasks/{task_id}/open-sdk")
+    def open_task_sdk(
+        task_id: str,
+        return_to: Annotated[str, Form()] = "/worklist",
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        """Same as open, but the session is SDK-mode and the page mounts the library in-place."""
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        back = return_to if return_to in RETURN_URLS else "/worklist"
+        task = state.tasks.get(task_id)
+        if task is None or task.signer_for(user.id) is None:
+            return RedirectResponse(f"{back}?problem_code=not_your_task", status_code=303)
+        try:
+            ensure_envelope(task)
+            started = start_session(task, user, demo_session, client="sdk", reuse=False)
+        except EsignApiError as exc:
+            return RedirectResponse(f"{back}?problem_code={exc.code}", status_code=303)
+        if started is None:
+            return RedirectResponse(f"{back}?problem_code=no_signer", status_code=303)
+        return RedirectResponse(
+            f"/sign/{task.id}/sdk" + (f"?return_to={back}" if back != "/worklist" else ""), status_code=303
+        )
+
+    def start_session(
+        task: Task, user: User, session_key: str | None, *, client: str = "iframe", reuse: bool = True
+    ) -> TaskSigner | None:
         """Start a signing session for this person on this task, or reuse the one already running.
 
         The service revokes a signer's previous session whenever a new one is created, and a
@@ -384,7 +411,7 @@ def create_app(
         if signer_id is None:
             return None
         started = task.session_started.get(signer.role_key)
-        if signer.role_key in task.sessions and started is not None and _now() - started < SESSION_REUSE:
+        if reuse and signer.role_key in task.sessions and started is not None and _now() - started < SESSION_REUSE:
             return signer
         kiosk = task.kiosk
         created = esign.create_session(
@@ -393,6 +420,7 @@ def create_app(
             method="staff_verified" if kiosk is not None else "password",
             auth_time=login_time(session_key),
             kiosk=kiosk,
+            client=client,
         )
         task.sessions[signer.role_key] = (str(created["session_id"]), str(created["token"]))
         task.session_started[signer.role_key] = _now()
@@ -692,6 +720,39 @@ def create_app(
             },
         )
 
+    @app.get("/sign/{task_id}/sdk", response_class=HTMLResponse)
+    def sign_sdk_page(
+        request: Request,
+        task_id: str,
+        return_to: str = "/worklist",
+        demo_session: Annotated[str | None, Cookie()] = None,
+    ) -> Response:
+        user = current_user(demo_session)
+        if user is None:
+            return to_login()
+        back = return_to if return_to in RETURN_URLS else "/worklist"
+        task = state.tasks.get(task_id)
+        if task is None:
+            return problem(request, user, "No such document", "That document is not on this worklist.", 404)
+        signer = signer_for(task, user)
+        if signer is None or signer.role_key not in task.sessions:
+            return RedirectResponse(f"{back}?problem_code=session_missing", status_code=303)
+        return render(
+            request,
+            "sign_sdk.html",
+            {
+                "user": user,
+                "task": task,
+                "signer": signer,
+                "patient": state.patients[task.patient_id],
+                "needs_reauth": signer.capacity == "clinician",
+                "esign_origin": settings.ui_url,
+                "api_url": settings.api_url,
+                "return_url": back,
+                "return_label": RETURN_URLS[back],
+            },
+        )
+
     @app.post("/sign/{task_id}/token")
     def sign_token(task_id: str, demo_session: Annotated[str | None, Cookie()] = None) -> Response:
         """The page asks for the token once the iframe says it is ready. It arrives in a response
@@ -940,7 +1001,7 @@ def create_app(
 
     def refresh_archive(filing: ArchiveFiling) -> None:
         """Ask the service where the filing has got to, and file the sealed copy if the webhook
-        has not already: the inline seal usually finishes inside the filing request itself."""
+        has not already: the worker usually finishes it moments after filing."""
         try:
             view = esign.envelope(filing.envelope_id)
         except EsignApiError:

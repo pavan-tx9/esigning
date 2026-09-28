@@ -33,10 +33,13 @@ export function nextUnseenPage(seen: ReadonlySet<number>, pageCount: number): nu
  * unseen page still reads "page 7", which is what most of these say.
  */
 export function describePages(pages: number[]): string {
-  if (pages.length <= 1) {
-    return `page ${pages[0] ?? 1}`;
+  if (pages.length === 0) {
+    return "no pages";
   }
-  const runs: string[] = [];
+  if (pages.length === 1) {
+    return `page ${pages[0]}`;
+  }
+  const runs: { label: string; count: number }[] = [];
   for (let at = 0; at < pages.length; ) {
     let end = at;
     while (end + 1 < pages.length && pages[end + 1] === (pages[end] ?? 0) + 1) {
@@ -44,10 +47,17 @@ export function describePages(pages: number[]): string {
     }
     const from = pages[at];
     const to = pages[end];
-    runs.push(from === to ? `${from}` : `${from} to ${to}`);
+    runs.push({
+      label: from === to ? `${from}` : `${from} to ${to}`,
+      count: end - at + 1,
+    });
     at = end + 1;
   }
-  const shown = runs.length > 4 ? [...runs.slice(0, 3), `${runs.length - 3} more`] : runs;
+  const leftoverPages = runs.slice(3).reduce((sum, run) => sum + run.count, 0);
+  const shown =
+    runs.length > 4
+      ? [...runs.slice(0, 3).map((run) => run.label), `${leftoverPages} more`]
+      : runs.map((run) => run.label);
   if (shown.length === 1) {
     return `pages ${shown[0]}`;
   }

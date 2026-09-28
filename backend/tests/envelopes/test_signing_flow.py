@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from esign.contracts import Conflict, IntegrityFailure, NotFound
+from esign.contracts import Conflict, IntegrityFailure, NotFound, ValidationFailed
 from tests.envelopes.conftest import CONSENT_VERSION, CTX, PAGES, PATIENT_CONSENT, Bench
 
 
@@ -117,6 +117,52 @@ def test_viewed_is_recorded_once(bench: Bench, db: Session) -> None:
     assert bench.signer_status(db, signer_id) == "viewed"
 
 
+def test_viewed_accepts_the_old_pages_viewed_claim_without_the_new_fields(bench: Bench, db: Session) -> None:
+    """Addendum 4: a client that still sends only ``pages_viewed`` is recorded as it always was."""
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    view = bench.create(db, host, PATIENT_CONSENT)
+    session = bench.session(db, bench.signer_id(view, "patient"))
+    bench.service.present(db, session, CTX)
+
+    bench.service.record_viewed(db, session, PAGES, CTX)
+
+    data = bench.event_data(db, view.id, "document.viewed")
+    assert data["pages_viewed"] == PAGES
+    assert data["page_count"] == PAGES
+    assert data["pages_seen"] is None
+    assert data["reached_end"] is None
+
+
+def test_viewed_records_every_page_and_the_end_when_the_client_sends_them(bench: Bench, db: Session) -> None:
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    view = bench.create(db, host, PATIENT_CONSENT)
+    session = bench.session(db, bench.signer_id(view, "patient"))
+    bench.service.present(db, session, CTX)
+    bench.clock.advance(125)
+
+    bench.service.record_viewed(db, session, PAGES, CTX, pages_seen=tuple(range(1, PAGES + 1)), reached_end=True)
+
+    data = bench.event_data(db, view.id, "document.viewed")
+    assert data["pages_seen"] == list(range(1, PAGES + 1))
+    assert data["reached_end"] is True
+    assert data["review_seconds"] == 125
+
+
+def test_viewed_refuses_a_pages_seen_list_that_is_not_every_page(bench: Bench, db: Session) -> None:
+    host = bench.host(db)
+    bench.template(db, host, PATIENT_CONSENT)
+    view = bench.create(db, host, PATIENT_CONSENT)
+    session = bench.session(db, bench.signer_id(view, "patient"))
+    bench.service.present(db, session, CTX)
+
+    with pytest.raises(ValidationFailed) as seen:
+        bench.service.record_viewed(db, session, PAGES, CTX, pages_seen=(1, 2), reached_end=True)
+    assert seen.value.code == "pages_not_all_viewed"
+    assert bench.signer_status(db, session.signer_id) == "pending"
+
+
 def test_viewing_again_after_consent_does_not_undo_consent(bench: Bench, db: Session) -> None:
     host = bench.host(db)
     bench.template(db, host, PATIENT_CONSENT)
@@ -192,6 +238,9 @@ def test_consent_stores_the_text_it_was_given(bench: Bench, db: Session) -> None
         "relied_on_envelope_id": None,
         "relied_on_accepted_at": None,
         "relied_on_root_accepted_at": None,
+        # Addendum 4: the signing client and origin. Null on the iframe path.
+        "client": None,
+        "origin": None,
     }
 
 

@@ -36,9 +36,12 @@ from esign.identity.hosts import (
     create_host,
     disable_host,
     embedding_origins,
+    get_host,
+    list_allowed_origins,
     normalise_origin,
     rotate_host_key,
     rotate_webhook_secret,
+    set_host_timezone,
     webhook_target,
 )
 from esign.identity.ratelimit import Limit, RateLimits, SlidingWindowRateLimiter, host_key, ip_key, session_key
@@ -64,8 +67,10 @@ __all__ = [
     "create_host",
     "disable_host",
     "embedding_origins",
+    "get_host",
     "host_key",
     "ip_key",
+    "list_allowed_origins",
     "normalise_locale",
     "normalise_origin",
     "parse_trusted_proxies",
@@ -73,6 +78,7 @@ __all__ = [
     "rotate_webhook_secret",
     "seed_default_consent",
     "session_key",
+    "set_host_timezone",
     "webhook_target",
 ]
 

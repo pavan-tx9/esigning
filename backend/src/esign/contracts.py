@@ -19,6 +19,11 @@ electronically standing for the length of a sitting. Its types and methods are m
 ``Addendum 3``. There is no migration: standing consent is *found* in the ``signers`` and
 ``signing_sessions`` rows that are already written, never stored a second time.
 
+Addendum 4 (docs/SPEC-ADDENDUM-4.md) records that every page was reviewed and the end was reached,
+prints the signing date in a host timezone, answers the sign press without waiting for the seal,
+and adds an opt-in SDK mode so a host can sign without the iframe. Its types and methods are
+marked ``Addendum 4``; migration ``0900_addendum_4.sql`` is their schema.
+
 Conventions:
 - All hashes are raw 32-byte SHA-256 digests (``bytes``), hex only at API and log boundaries.
 - All datetimes are timezone-aware UTC. Time comes from ``Clock``, never from ``datetime.now``.
@@ -305,6 +310,9 @@ class SignerStamp:
     capacity: Capacity
     on_behalf_of_label: str | None
     signed_at: datetime
+    #: Addendum 4. IANA name used only when *formatting* ``signed_at`` on the page. The instant
+    #: itself stays UTC from ``Clock``. ``UTC`` when the host has no timezone of its own.
+    display_tz: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -348,6 +356,16 @@ class CertificateSigner:
     #: beside ``consented_at``, so a reader can see how long before the agreement the person read
     #: the notice rather than being told only that it was "earlier".
     consent_displayed_at: datetime | None = None
+    #: Addendum 4. From ``document.viewed``: whether the signer reached the end of the document,
+    #: how long after ``document.presented`` the viewed claim was recorded, and how many pages
+    #: that claim covered. ``None`` on a trail written before the addendum.
+    review_reached_end: bool | None = None
+    review_seconds: int | None = None
+    review_page_count: int | None = None
+    #: Addendum 4. The library the signer's browser said it was, and the origin it called from,
+    #: for an SDK session. ``None`` for the framed UI and for a trail written before the addendum.
+    signing_client: str | None = None
+    signing_origin: str | None = None
 
 
 #: Addendum 1 A. What the attesting staff member says about the scan. ``true_copy`` is the only
@@ -569,6 +587,7 @@ class DocumentService(Protocol):
 
 # --------------------------------------------------------------------------- sealing (esign.sealing)
 
+
 @dataclass(frozen=True)
 class SealResult:
     sealed_pdf: bytes
@@ -592,11 +611,7 @@ class SealValidation:
     def ok(self) -> bool:
         # Fail closed: any reported problem denies the seal, whatever the four flags say.
         return (
-            self.intact
-            and self.covers_whole_document
-            and self.trusted
-            and self.timestamp_valid
-            and not self.problems
+            self.intact and self.covers_whole_document and self.trusted and self.timestamp_valid and not self.problems
         )
 
 
@@ -621,8 +636,14 @@ class Sealer(Protocol):
 #: ``document.supplied``, so the step from what the host sent to what the signer was shown is
 #: itself evidence rather than an assertion.
 BlobKind = Literal[
-    "template_pdf", "presented_pdf", "revision_pdf", "final_unsealed_pdf", "sealed_pdf", "signature_image",
-    "scan_pdf", "supplied_pdf",
+    "template_pdf",
+    "presented_pdf",
+    "revision_pdf",
+    "final_unsealed_pdf",
+    "sealed_pdf",
+    "signature_image",
+    "scan_pdf",
+    "supplied_pdf",
 ]
 
 
@@ -715,6 +736,10 @@ class RequestContext:
     user_agent: str | None = None
     auth_method: str | None = None
     session_id: UUID | None = None
+    #: Addendum 4. ``X-Esign-Client`` (``esign-sdk/<version>``) and the request ``Origin``. Set
+    #: on SDK sessions; recorded in event ``data``, not as audit columns.
+    client: str | None = None
+    origin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -770,11 +795,17 @@ class AuditLog(Protocol):
 # --------------------------------------------------------------------------- identity (esign.identity)
 
 
+ClientMode = Literal["iframe", "sdk"]
+
+
 @dataclass(frozen=True)
 class Host:
     id: UUID
     name: str
     allowed_origins: tuple[str, ...]
+    #: Addendum 4. IANA timezone for dates printed under a signature. ``None`` means the process
+    #: default (``DEFAULT_DISPLAY_TIMEZONE``).
+    display_timezone: str | None = None
 
 
 AuthMethod = Literal["password", "password+mfa", "sso", "portal_otp", "pin", "staff_verified"]
@@ -809,6 +840,10 @@ class SessionInfo:
     # signer row, never from the request.
     host_id: UUID
     host_user_id: str
+    #: Addendum 4. How this session is driven. ``iframe`` is the framed UI (the default, and
+    #: every session written before the addendum). ``sdk`` is the host's page importing the
+    #: library. Chosen by the host at session creation, never by the browser.
+    client_mode: ClientMode = "iframe"
 
 
 @dataclass(frozen=True)
@@ -866,14 +901,24 @@ class IdentityService(Protocol):
         """Constant-time comparison on the key hash. Raises Unauthorized."""
 
     def create_session(
-        self, db: Session, *, signer_id: UUID, auth: AuthContext, kiosk: KioskContext | None, ctx: RequestContext
+        self,
+        db: Session,
+        *,
+        signer_id: UUID,
+        auth: AuthContext,
+        kiosk: KioskContext | None,
+        ctx: RequestContext,
+        client_mode: ClientMode = "iframe",
     ) -> tuple[str, SessionInfo]:
         """Returns the opaque token exactly once. Revokes any earlier live session for the signer.
         Rejects an ``auth_time`` older than the configured maximum or in the future. Raises
         ValidationFailed with code ``auth_too_old``, ``auth_time_in_future``, ``invalid_auth_time``,
         ``unsupported_auth_method``, ``kiosk_context_required`` or ``invalid_kiosk_context``, and
         NotFound (``signer_not_found``) for an unknown signer. Writes no audit event: the API
-        layer appends ``session.created`` / ``session.rejected`` (SPEC section 3)."""
+        layer appends ``session.created`` / ``session.rejected`` (SPEC section 3).
+
+        Addendum 4: ``client_mode`` is ``iframe`` (the framed UI) or ``sdk`` (the host's page
+        imports the library). It is stored on the session and recorded on ``session.created``."""
 
     def authenticate_session(self, db: Session, bearer: str) -> SessionInfo:
         """Raises Unauthorized for unknown, expired or revoked tokens; all three are indistinguishable
@@ -957,9 +1002,7 @@ class RateLimiter(Protocol):
 
 # --------------------------------------------------------------------------- envelopes (esign.envelopes)
 
-EnvelopeStatus = Literal[
-    "created", "in_progress", "completed_pending_seal", "sealed", "declined", "voided", "expired"
-]
+EnvelopeStatus = Literal["created", "in_progress", "completed_pending_seal", "sealed", "declined", "voided", "expired"]
 SignerStatus = Literal["pending", "viewed", "consented", "signed", "declined"]
 
 
@@ -1307,7 +1350,9 @@ class EnvelopeService(Protocol):
         signing UI is served this envelope's own field definitions in place of a template
         version's. Returns the view with ``source = "host_document"``."""
 
-    def create_archive(self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext) -> EnvelopeView:
+    def create_archive(
+        self, db: Session, host: Host, spec: NewArchive, scan: bytes, ctx: RequestContext
+    ) -> EnvelopeView:
         """Addendum 1 A: file a scan of a paper-signed document as a ``paper_archive`` envelope.
 
         Enforces: ``document_type`` approved (ValidationFailed ``document_type_not_approved``),
@@ -1325,8 +1370,8 @@ class EnvelopeService(Protocol):
         paper_archive``, no template, no signers, ``presented_sha256`` and
         ``current_revision_sha256`` both the scan's hash, ``attested_at = now``; appends
         ``archive.created`` (actor: the host) then ``archive.attested`` (actor: the staff member,
-        role ``staff``); moves it ``created -> completed_pending_seal`` and enqueues the seal job,
-        attempting it once inline like the last signature does. ``seal_pending`` then builds the
+        role ``staff``); moves it ``created -> completed_pending_seal`` and enqueues the seal job
+        (``NOTIFY esign_seal``). ``seal_pending`` then builds the
         cover (``build_archive_cover``), the archive certificate, finalizes cover + scan +
         certificate and seals as for any envelope. Returns the view with ``kind =
         "paper_archive"``."""
@@ -1345,8 +1390,22 @@ class EnvelopeService(Protocol):
         locale when omitted), because ``consent_standing`` is a fact about one consent text and
         the UI may ask for another language. It changes nothing else in the view."""
 
-    def record_viewed(self, db: Session, session: SessionInfo, pages_viewed: int, ctx: RequestContext) -> None:
-        """``pages_viewed`` must equal the page count of the bytes this session was served."""
+    def record_viewed(
+        self,
+        db: Session,
+        session: SessionInfo,
+        pages_viewed: int,
+        ctx: RequestContext,
+        *,
+        pages_seen: tuple[int, ...] | None = None,
+        reached_end: bool | None = None,
+    ) -> None:
+        """``pages_viewed`` must equal the page count of the bytes this session was served.
+
+        Addendum 4: ``pages_seen``, when present, must be exactly pages 1 to N. ``reached_end``
+        is whether the end of the document was on screen. Both are optional so a client that
+        still sends only ``pages_viewed`` keeps working. ``review_seconds`` is computed here
+        from ``document.presented`` to now, never taken from the client."""
 
     def accept_consent(
         self,

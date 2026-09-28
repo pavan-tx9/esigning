@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ task.title }} · Demo EHR{% endblock %}
+{% block main %}
+<div class="stack"
+     id="esign-sdk"
+     data-api="{{ api_url }}"
+     data-sdk-src="{{ esign_origin }}/esign-sdk.js"
+     data-sdk-css="{{ esign_origin }}/esign-sdk.css"
+     data-task-id="{{ task.id }}"
+     data-envelope-id="{{ task.envelope_id or '' }}"
+     data-return-url="{{ return_url }}"
+     data-return-label="{{ return_label }}"
+     data-needs-reauth="{{ 'true' if needs_reauth else 'false' }}">
+
+  <section class="card">
+    <h1 data-testid="sign-title">{{ task.title }}</h1>
+    <p class="lead" data-testid="who-is-signing">
+      You are signing as {{ user.display_name }} — {{ signer.role_label|lower }}{% if signer.capacity != 'self' %}, in the capacity of {{ signer.capacity }}{% endif %}.
+    </p>
+    <p class="fine">
+      This page imports the signing library and calls the Signer API from your browser. There is no
+      iframe. The host backend still opened the session (as <code>client: sdk</code>) and will still
+      attest a re-authentication if this role needs one.
+    </p>
+  </section>
+
+  <div id="esign-root" class="frame-shell" data-testid="sdk-root"></div>
+
+  <section class="card reauth" id="reauth" hidden>
+    <h2>Confirm it's you</h2>
+    <p>
+      You are signing in a professional capacity, so the records system is asking for your password
+      again before the signature is taken.
+    </p>
+    <form id="reauth-form" class="signin">
+      <label for="reauth-password">Password</label>
+      <input id="reauth-password" name="password" type="password" autocomplete="current-password" />
+      <div class="actions">
+        <button type="submit" data-testid="reauth-confirm">Confirm</button>
+        <button type="button" class="secondary" id="reauth-cancel">Not now</button>
+      </div>
+      <p class="notice error" id="reauth-error" role="alert" hidden></p>
+    </form>
+  </section>
+
+  <section class="card outcome" id="outcome" hidden>
+    <h2 id="outcome-title"></h2>
+    <p id="outcome-detail"></p>
+    <div class="actions" id="outcome-actions"></div>
+  </section>
+</div>
+<script src="/static/sdk.js" defer></script>
+{% endblock %}

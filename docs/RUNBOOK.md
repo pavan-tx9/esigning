@@ -454,8 +454,8 @@ Consequences worth understanding:
 ### How it behaves
 
 When the last signer signs, the envelope becomes `completed_pending_seal` and a `seal_jobs` row is
-written **in the same transaction**. One sealing attempt is then made inline, after that commit and
-in a transaction of its own. If it fails, the worker retries.
+written **in the same transaction**. A `NOTIFY esign_seal` wakes the worker, which attempts the
+seal. If it fails, the worker retries.
 
 Every failure — retryable or not — does the same three things: the envelope stays
 `completed_pending_seal`, `seal.failed` is recorded with an error code (in a separate, committed

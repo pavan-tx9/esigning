@@ -34,7 +34,6 @@ from esign.contracts import AdoptedSignature, EsignError, Forbidden, RequestCont
 from esign.identity import Limit, RateLimits, ip_key, session_key
 from esign.logging import get_logger
 from esign.runtime import Runtime
-from esign.worker import claim_seal_job, seal_one
 
 __all__ = ["router"]
 
@@ -152,7 +151,14 @@ def post_viewed(request: Request, body: ViewedBody) -> JSONResponse:
         # Reporting a view re-hashes the revision, re-parses it for its page count and appends
         # ``document.viewed``. Metered like the GETs that do the same work.
         _limit(rt, "viewed", session, ctx)
-        rt.envelopes.record_viewed(db, session, body.pages_viewed, ctx)
+        rt.envelopes.record_viewed(
+            db,
+            session,
+            body.pages_viewed,
+            ctx,
+            pages_seen=None if body.pages_seen is None else tuple(body.pages_seen),
+            reached_end=body.reached_end,
+        )
         ack = _signer_ack(rt, db, session)
     return JSONResponse(ack)
 
@@ -194,10 +200,10 @@ def post_sign(
     the same key with a different body is a ``conflict``.
 
     When this was the last signature the envelope is ``completed_pending_seal`` and a seal job is
-    queued in the same transaction. One sealing attempt is then made inline, *after* that commit
-    and in a transaction of its own: if KMS, the timestamp authority or storage is down the
-    signature still stands, the failure is recorded, and the worker retries. The response reports
-    the state as of the signature, never "sealed" on the strength of an attempt.
+    queued in the same transaction. A ``NOTIFY esign_seal`` wakes the worker; the response reports
+    the state as of the signature, never "sealed" on the strength of an attempt. The worker seals,
+    validates and stores. Nothing about "never fail open" changes: Done already says whether the
+    document is sealed or still sealing, and ``esign:sealed`` fires only when the copy arrives.
 
     ``save_adopted_signature`` (Addendum 1 B) keeps the drawn or typed signature just applied, in
     this same transaction and only once the signature itself has succeeded. A replay of the same
@@ -246,15 +252,6 @@ def post_sign(
             signer = next((s for s in view.signers if s.id == session.signer_id), None)
             save_adopted_signature(rt, db, session, source, ctx, capacity=None if signer is None else signer.capacity)
         idempotency.complete(db, scope=scope, key=idempotency_key, status=200, body=ack)
-    if view.status == "completed_pending_seal":
-        # Claim the job like any worker would, so a worker ticking right now does not make a second
-        # attempt inside the backoff window if this one fails. If a worker got there first, it
-        # seals. seal_one never raises for an expected failure; the job stays queued either way.
-        claimed_at = rt.clock.now()
-        with rt.transaction() as db:
-            mine = claim_seal_job(db, view.id, now=claimed_at)
-        if mine:
-            seal_one(rt, view.id, claimed_at=claimed_at)
     return JSONResponse(ack)
 
 

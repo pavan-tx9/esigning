@@ -28,7 +28,7 @@ import {
 import { ReadStep } from "@/flow/steps/ReadStep";
 import { SignStep } from "@/flow/steps/SignStep";
 import { hasSessionToken, setSessionToken } from "@/lib/api";
-import type { ParentChannel, QueuePosition } from "@/lib/embed";
+import type { HostChannel, QueuePosition } from "@/lib/embed";
 import {
   isNetworkError,
   onBehalfOfPhrase,
@@ -53,12 +53,18 @@ const STEP_LABELS: Record<Step, string> = {
 };
 
 interface SigningFlowProps {
-  channel: ParentChannel;
+  channel: HostChannel;
   /** The query client calls this on any 401. Wired here because only the flow knows what to do. */
   sessionGone: RefObject<() => void>;
+  /**
+   * SDK mode: the host already has the token, so skip the postMessage handshake. The iframe UI
+   * never passes this.
+   */
+  token?: string;
+  locale?: string;
 }
 
-export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
+export function SigningFlow({ channel, sessionGone, token, locale: sdkLocale }: SigningFlowProps) {
   const queryClient = useQueryClient();
   const announce = useAnnounce();
   const [state, dispatch] = useReducer(flowReducer, initialFlowState);
@@ -73,17 +79,15 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
   const [queue, setQueue] = useState<QueuePosition | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
   /**
-   * How far through the document the signer has got, and whether `POST /signing/viewed` has gone.
-   * Held here, not on the Read screen, because that screen is unmounted and remounted by things
-   * that change neither -- the paper-path sheet, chiefly -- and losing it would charge somebody
-   * another scroll through thirty pages for looking at the way out.
+   * Whether `POST /signing/viewed` has gone for the document now on screen. The pages themselves
+   * live on the workspace (the viewer's tracker is the only source). This flag is held here so
+   * a remount of the Read screen -- the paper-path sheet unmounts the step, not the workspace --
+   * does not send the same claim twice. The workspace calls `onReviewReset` when the document
+   * identity changes, which is the only time this must go back to false.
    */
-  const [pagesSeen, setPagesSeen] = useState<ReadonlySet<number>>(() => new Set());
   const [viewedPosted, setViewedPosted] = useState(false);
   const markViewed = useCallback(() => setViewedPosted(true), []);
-  /** A fresh read: the document changed, so what was displayed before is not this document. */
   const readFromScratch = useCallback(() => {
-    setPagesSeen(new Set());
     setViewedPosted(false);
   }, []);
   /**
@@ -162,12 +166,33 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
       }
     };
     window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
+    const onReauth = () => {
+      for (const listener of reauthListeners.current) {
+        listener();
+      }
+    };
+    window.addEventListener("esign:reauth_done", onReauth);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("esign:reauth_done", onReauth);
+    };
   }, [channel, wipe]);
+
+  useEffect(() => {
+    if (token === undefined || token === "") {
+      return;
+    }
+    setSessionToken(token);
+    setLocale(sdkLocale ?? null);
+    dispatch({ type: "TOKEN_RECEIVED" });
+  }, [token, sdkLocale]);
 
   // ------------------------------------------------------------------ connecting
   useEffect(() => {
     if (state.phase !== "connecting") {
+      return;
+    }
+    if (token !== undefined && token !== "") {
       return;
     }
     // The host's listener may not be attached yet when we load, so say "ready" until answered.
@@ -181,7 +206,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
       window.clearInterval(again);
       window.clearTimeout(giveUp);
     };
-  }, [state.phase, channel]);
+  }, [state.phase, channel, token]);
 
   // ------------------------------------------------------------------ session
   const sessionEnabled = state.phase === "loading" || state.phase === "active";
@@ -285,7 +310,6 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
           <ReadStep
             session={session}
             changed={readAgain}
-            seen={pagesSeen}
             viewedPosted={viewedPosted}
             onViewedPosted={markViewed}
             onContinue={() => {
@@ -346,7 +370,7 @@ export function SigningFlow({ channel, sessionGone }: SigningFlowProps) {
             key={session.envelope.id}
             session={session}
             step={state.step}
-            onSeen={setPagesSeen}
+            onReviewReset={readFromScratch}
             draft={draft}
             toolbarNode={toolbarNode}
             hidden={declining}

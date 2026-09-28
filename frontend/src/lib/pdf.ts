@@ -2,6 +2,10 @@
  * pdf.js, loaded on demand and configured once. The worker is bundled from node_modules by Vite
  * (`?url`), so nothing is fetched from a CDN and the strict CSP holds. The legacy build is used
  * on purpose: clinic tablets are not always on a current browser.
+ *
+ * When this module is running as the SDK IIFE inside a host page, the `?url` path is still
+ * `/assets/pdf.worker-….mjs` on the signing origin — not on the host. Resolve it against the
+ * script that loaded the library so the worker is not requested from the EHR.
  */
 
 import type { PDFDocumentProxy } from "pdfjs-dist/legacy/build/pdf.mjs";
@@ -24,12 +28,39 @@ export const LETTER_SIZE: PageSize = { width: 612, height: 792 };
 /** One queue for every page drawn anywhere on the screen: the document and the close-ups alike. */
 export const renderQueue = new RenderQueue(2);
 
+function libraryOrigin(): string | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  const script = document.querySelector("script[src*='esign-sdk.js']");
+  if (!(script instanceof HTMLScriptElement) || script.src === "") {
+    return null;
+  }
+  try {
+    return new URL(script.src).origin;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWorkerSrc(bundled: string): string {
+  const origin = libraryOrigin();
+  if (origin === null || bundled.startsWith("data:") || bundled.startsWith("blob:")) {
+    return bundled;
+  }
+  try {
+    return new URL(bundled, `${origin}/`).href;
+  } catch {
+    return bundled;
+  }
+}
+
 async function pdfjs() {
   const [lib, worker] = await Promise.all([
     import("pdfjs-dist/legacy/build/pdf.mjs"),
     import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url"),
   ]);
-  lib.GlobalWorkerOptions.workerSrc = worker.default;
+  lib.GlobalWorkerOptions.workerSrc = resolveWorkerSrc(worker.default);
   return lib;
 }
 

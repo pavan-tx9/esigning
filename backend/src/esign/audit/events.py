@@ -199,6 +199,9 @@ class SessionCreatedData(EventData):
     kiosk: bool
     kiosk_staff_user_id: OpaqueId | None = None
     kiosk_identity_check: IdentityCheck | None = None
+    #: Addendum 4. How the session is driven. Omitted on events written before the addendum;
+    #: readers treat a missing value as ``iframe``.
+    client_mode: Literal["iframe", "sdk"] | None = None
 
 
 class SessionRejectedData(EventData):
@@ -209,17 +212,31 @@ class SessionRejectedData(EventData):
     reason_code: Slug
 
 
+#: Addendum 4. The library the signer's browser named, e.g. ``esign-sdk/0.1.0``.
+ClientLabel = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9._-]{0,31}/[A-Za-z0-9._-]{1,32}$")]
+#: An origin the host already allowed to embed or to call in SDK mode.
+OriginLabel = Annotated[str, StringConstraints(pattern=r"^https?://[A-Za-z0-9.\-\[\]:]{1,253}$")]
+
+
 class DocumentPresentedData(EventData):
     signer_id: UUID
     revision_no: Ordinal
     page_count: Ordinal
     size_bytes: ByteSize
+    client: ClientLabel | None = None
+    origin: OriginLabel | None = None
 
 
 class DocumentViewedData(EventData):
     signer_id: UUID
     pages_viewed: Ordinal
     page_count: Ordinal
+    #: Addendum 4. The 1-based pages the client claims were displayed. Omitted on the old path.
+    pages_seen: tuple[Ordinal, ...] | None = None
+    reached_end: bool | None = None
+    review_seconds: Seconds | None = None
+    client: ClientLabel | None = None
+    origin: OriginLabel | None = None
 
 
 class ConsentAcceptedData(EventData):
@@ -249,6 +266,8 @@ class ConsentAcceptedData(EventData):
     relied_on_envelope_id: UUID | None = None
     relied_on_accepted_at: Timestamp | None = None
     relied_on_root_accepted_at: Timestamp | None = None
+    client: ClientLabel | None = None
+    origin: OriginLabel | None = None
 
     @model_validator(mode="after")
     def _relied_on_is_all_or_nothing(self) -> ConsentAcceptedData:
@@ -324,6 +343,8 @@ class SignerSignedData(EventData):
     # ``strict=False`` only so callers can pass plain dicts -- they must not have to import a
     # model out of this package. The nested model's own fields stay strict.
     captures: tuple[CaptureRef, ...] = Field(strict=False)
+    client: ClientLabel | None = None
+    origin: OriginLabel | None = None
 
 
 class SignerDeclinedData(EventData):

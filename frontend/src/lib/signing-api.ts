@@ -285,8 +285,17 @@ export interface SignRequest {
   save_adopted_signature?: true;
 }
 
-export function postViewed(pagesViewed: number) {
-  return api("/signing/viewed", ackSchema, { body: { pages_viewed: pagesViewed } });
+export function postViewed(
+  pagesViewed: number,
+  extras: { pagesSeen?: number[]; reachedEnd?: boolean } = {},
+) {
+  return api("/signing/viewed", ackSchema, {
+    body: {
+      pages_viewed: pagesViewed,
+      ...(extras.pagesSeen !== undefined ? { pages_seen: extras.pagesSeen } : {}),
+      ...(extras.reachedEnd !== undefined ? { reached_end: extras.reachedEnd } : {}),
+    },
+  });
 }
 
 /**

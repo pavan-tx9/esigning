@@ -379,7 +379,12 @@ def create_session(request: Request, envelope_id: UUID, signer_id: UUID, body: S
             rt.envelopes.assert_signer_may_start(db, host, envelope_id, signer_id)
             kiosk = body.kiosk_context()
             token, info = rt.identity.create_session(
-                db, signer_id=signer_id, auth=body.auth.to_contract(), kiosk=kiosk, ctx=ctx
+                db,
+                signer_id=signer_id,
+                auth=body.auth.to_contract(),
+                kiosk=kiosk,
+                ctx=ctx,
+                client_mode=body.client,
             )
             rt.audit.append(
                 db,
@@ -397,6 +402,7 @@ def create_session(request: Request, envelope_id: UUID, signer_id: UUID, body: S
                     "kiosk": info.kiosk is not None,
                     "kiosk_staff_user_id": info.kiosk.staff_user_id if info.kiosk else None,
                     "kiosk_identity_check": info.kiosk.identity_check if info.kiosk else None,
+                    "client_mode": info.client_mode,
                 },
             )
     except (Conflict, ValidationFailed) as exc:

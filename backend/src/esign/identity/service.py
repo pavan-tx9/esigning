@@ -34,6 +34,7 @@ from esign.contracts import (
     AdoptedSignatureKind,
     AuthContext,
     AuthMethod,
+    ClientMode,
     Clock,
     Conflict,
     ConsentText,
@@ -85,6 +86,7 @@ _SESSION_COLUMNS: Final = (
     "ss.auth_method AS auth_method, ss.auth_time AS auth_time, "
     "ss.kiosk_staff_user_id AS kiosk_staff_user_id, ss.kiosk_identity_check AS kiosk_identity_check, "
     "ss.created_at AS created_at, ss.expires_at AS expires_at, ss.revoked_at AS revoked_at, "
+    "ss.client_mode AS client_mode, "
     "s.envelope_id AS envelope_id, s.host_user_id AS host_user_id, e.host_id AS host_id"
 )
 _SESSION_JOINS: Final = "JOIN signers s ON s.id = ss.signer_id JOIN envelopes e ON e.id = s.envelope_id"
@@ -172,6 +174,7 @@ class SqlIdentityService:
         auth: AuthContext,
         kiosk: KioskContext | None,
         ctx: RequestContext,
+        client_mode: ClientMode = "iframe",
     ) -> tuple[str, SessionInfo]:
         """Open a signing session for one signer and return its token exactly once.
 
@@ -209,9 +212,10 @@ class SqlIdentityService:
             text(
                 "INSERT INTO signing_sessions "
                 "(id, signer_id, token_hash, auth_method, auth_time, kiosk_staff_user_id, "
-                " kiosk_identity_check, ip, user_agent, created_at, expires_at) "
+                " kiosk_identity_check, ip, user_agent, created_at, expires_at, client_mode) "
                 "VALUES (:id, :signer_id, :token_hash, :auth_method, :auth_time, :staff_user_id, "
-                "        :identity_check, CAST(:ip AS inet), :user_agent, :created_at, :expires_at)"
+                "        :identity_check, CAST(:ip AS inet), :user_agent, :created_at, :expires_at, "
+                "        :client_mode)"
             ),
             {
                 "id": session_id,
@@ -225,6 +229,7 @@ class SqlIdentityService:
                 "user_agent": _storable_user_agent(ctx.user_agent),
                 "created_at": now,
                 "expires_at": expires_at,
+                "client_mode": client_mode,
             },
         )
         _log().info(
@@ -244,6 +249,7 @@ class SqlIdentityService:
             expires_at=expires_at,
             host_id=req_uuid(row, "host_id"),
             host_user_id=req_str(row, "host_user_id"),
+            client_mode=client_mode,
         )
         return token, info
 
@@ -570,6 +576,7 @@ def _row_to_session_info(row: RowMapping) -> SessionInfo:
         if staff_user_id is not None and identity_check is not None
         else None
     )
+    mode = opt_str(row, "client_mode") or "iframe"
     return SessionInfo(
         id=req_uuid(row, "id"),
         signer_id=req_uuid(row, "signer_id"),
@@ -579,6 +586,7 @@ def _row_to_session_info(row: RowMapping) -> SessionInfo:
         expires_at=req_time(row, "expires_at"),
         host_id=req_uuid(row, "host_id"),
         host_user_id=req_str(row, "host_user_id"),
+        client_mode=cast(ClientMode, mode if mode in ("iframe", "sdk") else "iframe"),
     )
 
 

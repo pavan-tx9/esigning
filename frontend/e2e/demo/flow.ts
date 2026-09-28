@@ -19,6 +19,9 @@ export const shot = (page: Page, name: string) =>
 /** The signing UI, inside the host page's iframe. */
 export const ui = (page: Page): FrameLocator => page.frameLocator("#frame");
 
+/** The framed UI, or the same components mounted in the host page (SDK mode). */
+type SigningUi = Page | FrameLocator;
+
 export async function signIn(page: Page, username: string): Promise<void> {
   await page.goto("/");
   if (await page.getByRole("link", { name: "Worklist" }).isVisible()) {
@@ -47,7 +50,7 @@ export async function openTask(page: Page, title: string): Promise<FrameLocator>
 // --------------------------------------------------------------------------- screen 1: read
 
 /** Read the document the way somebody actually does: bring each page up and let it be seen. */
-export async function readEveryPage(frame: FrameLocator): Promise<number> {
+export async function readEveryPage(frame: SigningUi): Promise<number> {
   await expect(frame.locator("canvas[data-rendered]").first()).toBeVisible({ timeout: 45_000 });
   const pages = await frame.locator("[data-page]").count();
   expect(pages).toBeGreaterThan(0);
@@ -66,6 +69,16 @@ export async function readEveryPage(frame: FrameLocator): Promise<number> {
       .toContain(String(n));
   }
   await expect(frame.getByTestId("page-progress")).toContainText("All pages seen");
+  // Seeing every page is not reaching the end: the consent block sits under the last page.
+  const goToEnd = frame.getByRole("button", { name: "Go to end" });
+  if (await goToEnd.isVisible()) {
+    await goToEnd.click();
+  } else {
+    await frame
+      .getByTestId("consent-block")
+      .evaluate((node) => node.scrollIntoView({ block: "center" }));
+  }
+  await expect(frame.getByRole("button", { name: "Continue to sign" })).toBeVisible();
   return pages;
 }
 
@@ -79,7 +92,7 @@ export async function readEveryPage(frame: FrameLocator): Promise<number> {
  * and answers which one it got. A spec that cares asserts that answer against the envelope's
  * trail, never against what an earlier run happened to leave in the service's database.
  */
-export async function agreeAndContinue(frame: FrameLocator): Promise<boolean> {
+export async function agreeAndContinue(frame: SigningUi): Promise<boolean> {
   await expect(frame.getByTestId("consent-block")).toBeVisible();
   const standing = frame.getByTestId("standing-consent");
   const stood = (await standing.count()) > 0;
@@ -96,7 +109,7 @@ export async function agreeAndContinue(frame: FrameLocator): Promise<boolean> {
 }
 
 /** Read every page, agree, and arrive on the Sign screen. */
-export async function readAndContinue(frame: FrameLocator): Promise<number> {
+export async function readAndContinue(frame: SigningUi): Promise<number> {
   const pages = await readEveryPage(frame);
   await agreeAndContinue(frame);
   return pages;
@@ -112,7 +125,7 @@ export async function readAndContinue(frame: FrameLocator): Promise<number> {
  * ways to make one. A helper that means "make one now" has to ask for the chooser rather than
  * assume nothing is on file.
  */
-async function chooseANewSignature(frame: FrameLocator): Promise<void> {
+async function chooseANewSignature(frame: SigningUi): Promise<void> {
   await expect(frame.getByTestId("signature-panel")).toBeVisible();
   const change = frame.getByRole("button", { name: "Change" });
   if (await change.isVisible()) {
@@ -121,14 +134,14 @@ async function chooseANewSignature(frame: FrameLocator): Promise<void> {
 }
 
 /** Type a name as the signature. Steadier than drawing, and exercises the font embedding. */
-export async function typeSignature(frame: FrameLocator, name: string): Promise<void> {
+export async function typeSignature(frame: SigningUi, name: string): Promise<void> {
   await chooseANewSignature(frame);
   await frame.getByRole("radio", { name: /Type it/ }).check();
   await frame.getByLabel("Type your full name").fill(name);
 }
 
 /** Type a name and tick the box that keeps it for next time (SPEC section 14 B). */
-export async function typeSignatureAndSave(frame: FrameLocator, name: string): Promise<void> {
+export async function typeSignatureAndSave(frame: SigningUi, name: string): Promise<void> {
   await typeSignature(frame, name);
   const keep = frame.getByRole("checkbox", { name: /Save this signature for next time/ });
   await expect(keep).not.toBeChecked();
@@ -173,7 +186,7 @@ export async function savedSignatureIsOffered(frame: FrameLocator): Promise<void
  * part of the page its mark lands on. Every template puts different fields in front of a signer,
  * so the loop answers whatever each row is asking for.
  */
-export async function placeEveryField(frame: FrameLocator): Promise<void> {
+export async function placeEveryField(frame: SigningUi): Promise<void> {
   const rows = frame.locator('[data-testid="field-row"]');
   const count = await rows.count();
   expect(count).toBeGreaterThan(0);
@@ -203,7 +216,7 @@ export async function placeEveryField(frame: FrameLocator): Promise<void> {
  * checkbox restating it -- and, for a role that needs re-authentication with nothing live, it is
  * also what asks the host for it.
  */
-export async function signDocument(frame: FrameLocator): Promise<void> {
+export async function signDocument(frame: SigningUi): Promise<void> {
   const button = frame.getByTestId("sign-button");
   await button.scrollIntoViewIfNeeded();
   await expect(button).toContainText(/^Sign as /);
@@ -350,10 +363,11 @@ export interface AuditEvent {
 
 export async function auditTrail(page: Page, envelopeId: string): Promise<AuditEvent[]> {
   const key = demoApiKey();
-  const response = await page.request.get(
-    `${process.env.DEMO_ESIGN_API_URL ?? "http://localhost:8000"}/v1/envelopes/${envelopeId}/audit`,
-    { headers: { Authorization: `Bearer ${key}` } },
-  );
+  const api =
+    process.env.DEMO_ESIGN_API_URL ?? `http://localhost:${process.env.ESIGN_API_PORT ?? "8000"}`;
+  const response = await page.request.get(`${api}/v1/envelopes/${envelopeId}/audit`, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
   expect(response.ok()).toBe(true);
   const body = (await response.json()) as { events: AuditEvent[] };
   return body.events;

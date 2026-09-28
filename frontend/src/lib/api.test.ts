@@ -7,8 +7,10 @@ import {
   ApiValidationError,
   api,
   apiBytes,
+  configureApi,
   hasSessionToken,
   JSON_TIMEOUT_MS,
+  resetApiConfig,
   setSessionToken,
 } from "@/lib/api";
 import { server } from "@/test/server";
@@ -18,6 +20,10 @@ const sessionSchema = z.object({ envelope: z.object({ id: z.string(), page_count
 describe("the fetch seam", () => {
   beforeEach(() => {
     setSessionToken(null);
+    resetApiConfig();
+  });
+  afterEach(() => {
+    resetApiConfig();
   });
 
   it("parses a well-shaped response", async () => {
@@ -82,6 +88,24 @@ describe("the fetch seam", () => {
     await api("/signing/session", sessionSchema);
 
     expect(seen).toBe("Bearer est_testtoken");
+  });
+
+  it("names the library and talks to a configured origin when asked", async () => {
+    let url = "";
+    let client: string | null = null;
+    server.use(
+      http.get("https://esign.example/v1/signing/session", ({ request }) => {
+        url = request.url;
+        client = request.headers.get("X-Esign-Client");
+        return HttpResponse.json({ envelope: { id: "abc", page_count: 1 } });
+      }),
+    );
+
+    configureApi({ baseUrl: "https://esign.example/v1", client: "esign-sdk/0.1.0" });
+    await api("/signing/session", sessionSchema);
+
+    expect(url).toBe("https://esign.example/v1/signing/session");
+    expect(client).toBe("esign-sdk/0.1.0");
   });
 
   it("never puts the token in the URL", async () => {

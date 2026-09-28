@@ -79,7 +79,7 @@ def sign_body(
 
 
 def sign(signer: Signer, payload: dict[str, Any], *, key: str, **kwargs: Any) -> httpx.Response:
-    return signer.post("/sign", sign_body(signer, payload, **kwargs), **{"Idempotency-Key": key})
+    return signer.apply(sign_body(signer, payload, **kwargs), key=key)
 
 
 def adopt(

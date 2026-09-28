@@ -189,7 +189,11 @@ afterEach(() => {
   current = null;
 });
 
-function mount(pdf: LoadedPdf, onSeen: ReturnType<typeof vi.fn>) {
+function mount(
+  pdf: LoadedPdf,
+  onSeen: ReturnType<typeof vi.fn>,
+  onReachedEnd?: ReturnType<typeof vi.fn>,
+) {
   return render(
     <DocumentViewer
       pdf={pdf}
@@ -199,9 +203,36 @@ function mount(pdf: LoadedPdf, onSeen: ReturnType<typeof vi.fn>) {
       onSeen={onSeen}
       onCurrentPage={() => {}}
       onPageFailed={() => {}}
+      {...(onReachedEnd === undefined ? {} : { onReachedEnd, trailing: <div>consent</div> })}
     />,
   );
 }
+
+const intersectTrailing = () => {
+  const target = document.querySelector("[data-trailing]");
+  if (target === null) {
+    throw new Error("the end of the document is not mounted");
+  }
+  const observer = FakeIntersectionObserver.instances.find((instance) =>
+    instance.targets.has(target),
+  );
+  if (observer === undefined) {
+    throw new Error("no observer is watching the end of the document");
+  }
+  act(() => {
+    observer.callback([
+      {
+        target,
+        isIntersecting: true,
+        intersectionRatio: 1,
+        intersectionRect: { height: 40 } as DOMRectReadOnly,
+        rootBounds: { height: ROOT_HEIGHT } as DOMRectReadOnly,
+        boundingClientRect: {} as DOMRectReadOnly,
+        time: 0,
+      },
+    ]);
+  });
+};
 
 describe("a page counts as seen only while it is drawn and on screen", () => {
   it("is not counted while its canvas has been released, and counts again once drawn again", async () => {
@@ -273,6 +304,7 @@ describe("a new document starts again", () => {
     next.holdRenders();
     view.rerender(
       <DocumentViewer
+        key="revision-b"
         pdf={next.pdf}
         pageCount={2}
         fields={[]}
@@ -294,5 +326,21 @@ describe("a new document starts again", () => {
     next.finishRenders();
     await screen.findByText("Text of B page 1");
     await waitFor(() => expect(seenSets(onSeen)).toContainEqual([1]), { timeout: 2_000 });
+  });
+});
+
+describe("reaching the end of the document", () => {
+  it("fires once when the block under the last page has been on screen", async () => {
+    const onSeen = vi.fn();
+    const onReachedEnd = vi.fn();
+    current = fakePdf("A");
+    mount(current.pdf, onSeen, onReachedEnd);
+
+    await waitFor(() => expect(document.querySelector("[data-trailing]")).not.toBeNull());
+    expect(onReachedEnd).not.toHaveBeenCalled();
+    intersectTrailing();
+    expect(onReachedEnd).toHaveBeenCalledExactlyOnceWith(true);
+    intersectTrailing();
+    expect(onReachedEnd).toHaveBeenCalledTimes(1);
   });
 });

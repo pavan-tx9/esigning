@@ -45,11 +45,17 @@ _DIGESTS: Final[dict[str, Any]] = {"sha256": hashlib.sha256}
 def kms_client(settings: Settings) -> KMSClient:
     """A boto3 KMS client from settings. Credentials come from the environment, never the repo."""
     import boto3  # imported lazily: nothing but the KMS backend needs botocore's import cost
+    from botocore.config import Config
 
     client: KMSClient = boto3.client(
         "kms",
         region_name=settings.seal_kms_region,
         endpoint_url=settings.seal_kms_endpoint_url,
+        config=Config(
+            connect_timeout=3,
+            read_timeout=10,
+            retries={"max_attempts": 3, "mode": "standard"},
+        ),
     )
     return client
 

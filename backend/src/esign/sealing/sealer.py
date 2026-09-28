@@ -48,6 +48,7 @@ from pyhanko.sign.validation import (
 from pyhanko.sign.validation.dss import DocumentSecurityStore
 from pyhanko.sign.validation.errors import NoDSSFoundError, ValidationInfoReadingError
 from pyhanko_certvalidator import ValidationContext
+from pyhanko_certvalidator.fetchers.requests_fetchers import RequestsFetcherBackend
 
 from esign.config import Settings
 from esign.contracts import (
@@ -311,15 +312,20 @@ class PadesSealer:
             )
 
         crls = list(material.dev_pki.crls) if material.dev_pki is not None else []
+        fetching = material.dev_pki is None
+        fetcher = None
+        if fetching:
+            fetcher = RequestsFetcherBackend(per_request_timeout=self._settings.revocation_timeout_seconds)  # type: ignore[no-untyped-call]
         return ValidationContext(
             trust_roots=trust_roots,
             # The dev PKI ships its own CRLs, so nothing needs fetching. A KMS deployment has a
             # real CA whose revocation endpoints must be reachable; failures there surface as
             # SealUnavailable, which is the point.
-            allow_fetching=material.dev_pki is None,
+            allow_fetching=fetching,
             crls=crls,
             revocation_mode="hard-fail",
             moment=None if material.dev_pki is None else self._clock.now(),
+            fetcher_backend=fetcher,
         )
 
     def _signing_trust_roots(self, material: SigningMaterial) -> tuple[asn1_x509.Certificate, ...]:

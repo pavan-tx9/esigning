@@ -13,7 +13,7 @@ import { prefersReducedMotion, useStableCallback } from "@/components/ui";
 import type { PageSize } from "@/lib/geometry";
 import { rectToPercentBox } from "@/lib/geometry";
 import { isSubstantiallyVisible, PagesSeenTracker } from "@/lib/pages-seen";
-import { LETTER_SIZE, type LoadedPdf, type PDFDocumentProxy, pageText } from "@/lib/pdf";
+import { LETTER_SIZE, type LoadedPdf, pageText } from "@/lib/pdf";
 import {
   pagePixels,
   RENDER_AHEAD_PX,
@@ -24,8 +24,8 @@ import {
 import type { SigningField } from "@/lib/signing-api";
 
 export interface DocumentViewerHandle {
-  /** Scroll a page to the top of the region. `focus` moves keyboard focus onto it as well. */
-  goToPage: (page: number, options?: { focus?: boolean }) => void;
+  /** Scroll a page to the top of the region. */
+  goToPage: (page: number) => void;
   /** Scroll whatever sits under the last page (the consent block) into view. */
   goToEnd: () => void;
 }
@@ -38,6 +38,8 @@ export interface DocumentViewerProps {
   fields: SigningField[];
   zoom: number;
   onSeen: (seen: ReadonlySet<number>) => void;
+  /** The consent block under the last page has been on screen. Once true, it stays true. */
+  onReachedEnd?: (reached: boolean) => void;
   onCurrentPage: (page: number) => void;
   onPageFailed: () => void;
   /** What sits in a field's box on the page: the applied mark, once there is one. */
@@ -60,30 +62,19 @@ const GUTTER = 16;
  * stay within a bounded neighbourhood of where the reader is. Each is reported as seen only
  * after it has been drawn and looked at.
  *
+ * The parent keys this on the document so nothing of one revision survives into the next: what
+ * is drawn, what is near, the text for screen readers, the heights, the seen tracker.
+ *
  * The scroll container is this component, not the window: the frame it lives in is a fixed
  * size, so the page can never grow to make the whole document "visible" at once.
  */
-export function DocumentViewer(props: DocumentViewerProps) {
-  // Everything below is per document -- what is drawn, what is near, the text for screen
-  // readers, the heights, the seen tracker -- and a new document (the bytes arriving, or the
-  // document moving on under the signer) must start all of it again. Keying the whole thing on
-  // the document is what guarantees that no state of one revision survives into the next.
-  const serial = useRef(0);
-  const lastDoc = useRef<PDFDocumentProxy | null | undefined>(undefined);
-  const doc = props.pdf?.doc ?? null;
-  if (lastDoc.current !== doc) {
-    lastDoc.current = doc;
-    serial.current += 1;
-  }
-  return <DocumentViewerForDocument key={serial.current} {...props} />;
-}
-
-function DocumentViewerForDocument({
+export function DocumentViewer({
   pdf,
   pageCount,
   fields,
   zoom,
   onSeen,
+  onReachedEnd,
   onCurrentPage,
   onPageFailed,
   fieldContent,
@@ -104,7 +95,9 @@ function DocumentViewerForDocument({
   const heights = useRef(new Map<number, number>());
   const current = useRef(1);
   const reportSeen = useStableCallback(onSeen);
+  const reportEnd = useStableCallback(onReachedEnd ?? (() => {}));
   const reportCurrent = useStableCallback(onCurrentPage);
+  const endReported = useRef(false);
 
   const sizes: PageSize[] = useMemo(
     () => pdf?.pages ?? Array.from({ length: pageCount }, () => LETTER_SIZE),
@@ -112,9 +105,18 @@ function DocumentViewerForDocument({
   );
   const doc = pdf?.doc ?? null;
 
-  // One tracker for the life of this document (the component is keyed on it, above).
-  const tracker = useMemo(() => new PagesSeenTracker((_, seen) => reportSeen(seen)), [reportSeen]);
-  useEffect(() => () => tracker.dispose(), [tracker]);
+  const trackerRef = useRef<PagesSeenTracker | null>(null);
+  if (trackerRef.current === null) {
+    trackerRef.current = new PagesSeenTracker((_, seen) => reportSeen(seen));
+  }
+  const tracker = trackerRef.current;
+  useEffect(
+    () => () => {
+      trackerRef.current?.dispose();
+      trackerRef.current = null;
+    },
+    [],
+  );
   /** Text requests already made, so a page near the screen is not asked for twice. */
   const textRequests = useRef(new Set<number>());
 
@@ -200,6 +202,30 @@ function DocumentViewerForDocument({
     };
   }, [frameWidth, tracker, reportCurrent, scroller]);
 
+  useEffect(() => {
+    if (scroller === null || trailing === undefined) {
+      return;
+    }
+    const node = scroller.querySelector<HTMLElement>("[data-trailing]");
+    if (node === null) {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (endReported.current) {
+          return;
+        }
+        if (entries.some((entry) => entry.isIntersecting)) {
+          endReported.current = true;
+          reportEnd(true);
+        }
+      },
+      { root: scroller, threshold: 0 },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [scroller, trailing, reportEnd]);
+
   // A text rendering of each page for screen readers, fetched once the page is near.
   useEffect(() => {
     if (doc === null) {
@@ -235,13 +261,10 @@ function DocumentViewerForDocument({
   useImperativeHandle(
     ref,
     () => ({
-      goToPage: (page: number, options = {}) => {
+      goToPage: (page: number) => {
         const node = pageNodes.current.get(page);
         if (node !== undefined) {
           scrollTo(node);
-          if (options.focus === true) {
-            node.focus({ preventScroll: true });
-          }
         }
       },
       goToEnd: () => {
@@ -255,14 +278,7 @@ function DocumentViewerForDocument({
   );
 
   const pageWidth = readingWidth(frameWidth, zoom);
-  const first = sizes[0] ?? LETTER_SIZE;
-  const keep = retainedWindow(
-    pagePixels(
-      pageWidth,
-      (pageWidth * first.height) / first.width,
-      typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
-    ),
-  );
+  const devicePixelRatio = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
 
   const onRendered = useCallback(
     (page: number, isRendered: boolean) => {
@@ -304,6 +320,8 @@ function DocumentViewerForDocument({
           {sizes.map((size, index) => {
             const pageNumber = index + 1;
             const pageFields = fields.filter((field) => field.page === pageNumber);
+            const cssHeight = (pageWidth * size.height) / size.width;
+            const keep = retainedWindow(pagePixels(pageWidth, cssHeight, devicePixelRatio));
             const active =
               near.has(pageNumber) ||
               (rendered.has(pageNumber) && shouldRetain(pageNumber, current.current, keep));

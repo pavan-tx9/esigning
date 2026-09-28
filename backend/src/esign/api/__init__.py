@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from esign.api.errors import install_error_handlers
-from esign.api.middleware import AccessLog, BodySizeLimit, SecurityHeaders
+from esign.api.middleware import AccessLog, BodySizeLimit, SecurityHeaders, SigningCors
 from esign.api.ui import install_ui
 from esign.config import Settings
 from esign.db import ping
@@ -60,6 +60,7 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
     # (413 included), and the size limit runs before anything reads a body.
     app.add_middleware(BodySizeLimit, settings=rt.settings)
     app.add_middleware(SecurityHeaders, settings=rt.settings)
+    app.add_middleware(SigningCors)
     app.add_middleware(AccessLog)
     log.info("api.started", app_env=rt.settings.app_env, component="api", ok=ui)
     return app

@@ -34,7 +34,7 @@ def test_a_single_signer_envelope_goes_from_created_to_sealed_and_verifies(ehr: 
     signed = patient.sign(payload, key="sign-once")
     assert signed.status_code == 200, signed.text
     assert signed.json()["signer"]["status"] == "signed"
-    # The response reports the state as of the signature; the inline seal attempt follows it.
+    # The response reports the state as of the signature; the worker seals afterwards.
     assert signed.json()["envelope"]["status"] == "completed_pending_seal"
 
     after = ehr.envelope(envelope["id"])
@@ -196,8 +196,9 @@ def test_a_typed_signature_at_the_configured_bound_is_accepted(ehr: Ehr, world: 
         for f in payload["fields"]
         if f["type"] == "signature"
     ]
-    signed = patient.post(
-        "/sign", {"intent_confirmed": True, "captures": captures}, **{"Idempotency-Key": "typed-at-bound"}
+    signed = patient.apply(
+        {"intent_confirmed": True, "captures": captures},
+        key="typed-at-bound",
     )
     assert signed.status_code == 200, signed.text
     assert ehr.envelope(envelope["id"])["status"] == "sealed"

@@ -57,6 +57,25 @@ describe("has this page actually been displayed?", () => {
     expect(seen).not.toHaveBeenCalled();
   });
 
+  it("starts empty again after dispose, so a new document cannot inherit the last one's pages", () => {
+    const first = vi.fn();
+    const tracker = new PagesSeenTracker(first);
+    tracker.setRendered(1, true);
+    tracker.setVisible(1, true);
+    vi.advanceTimersByTime(DWELL_MS);
+    expect(first).toHaveBeenCalledOnce();
+    tracker.dispose();
+
+    const second = vi.fn();
+    const next = new PagesSeenTracker(second);
+    next.setRendered(1, true);
+    next.setVisible(1, true);
+    vi.advanceTimersByTime(DWELL_MS - 1);
+    expect(second).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(second).toHaveBeenCalledExactlyOnceWith(1, new Set([1]));
+  });
+
   it("treats a zoomed page that fills the screen as visible", () => {
     expect(isSubstantiallyVisible(0.6, 300, 800)).toBe(true);
     expect(isSubstantiallyVisible(0.2, 500, 800)).toBe(true);

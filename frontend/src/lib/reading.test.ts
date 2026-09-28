@@ -38,7 +38,10 @@ describe("describePages", () => {
     expect(describePages([2, 5, 6, 9])).toBe("pages 2, 5 to 6 and 9");
   });
 
-  it("cuts a long list short", () => {
+  it("cuts a long list short, counting leftover pages rather than leftover runs", () => {
+    expect(describePages([])).toBe("no pages");
     expect(describePages([1, 3, 5, 7, 9, 11])).toBe("pages 1, 3, 5 and 3 more");
+    // Five leftover pages across three leftover runs: "N more" is pages, not runs.
+    expect(describePages([1, 3, 5, 7, 8, 9, 11, 13])).toBe("pages 1, 3, 5 and 5 more");
   });
 });

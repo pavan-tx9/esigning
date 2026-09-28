@@ -148,7 +148,12 @@ export function acceptMessage(
  * The live connection to the host page. After `init` is accepted, the origin that sent it is the
  * only one spoken to or listened to for the rest of the session.
  */
-export class ParentChannel {
+export interface HostChannel {
+  accept(event: MessageEvent): InboundMessage | null;
+  post(message: OutboundMessage): void;
+}
+
+export class ParentChannel implements HostChannel {
   private readonly allowed: readonly string[];
   private lockedOrigin: string | null = null;
 

@@ -117,7 +117,7 @@ def test_a_clinician_saves_a_signature_on_one_order_and_uses_it_on_the_next(orde
     signer, payload = clinician_session(ehr, first)
     assert payload["adopted_signature"] is None
     assert ehr.reauth(signer).status_code == 200
-    kept = signer.post("/sign", sign_body(signer, payload, kind="drawn", save=True), **{"Idempotency-Key": "keep-1"})
+    kept = signer.apply(sign_body(signer, payload, kind="drawn", save=True), key="keep-1")
     assert kept.status_code == 200, kept.text
     assert "signature.adopted" in ehr.audit_types(first["id"])
 
@@ -128,10 +128,9 @@ def test_a_clinician_saves_a_signature_on_one_order_and_uses_it_on_the_next(orde
     assert offered is not None and offered["kind"] == "drawn"
     assert offered["image_png_base64"] and offered["typed_text"] is None
     assert ehr.reauth(signer2).status_code == 200
-    applied = signer2.post(
-        "/sign",
+    applied = signer2.apply(
         sign_body(signer2, payload2, captures=adopted_capture(payload2, offered["id"])),
-        **{"Idempotency-Key": "use-1"},
+        key="use-1",
     )
     assert applied.status_code == 200, applied.text
 

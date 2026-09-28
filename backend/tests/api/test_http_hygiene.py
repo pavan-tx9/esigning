@@ -118,6 +118,17 @@ def test_the_signing_ui_is_framed_only_by_the_hosts_origins(
 
     asset = world.client.get("/assets/index-abc.js")
     assert asset.status_code == 200 and "console.log" in asset.text
+    assert asset.headers["cross-origin-resource-policy"] == "same-origin"
+
+    (dist / "esign-sdk.js").write_text("var EsignSdk={};", encoding="utf-8")
+    (dist / "assets" / "pdf.worker.min-test.mjs").write_text("/* worker */", encoding="utf-8")
+    sdk = world.client.get("/esign-sdk.js")
+    assert sdk.status_code == 200 and "EsignSdk" in sdk.text
+    assert sdk.headers["cross-origin-resource-policy"] == "cross-origin"
+    worker = world.client.get("/assets/pdf.worker.min-test.mjs")
+    assert worker.status_code == 200
+    assert worker.headers["cross-origin-resource-policy"] == "cross-origin"
+    assert worker.headers["access-control-allow-origin"] == "*"
 
 
 def test_without_a_built_ui_there_is_no_sign_route(world: World) -> None:

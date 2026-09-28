@@ -20,7 +20,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from esign.api.context import runtime_of
@@ -29,6 +29,17 @@ from esign.api.middleware import ui_csp
 from esign.identity import embedding_origins
 
 __all__ = ["install_ui"]
+
+
+def _library_file(path: Path, media_type: str) -> Response:
+    """The IIFE and its CSS, looked up at request time so a rebuild does not need a restart."""
+    if not path.is_file():
+        return Response(status_code=404)
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 def _origins_for(request: Request) -> tuple[str, ...]:
@@ -60,6 +71,17 @@ def install_ui(app: FastAPI, dist: Path) -> bool:
         meta = f'<meta name="esign-allowed-origins" content="{html.escape(" ".join(origins), quote=True)}">'
         page = page.replace("<head>", f"<head>\n    {meta}", 1) if "<head>" in page else meta + page
         return HTMLResponse(page, headers={"Content-Security-Policy": ui_csp(origins), "Cache-Control": "no-store"})
+
+    @router.get("/esign-sdk.js")
+    def sdk_js() -> Response:
+        return _library_file(dist / "esign-sdk.js", "text/javascript; charset=utf-8")
+
+    @router.get("/esign-sdk.css")
+    def sdk_css() -> Response:
+        css = dist / "esign-sdk.css"
+        if not css.is_file():
+            css = dist / "esign-frontend.css"
+        return _library_file(css, "text/css; charset=utf-8")
 
     app.include_router(router)
     assets = dist / "assets"
