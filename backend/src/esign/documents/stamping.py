@@ -8,11 +8,12 @@ Two rules that are load-bearing rather than cosmetic:
 
 * **Nothing overflows its rectangle.** Text is shrunk, then wrapped, then clipped. A field that
   spills over the sentence next to it changes what the document appears to say.
-* **The caption is not optional.** Every signature and set of initials carries who signed, in what
-  capacity and on whose behalf, when (in the host's display timezone), and the signer id. The time
-  comes from the ``SignerStamp`` the envelope service built from ``Clock``; a ``date_signed`` field
-  is filled from the same value. Neither is ever taken from a capture, so a client cannot backdate
-  a signature.
+* **The caption is opt-in.** With ``SIGNATURE_CAPTION=true``, every signature and set of initials
+  carries who signed, in what capacity and on whose behalf, when (in the host's display timezone),
+  and the signer id. Off (the default), the mark fills its field and the certificate carries those
+  facts. The time comes from the ``SignerStamp`` the envelope service built from ``Clock``; a
+  ``date_signed`` field is filled from the same value. Neither is ever taken from a capture, so a
+  client cannot backdate a signature.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import io
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -177,15 +179,25 @@ def _draw_text_block(
     canvas.restoreState()
 
 
-def _display_when(stamp: SignerStamp) -> str:
-    """The signing instant in the host's timezone, for the caption. The instant itself is UTC."""
+def _local_signed_at(stamp: SignerStamp) -> datetime:
+    """The signing instant in the host's display timezone. The instant itself is UTC."""
     if stamp.signed_at.tzinfo is None:
         raise ValidationFailed("signature time is not timezone-aware", code="stamp_time_naive")
     try:
         zone = ZoneInfo(stamp.display_tz)
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ValidationFailed("signature timezone is unknown", code="stamp_timezone_unknown") from exc
-    local = stamp.signed_at.astimezone(zone)
+    return stamp.signed_at.astimezone(zone)
+
+
+def _display_date(stamp: SignerStamp) -> str:
+    """The signing day in the host's timezone, for a ``date_signed`` field without a caption."""
+    return _local_signed_at(stamp).strftime("%m/%d/%Y")
+
+
+def _display_when(stamp: SignerStamp) -> str:
+    """The signing instant in the host's timezone, for the caption."""
+    local = _local_signed_at(stamp)
     # %-I is not portable; strip a leading zero from a 12-hour clock ourselves.
     hour = local.strftime("%I").lstrip("0") or "12"
     return f"{local.strftime('%m/%d/%Y')} {hour}:{local.strftime('%M %p %Z')}"
@@ -472,7 +484,7 @@ def apply_signer_marks(
         by_page[field.page - 1].append(field)
 
     for page_index, page_fields in sorted(by_page.items()):
-        _draw_marks_page(writer, pages[page_index], page_fields, matched, stamp)
+        _draw_marks_page(writer, pages[page_index], page_fields, matched, stamp, settings.signature_caption)
 
     return sanitized_bytes(writer)
 
@@ -483,17 +495,22 @@ def _draw_marks_page(
     fields: list[FieldDef],
     matched: dict[str, Capture],
     stamp: SignerStamp,
+    show_caption: bool,
 ) -> None:
     def draw(canvas: Canvas) -> None:
         for field in fields:
-            _draw_field(canvas, field, matched.get(field.id), stamp)
+            _draw_field(canvas, field, matched.get(field.id), stamp, show_caption)
 
     draw_overlay(writer, geometry, draw)
 
 
-def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp: SignerStamp) -> None:
+def _draw_field(
+    canvas: Canvas, field: FieldDef, capture: Capture | None, stamp: SignerStamp, show_caption: bool = True
+) -> None:
     if field.type == "date_signed":
-        when = f"Date: {_display_when(stamp)}"
+        # Without the caption the document labels this field itself ("Date of review:"), so it
+        # carries the day alone; the certificate keeps the full instant.
+        when = f"Date: {_display_when(stamp)}" if show_caption else _display_date(stamp)
         _draw_text_block(canvas, field.rect, when, font=PLAIN_FONT, size=min(11.0, field.rect.h * 0.7), multiline=False)
         return
 
@@ -516,16 +533,18 @@ def _draw_field(canvas: Canvas, field: FieldDef, capture: Capture | None, stamp:
         )
         return
 
-    caption = _caption_layout(stamp, field.rect.w)
-    band = _split(field.rect, len(caption))
+    caption = _caption_layout(stamp, field.rect.w) if show_caption else ()
+    band = _split(field.rect, len(caption)) if caption else None
+    mark = band.mark if band else field.rect
     # An ``adopted`` capture (Addendum 1 B) is drawn exactly as the signature it saved: the stored
     # PNG, or the stored text in the script face. Its kind is recorded, not its appearance.
     if capture.kind in ("drawn", "adopted") and capture.image_png:
-        _draw_image(canvas, band.mark, capture.image_png)
+        _draw_image(canvas, mark, capture.image_png)
     elif capture.kind == "typed" or (capture.kind == "adopted" and capture.typed_text):
         text = (capture.typed_text or "").strip()
-        _draw_text_block(canvas, band.mark, text, font=SCRIPT_FONT, size=band.mark.h * 0.9, multiline=False)
+        _draw_text_block(canvas, mark, text, font=SCRIPT_FONT, size=mark.h * 0.9, multiline=False)
     else:  # click-to-sign: the signer's name in the plain face, never the script one
         text = _initials(stamp.display_name) if field.type == "initials" else stamp.display_name
-        _draw_text_block(canvas, band.mark, text, font=PLAIN_FONT, size=band.mark.h * 0.85, multiline=False)
-    _draw_caption(canvas, band.caption, caption)
+        _draw_text_block(canvas, mark, text, font=PLAIN_FONT, size=mark.h * 0.85, multiline=False)
+    if band:
+        _draw_caption(canvas, band.caption, caption)

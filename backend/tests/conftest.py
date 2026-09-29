@@ -192,6 +192,8 @@ def settings(test_database: tuple[URL, URL], tmp_path: Path, blob_dir: Path) -> 
         seal_profile="PAdES-B-T",
         tsa_url="",
         log_level="DEBUG",
+        # Off by default; on here so the caption's own guarantees stay under test.
+        signature_caption=True,
     )
 
 
@@ -206,6 +208,8 @@ def settings_no_db(tmp_path: Path) -> Settings:
         trust_roots_path=tmp_path / "dev-pki" / "trust-roots.pem",
         seal_profile="PAdES-B-T",
         tsa_url="",
+        # Off by default; on here so the caption's own guarantees stay under test.
+        signature_caption=True,
     )
 
 
