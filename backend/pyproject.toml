@@ -14,6 +14,9 @@ dependencies = [
     "python-multipart>=0.0.12",
     "pyhanko>=0.25",
     "pyhanko-certvalidator>=0.26",
+    # pyhanko_certvalidator's requests fetcher (live OCSP/CRL while sealing) imports it, and
+    # pyhanko does not declare it.
+    "requests>=2.31",
     "cryptography>=43",
     "pypdf>=5",
     "reportlab>=4.2",
