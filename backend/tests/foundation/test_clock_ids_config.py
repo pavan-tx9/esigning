@@ -148,6 +148,13 @@ def test_both_spellings_survive_the_environment(monkeypatch: pytest.MonkeyPatch)
     assert json_spelling.trusted_proxy_cidrs == ("10.0.0.0/8", "192.168.0.0/16")
 
 
+def test_the_signature_caption_is_off_unless_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SIGNATURE_CAPTION", raising=False)
+    assert Settings(_env_file=None).signature_caption is False
+    monkeypatch.setenv("SIGNATURE_CAPTION", "true")
+    assert Settings(_env_file=None).signature_caption is True
+
+
 def test_an_unknown_seal_profile_is_refused() -> None:
     with pytest.raises(ValueError, match="seal_profile"):
         Settings(seal_profile="PAdES-B-MAYBE")

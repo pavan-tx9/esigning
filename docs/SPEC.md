@@ -355,7 +355,10 @@ the paper original and the attesting staff member, and the cover page and the ce
   certificate keeps the UTC time. `date_signed` fields are filled by the server from `Clock`,
   never by the client, in the same display format. Signature and initials fields are at least
   80x28pt, so the caption never has to abbreviate the signer id (the link between the mark and
-  the audit trail).
+  the audit trail). The caption is drawn only when `SIGNATURE_CAPTION=true`; unset, the mark
+  fills its field, a `date_signed` field carries the day alone (`MM/DD/YYYY`, no label, no
+  time), and the certificate and audit trail remain the record of who signed, in what capacity,
+  when, and which signer id.
 - A signer role may be declared `required: false` (an optional witness or interpreter); an
   envelope may omit such a role. Every role that is present must sign.
 - Embed fonts. Output must contain no JavaScript, no form fields, no annotations that can be edited.

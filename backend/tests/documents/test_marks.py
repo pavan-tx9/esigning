@@ -17,6 +17,7 @@ from pypdf import PdfReader
 
 from esign.config import Settings
 from esign.contracts import Capture, DocumentService, FieldDef, Rect, SignerStamp, ValidationFailed
+from esign.documents import build_document_service
 from esign.documents.fonts import PLAIN_FONT, SCRIPT_FONT
 from tests.documents.helpers import handwriting_png, make_pdf, placed_images, placed_text
 
@@ -103,6 +104,22 @@ def test_the_caption_says_who_in_what_capacity_when_and_which_signer(
     assert str(stamp.signer_id) in text
 
 
+def test_with_the_caption_off_the_mark_fills_its_field_and_nothing_is_under_it(
+    settings_no_db: Settings, stamp: SignerStamp
+) -> None:
+    documents = build_document_service(settings_no_db.model_copy(update={"signature_caption": False}))
+    out = documents.apply_signer_marks(make_pdf(), [sig_field()], [typed()], stamp)
+    text = PdfReader(io.BytesIO(out)).pages[0].extract_text()
+    assert "Date:" not in text
+    assert str(stamp.signer_id) not in text
+    assert "(self)" not in text
+    marks = [run for run in placed_text(out) if run.text == "Ada Lovelace"]
+    assert marks
+    box = marks[0].box(SCRIPT_FONT)
+    assert box.inside(SIG_RECT)
+    assert box.y0 < SIG_RECT.y + SIG_RECT.h * 0.25, "the mark should use the band the caption no longer needs"
+
+
 def test_on_behalf_of_appears_in_the_caption(documents: DocumentService) -> None:
     guardian = SignerStamp(
         signer_id=UUID(int=9),
@@ -161,6 +178,20 @@ def test_date_signed_comes_from_the_stamp(documents: DocumentService, stamp: Sig
     runs = [run for run in placed_text(out) if "Date: 03/17/2026 2:30 PM UTC" in run.text and "Signer" not in run.text]
     assert runs
     assert runs[0].box(PLAIN_FONT).inside(date_field.rect)
+
+
+def test_without_the_caption_date_signed_is_the_day_alone(settings_no_db: Settings, stamp: SignerStamp) -> None:
+    documents = build_document_service(settings_no_db.model_copy(update={"signature_caption": False}))
+    date_field = FieldDef(
+        id="patient_date", type="date_signed", page=1, rect=Rect(x=360, y=400, w=150, h=18), signer_role="patient"
+    )
+    out = documents.apply_signer_marks(make_pdf(), [sig_field(), date_field], [typed()], stamp)
+    runs = [run for run in placed_text(out) if run.text == "03/17/2026"]
+    assert runs
+    assert runs[0].box(PLAIN_FONT).inside(date_field.rect)
+    text = PdfReader(io.BytesIO(out)).pages[0].extract_text()
+    assert "Date:" not in text
+    assert "PM" not in text
 
 
 def test_a_client_supplied_date_signed_is_refused(documents: DocumentService, stamp: SignerStamp) -> None:
