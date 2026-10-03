@@ -1144,7 +1144,7 @@ class EnvelopeServiceImpl:
         certificate = self._documents.build_certificate(summary)
         signed_pdf = self._blobs.get(db, final_revision_sha)
         body = self._archive_body(envelope, summary, signed_pdf) if envelope.kind == "paper_archive" else signed_pdf
-        final_unsealed = self._documents.finalize(body, certificate)
+        final_unsealed = self._documents.embed_certificate(body, certificate)
         mark = _phase("finalize", mark)
 
         retain_until = self._settings.retain_until(envelope.document_type, now)
@@ -1266,7 +1266,7 @@ class EnvelopeServiceImpl:
         return view
 
     def _archive_body(self, envelope: repo.EnvelopeRow, summary: CertificateSummary, scan: bytes) -> bytes:
-        """Cover page, then the scan (Addendum 1 A). The certificate is appended after both.
+        """Cover page, then the scan (Addendum 1 A). The certificate is embedded after both.
 
         The cover goes *inside* the seal and *before* the scan, so the first thing a reader of the
         sealed PDF sees is what this document is and what the seal does and does not prove. It is

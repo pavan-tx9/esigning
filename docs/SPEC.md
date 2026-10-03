@@ -165,7 +165,7 @@ the state change.
 7. **Finalize and seal**: when the last signer signs, the envelope becomes
    `completed_pending_seal` and a seal job is enqueued. The HTTP response is that stamp
    (`completed_pending_seal`); a `NOTIFY esign_seal` wakes the worker, which builds
-   the certificate of completion from the audit trail, appends it, applies one PAdES certification
+   the certificate of completion from the audit trail, embeds it as a file attachment, applies one PAdES certification
    seal with an RFC 3161 timestamp using the KMS-held key, validates its own output, stores it
    write-once, then marks the envelope `sealed`. The sign press never waits for that work.
 8. **Deliver**: the signer can download the sealed copy from the same session; the host is
@@ -174,10 +174,12 @@ the state change.
    seal, every stored hash, and the audit chain, and record that the check happened.
 
 **Why one seal at the end rather than a signature per signer:** the certificate of completion has
-to be inside the sealed bytes, and appending pages after a PDF signature invalidates it. So each
-signer step produces a hashed, stored, audit-chained revision, and the single final seal covers the
-document plus certificate with DocMDP "no changes permitted". The per-signer evidence is the audit
-chain and the stored revisions, which verification re-hashes.
+to be inside the sealed bytes, and adding anything after a PDF signature invalidates it. The
+certificate is a file attachment (`certificate-of-completion.pdf`), not extra pages, so the pages
+of the sealed file are the pages that were signed. Each signer step produces a hashed, stored,
+audit-chained revision, and the single final seal covers the document plus that attachment with
+DocMDP "no changes permitted". The per-signer evidence is the audit chain and the stored
+revisions, which verification re-hashes.
 
 **Failure rule:** never fail open. If KMS, the timestamp authority or storage is unavailable
 (`SealUnavailable`, `StorageUnavailable`) the envelope stays `completed_pending_seal`,
@@ -217,8 +219,9 @@ to the kind). Its pipeline is steps 1, 7, 8 and 9 with the scan in place of the 
 2. **Seal**: the job builds a one-page cover (`build_archive_cover`: "Scanned copy of a document
    signed on paper", document type, paper signing date, who attested and when, disposition of the
    original, the scan's SHA-256, the envelope id, and what the seal does and does not prove),
-   places it *before* the scan, appends the archive variant of the certificate (the attestation in
-   place of the signer table) and seals the whole thing exactly as for an electronic envelope.
+   places it *before* the scan, embeds the archive variant of the certificate (the attestation in
+   place of the signer table) as a file attachment and seals the whole thing exactly as for an
+   electronic envelope.
    The cover is one page and never overflows it: a filing with more paper signers than the page
    holds prints as many as fit and then "and N more, listed on the certificate of completion",
    which paginates and names every one of them. Nothing else on the cover gives way -- who
@@ -325,8 +328,8 @@ the paper original and the attesting staff member, and the cover page and the ce
   by config. If the dev PKI cannot supply revocation data offline, dev and test may use `B-T`, but
   this must be an explicit `SEAL_PROFILE` setting, never a silent downgrade. The profile actually
   achieved is recorded in the `document.sealed` event. The certificate of completion is inside the
-  sealed bytes, so it is written before the seal exists: it prints the *configured* profile
-  (`CertificateSummary.seal_profile`), labelled as such.
+  sealed bytes, embedded as a file attachment before the seal exists: it prints the *configured*
+  profile (`CertificateSummary.seal_profile`), labelled as such. It is not an extra page.
 - The envelope id is written into the signature dictionary (`/Location = envelope:<id>`), binding
   the seal to the envelope it completes.
 - `SealValidation.ok` is false whenever `problems` is non-empty, whatever the four flags say.
@@ -362,7 +365,9 @@ the paper original and the attesting staff member, and the cover page and the ce
 - A signer role may be declared `required: false` (an optional witness or interpreter); an
   envelope may omit such a role. Every role that is present must sign.
 - Embed fonts. Output must contain no JavaScript, no form fields, no annotations that can be edited.
-- Certificate of completion: envelope id, document type, template key and version, hashes, and per
+- Certificate of completion, a file attachment named `certificate-of-completion.pdf`. The sealed
+  document's pages are the pages that were signed. The attachment carries: envelope id, document
+  type, template key and version, hashes, and per
   signer: name, role, capacity, authentication method, re-authentication method, consent version,
   viewed/consented/signed times, IP, user agent, kiosk details. Section 16 C: where the acceptance
   was recorded against a standing one, the Consented line says so in words -- "09:12 (given for an
@@ -752,7 +757,8 @@ Third round, from the review of the integrated system:
   takes `Settings` and uses `max_typed_signature_chars` / `max_text_field_chars`.
 - **Verification** gained `signer_rows_match_trail`, `captures_match_trail`,
   `capture_images_intact`, `sealed_pages_match_final_revision` and `seal_bound_to_envelope`, and
-  looks for the certificate's head hash on every page rather than the last four.
+  looks for the certificate's head hash in the embedded certificate, on every page of that
+  attachment rather than a fixed tail of the document.
 - **Rate limits**: `RateLimits.PRESENT`, `COPY` and `VERIFY` cover the GETs that append an audit
   event or re-hash a revision (`/signing/session`, `/signing/document`, `/signing/copy`,
   `/envelopes/{id}/verification`).
@@ -1060,6 +1066,14 @@ Addendum 4 (section 17), made once by the architecture step before the four feat
 - **API**: optional `client` on session creation; optional `pages_seen` and `reached_end` on
   `/signing/viewed`; CORS middleware on `/v1/signing/*` only; `X-Esign-Client` required for SDK
   sessions. The sign route no longer attempts the seal inline.
+
+The certificate of completion is embedded, not appended as pages:
+
+- **`contracts.py`**: `CERTIFICATE_OF_COMPLETION_FILENAME`; `DocumentService.embed_certificate`.
+  `finalize` concatenates pages (an archive cover in front of its scan) and no longer attaches
+  the certificate. The sealed file's page count is the signed document's, plus the cover page
+  for a paper archive. The one PAdES certification signature is unchanged and covers the
+  attachment, which is written before the seal.
 
 ## 14. Addendum 1: paper archives, adopted signatures, re-authentication span
 

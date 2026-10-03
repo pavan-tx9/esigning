@@ -8,11 +8,8 @@ drew it once, months ago" is a statement the record supports rather than an assu
 
 from __future__ import annotations
 
-import io
 import re
 from typing import Any
-
-from pypdf import PdfReader
 
 from tests.adopted_signatures.conftest import (
     KIOSK,
@@ -26,6 +23,7 @@ from tests.adopted_signatures.conftest import (
     stored_image_hex,
 )
 from tests.e2e.conftest import Ehr, World
+from tests.pdftext import certificate_text
 
 
 def _signed_event(ehr: Ehr, envelope_id: str) -> dict[str, Any]:
@@ -112,9 +110,7 @@ def test_the_certificate_says_the_signature_was_a_saved_one(ehr: Ehr) -> None:
 
     sealed = ehr.get(f"/envelopes/{envelope['id']}/document")
     assert sealed.status_code == 200, sealed.text
-    text = re.sub(
-        r"\s+", " ", "".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(sealed.content)).pages)
-    )
+    text = re.sub(r"\s+", " ", certificate_text(sealed.content))
     day = str(saved["created_at"])[:10]
     assert f"signed with a saved signature adopted on {day}" in text
 

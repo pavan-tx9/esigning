@@ -12,17 +12,16 @@ this envelope's own hash chain cannot contradict.
 
 from __future__ import annotations
 
-import io
 import re
 from typing import Any
 
 import pytest
-from pypdf import PdfReader
 from sqlalchemy import Engine, text
 
 from esign.clock import FixedClock
 from tests.consent_span.conftest import SITTING_SECONDS, Sitting, SittingFactory, agree, review
 from tests.consent_span.test_sitting import first_form
+from tests.pdftext import certificate_text as embedded_certificate_text
 
 #: How long after the first form the second one is agreed to.
 LATER_SECONDS = 180
@@ -31,8 +30,7 @@ LATER_SECONDS = 180
 def certificate_text(s: Sitting, envelope_id: str) -> str:
     response = s.ehr.get(f"/envelopes/{envelope_id}/document")
     assert response.status_code == 200, response.text
-    pages = PdfReader(io.BytesIO(response.content)).pages
-    return re.sub(r"\s+", " ", "\n".join(page.extract_text() or "" for page in pages))
+    return re.sub(r"\s+", " ", embedded_certificate_text(response.content))
 
 
 def failed_checks(report: dict[str, Any]) -> dict[str, str]:

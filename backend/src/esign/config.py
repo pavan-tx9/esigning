@@ -133,8 +133,9 @@ class Settings(BaseSettings):
     #: not set one of its own. Validated against the zoneinfo database.
     default_display_timezone: str = "UTC"
     #: Whether signature and initials marks carry the caption (who, capacity, date, signer id)
-    #: under them. Off (the default), the mark fills its field; the same facts stay on the
-    #: certificate page and in the audit trail. Set it true to print the caption on the document.
+    #: under them. Off (the default), the mark fills its field; the same facts stay in the
+    #: embedded certificate of completion and in the audit trail. Set it true to print the
+    #: caption on the document.
     signature_caption: bool = False
     #: Addendum 4. Per-request timeout for live revocation fetches (OCSP/CRL) while sealing.
     revocation_timeout_seconds: float = 10.0

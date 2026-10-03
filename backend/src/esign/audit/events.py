@@ -367,7 +367,7 @@ class EnvelopeCompletedData(EventData):
 
 
 class DocumentFinalizedData(EventData):
-    """The certificate of completion has been appended; these are the bytes about to be sealed."""
+    """The certificate of completion has been embedded; these are the bytes about to be sealed."""
 
     certificate_sha256: Sha256
     page_count: Ordinal

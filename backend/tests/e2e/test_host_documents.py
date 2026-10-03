@@ -22,6 +22,7 @@ from sqlalchemy import text
 from esign.storage import content_key
 from tests.documents.helpers import NamedWidget, generated_report
 from tests.e2e.conftest import CLINICIAN_NAME, Ehr, World
+from tests.pdftext import document_text
 
 #: The addendum's case: 20 to 30 pages of generated clinical text, a signature block on the last.
 REPORT_PAGES = 30
@@ -71,7 +72,7 @@ def _cosigned_body(ehr: Ehr) -> dict[str, Any]:
 
 
 def _sealed_text(pdf: bytes) -> str:
-    return re.sub(r"\s+", " ", " ".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf)).pages))
+    return re.sub(r"\s+", " ", document_text(pdf))
 
 
 # --------------------------------------------------------------------------- the whole story
@@ -155,8 +156,8 @@ def test_a_thirty_page_report_is_signed_by_a_clinician_who_re_authenticates(ehr:
     assert [(str(r.kind), r.page_count) for r in revisions] == [
         ("supplied", REPORT_PAGES),
         ("signer_applied", REPORT_PAGES),
-        ("final_unsealed", REPORT_PAGES + 1),
-        ("sealed", REPORT_PAGES + 1),
+        ("final_unsealed", REPORT_PAGES),
+        ("sealed", REPORT_PAGES),
     ]
 
     report = ehr.verification(envelope["id"])

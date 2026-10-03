@@ -416,7 +416,7 @@ class CertificateSummary:
     template_version: int | None
     seal_profile: SealProfile  # the *configured* profile; the one achieved is in document.sealed
     presented_sha256: bytes
-    final_revision_sha256: bytes  # last signer-applied revision, before the certificate is appended
+    final_revision_sha256: bytes  # last signer-applied revision, before the certificate is embedded
     created_at: datetime
     completed_at: datetime
     signers: tuple[CertificateSigner, ...]
@@ -453,6 +453,11 @@ class ArchiveCoverSummary:
     attested_at: datetime
     scan_sha256: bytes
     scan_page_count: int
+
+
+#: Filename of the certificate of completion inside the sealed PDF. A file attachment, not a page.
+#: Verification reads this name back out of the sealed bytes.
+CERTIFICATE_OF_COMPLETION_FILENAME: Final[str] = "certificate-of-completion.pdf"
 
 
 class DocumentService(Protocol):
@@ -573,16 +578,24 @@ class DocumentService(Protocol):
         envelope id, and that the seal proves the scan has not changed since it was filed and who
         filed it -- not that the ink signature is genuine. Embedded fonts, no form fields, no
         scripts, like every other page this service produces. The envelope service composes the
-        archive with ``finalize``: ``finalize(cover, scan)`` puts the cover first, and
-        ``finalize(that, certificate)`` produces the bytes to be sealed."""
+        archive with ``finalize(cover, scan)`` (cover page, then the scan) and then
+        ``embed_certificate`` on that result."""
 
     def page_count(self, pdf: bytes) -> int:
         """Pages in a PDF this service produced. Raises ValidationFailed if it cannot be read."""
 
-    def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
-        """Append the certificate pages and return the exact bytes to be sealed. The second
-        argument is any PDF this service accepted (``build_archive_cover`` says how an archive
-        is composed from the cover, the scan and the certificate with two calls)."""
+    def finalize(self, pdf: bytes, following_pdf: bytes) -> bytes:
+        """Append ``following_pdf``'s pages and return the bytes. Used to put an archive cover
+        in front of its scan. The certificate of completion is not a page of this result:
+        :meth:`embed_certificate` attaches it."""
+
+    def embed_certificate(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
+        """Attach the certificate of completion and return the exact bytes to be sealed.
+
+        The page count is unchanged. The certificate is a file attachment named
+        :data:`CERTIFICATE_OF_COMPLETION_FILENAME`, added after the document has been sanitised,
+        so the one PAdES seal covers it and a reader of the pages sees the document that was
+        signed. ``certificate_pdf`` is this service's own ``build_certificate`` output."""
 
 
 # --------------------------------------------------------------------------- sealing (esign.sealing)

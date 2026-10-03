@@ -9,7 +9,7 @@
 * the seal is validated against the *configured* trust roots (never the embedded certificates),
   and the certificate that signed is compared with the one recorded when it was sealed;
 * the head hash the certificate of completion recorded is compared with the chain as it stands,
-  and looked for in the text of the sealed certificate page.
+  and looked for in the text of the certificate embedded in the sealed PDF.
 
 Then it records ``verification.performed``, so the fact that someone checked -- and what they
 found -- is itself part of the trail.
@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 from esign.audit.canonical import archive_attested_detail_digest, host_document_roles_digest
 from esign.config import CONSENT_SPAN_MAX_SECONDS, REAUTH_SPAN_MAX_SECONDS
 from esign.contracts import (
+    CERTIFICATE_OF_COMPLETION_FILENAME,
     Actor,
     AuditEvent,
     AuditLog,
@@ -1032,12 +1033,12 @@ class Verifier:
     ) -> None:
         """The pages inside the seal are the pages of the last signer-applied revision.
 
-        ``finalize`` rebuilds the document with pypdf rather than appending the certificate as an
-        incremental update, so ``final_unsealed`` does not *contain* revision N's bytes. A verifier
-        could prove the seal covers ``final_unsealed`` and that revision N re-hashes, but not that
-        the pages inside the seal are revision N's pages -- the only link was the trail's word for
-        it. This recomputes the link: same page count plus the certificate's, and the same content
-        streams and page boxes for the leading pages.
+        ``embed_certificate`` rebuilds the document with pypdf, so ``final_unsealed`` does not
+        *contain* revision N's bytes. A verifier could prove the seal covers ``final_unsealed`` and
+        that revision N re-hashes, but not that the pages inside the seal are revision N's pages --
+        the only link was the trail's word for it. This recomputes the link: the same page count,
+        and the same content streams and page boxes. The certificate is a file attachment, so it
+        is not an extra page.
 
         Addendum 1 A: a paper archive's last revision is the scan, and the sealed document puts
         the cover page in front of it, so the comparison starts one page in. That offset is what
@@ -1064,10 +1065,11 @@ class Verifier:
         except Exception:
             run.failed("sealed_pages_match_final_revision", "a revision's pages could not be read")
             return
-        if len(target) < len(source) + offset:
+        expected = len(source) + offset
+        if len(target) != expected:
             run.failed(
                 "sealed_pages_match_final_revision",
-                f"the finalized document has {len(target)} pages, fewer than the {len(source)} that were signed",
+                f"the finalized document has {len(target)} pages; the signed revision has {len(source)}",
             )
             return
         problems = [
@@ -1170,21 +1172,17 @@ class Verifier:
             run.failed("certificate_head_hash_in_document", "the sealed document could not be read")
             return
         try:
-            reader = PdfReader(io.BytesIO(sealed_pdf))
-            # Every page, not a guess at how long the certificate is. ``build_certificate``
-            # paginates freely -- ten signers with long role labels already run to five pages --
-            # and the head hash is printed in the "Audit trail" section near the *top* of the
-            # certificate's first page. Searching a fixed tail failed genuine documents, which is
-            # the worst possible answer from a verifier: an append-only ``verification.performed``
-            # recording ``ok: false`` for a sound seal. ``max_template_pages`` bounds the work.
-            printed = re.sub(r"\s+", "", "".join(page.extract_text() or "" for page in reader.pages)).lower()
+            printed = _embedded_certificate_text(sealed_pdf)
         except Exception:
-            run.failed("certificate_head_hash_in_document", "the sealed document's text could not be read")
+            run.failed(
+                "certificate_head_hash_in_document",
+                "the embedded certificate of completion could not be read",
+            )
             return
         run.expect(
             "certificate_head_hash_in_document",
             bool(head) and head in printed,
-            "the head hash in the trail is not the one printed on the sealed certificate page",
+            "the head hash in the trail is not the one printed in the embedded certificate",
         )
 
 
@@ -1280,10 +1278,25 @@ def _uuid(value: Any) -> UUID | None:
         return None
 
 
+def _embedded_certificate_text(pdf: bytes) -> str:
+    """The text of the certificate of completion attached to ``pdf``, whitespace removed.
+
+    ``build_certificate`` paginates freely -- ten signers with long role labels already run to
+    five pages -- and the head hash is printed near the top of the certificate's first page.
+    The attachment is that whole PDF, so every one of its pages is read.
+    """
+    reader = PdfReader(io.BytesIO(pdf))
+    payloads = list(reader.attachments.get(CERTIFICATE_OF_COMPLETION_FILENAME) or [])
+    if len(payloads) != 1:
+        raise ValueError("the sealed PDF does not carry exactly one certificate of completion")
+    certificate = PdfReader(io.BytesIO(payloads[0]))
+    return re.sub(r"\s+", "", "".join(page.extract_text() or "" for page in certificate.pages)).lower()
+
+
 def _same_page(before: Any, after: Any) -> bool:
     """Whether two pages draw the same thing in the same place.
 
-    The content stream is compared decoded, because ``finalize`` re-writes the file and may choose a
+    The content stream is compared decoded, because ``embed_certificate`` re-writes the file and may choose a
     different compression; the boxes and rotation are compared because the same ink at a different
     offset is a different page; and the resources the stream *names* are compared because that is
     where a signature actually lives. A drawn signature is an image XObject invoked by name

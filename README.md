@@ -59,8 +59,9 @@ change without its event, or an event without its change, cannot exist.
 Two decisions worth knowing before you read further:
 
 - **One seal at the end, not one per signer.** The certificate of completion has to be inside the
-  sealed bytes, and appending pages after a PDF signature breaks it. Each signer's step produces a
-  hashed, stored, audit-chained revision; the final seal covers document plus certificate.
+  sealed bytes, and adding anything after a PDF signature breaks it. It is embedded as a file
+  attachment, so the sealed file's pages are the pages that were signed. Each signer's step
+  produces a hashed, stored, audit-chained revision; the final seal covers document plus certificate.
 - **Never fail open.** If KMS, the timestamp authority or storage is down, the envelope stays
   `completed_pending_seal`, the failure is recorded, the job retries with backoff, and nothing
   reports the document as complete.

@@ -56,8 +56,8 @@ words, and so does the certificate.
   **before** the scan, stating: "Scanned copy of a document signed on paper", document type, paper
   signing date, who attested and when, disposition of the original, the scan's SHA-256, the envelope
   id, and the sentence about what the seal does and does not prove. Then the existing certificate of
-  completion (with an archive variant: no signer table, the attestation instead) is appended after
-  the scan as today, and the whole thing is sealed. `CertificateSummary` gains `kind` and an
+  completion (with an archive variant: no signer table, the attestation instead) is embedded in the
+  sealed PDF as a file attachment, and the whole thing is sealed. `CertificateSummary` gains `kind` and an
   optional `attestation` block.
 
 ### Frontend

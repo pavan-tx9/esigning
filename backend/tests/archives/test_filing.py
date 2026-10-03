@@ -29,13 +29,13 @@ from tests.archives.conftest import (
     scan_pdf,
 )
 from tests.e2e.conftest import Ehr, World
+from tests.pdftext import certificate_text, document_text
 
 
 def _sealed_text(host: Ehr, envelope_id: str) -> str:
     response = host.get(f"/envelopes/{envelope_id}/document")
     assert response.status_code == 200, response.text
-    reader = PdfReader(io.BytesIO(response.content))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return document_text(response.content)
 
 
 def test_a_filed_scan_is_sealed_and_verifies(host: Ehr) -> None:
@@ -131,7 +131,7 @@ def test_the_scan_is_stored_write_once_as_revision_one(host: Ehr, world: World) 
     assert bytes(revisions[0].sha256).hex() == view["presented_sha256"]
     assert blob_kind == "scan_pdf"
     # Addendum 2 persists the page count as each revision is written, so nothing re-parses a PDF
-    # to count it later. The scan is two pages; the cover sheet and the certificate are the rest.
+    # to count it later. The scan is two pages; the cover is the extra page on the sealed file.
     assert revisions[0].page_count == 2
     assert all(r.page_count is not None for r in revisions)
 
@@ -148,8 +148,9 @@ def test_the_sealed_document_is_cover_then_scan_then_certificate(host: Ehr) -> N
     assert "Scanned copy of a document signed on paper" in pages[0]
     assert "Procedure consent -- page 1" in pages[1]
     assert "Procedure consent -- page 3" in pages[3]
-    assert "Certificate of completion" in pages[4]
-    assert len(pages) >= 5  # cover, three scanned pages, and the certificate
+    assert len(pages) == 4  # cover, then the three scanned pages
+    assert "Certificate of completion" not in "\n".join(pages)
+    assert "Certificate of completion" in certificate_text(response.content)
 
 
 def test_the_cover_says_what_the_seal_does_and_does_not_prove(host: Ehr) -> None:

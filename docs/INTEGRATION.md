@@ -530,7 +530,7 @@ exactly as for the last signature, `envelope.sealed` fires when it lands, and `/
 `/audit`, `/verification` and `/void` work as for any envelope. (`expires_at` is filled in for
 every envelope; an archive never expires — it is complete the moment it is filed.)
 
-The sealed PDF is **cover page, scan, certificate of completion**, in that order, under one seal.
+The sealed PDF is **cover page, then the scan**, under one seal, with the certificate of completion embedded as the file `certificate-of-completion.pdf`.
 The cover states what it is, the document type, the paper signing date, the number of pages
 scanned, the envelope id, who signed on paper, who attested and when, what became of the original,
 the scan's SHA-256, and, in these words:
