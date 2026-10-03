@@ -8,7 +8,7 @@ keyword arguments, and then two things are asserted:
    silently thrown away *or* silently let through; and
 2. no captured value, rendered, contains a name, a prefill value, a typed signature or PDF bytes.
 
-The run underneath is the real pipeline: inspect, prepare, sanitize, sign, certificate, finalize.
+The run underneath is the real pipeline: inspect, prepare, sanitize, sign, certificate, embed.
 """
 
 from __future__ import annotations
@@ -166,7 +166,7 @@ def run_the_pipeline(documents: DocumentService) -> None:
     assert typed_signed != signed
 
     certificate = documents.build_certificate(certificate_summary())
-    documents.finalize(signed, certificate)
+    documents.embed_certificate(signed, certificate)
 
 
 def test_the_module_logs_nothing_the_allowlist_would_drop(

@@ -11,13 +11,11 @@ that is never offered what the patient saved; a host that takes a saved signatur
 
 from __future__ import annotations
 
-import io
 import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from pypdf import PdfReader
 from sqlalchemy import Engine
 
 from esign.clock import FixedClock
@@ -26,6 +24,7 @@ from esign.storage import content_key
 from tests.adopted_signatures.conftest import adopted_capture, sign_body
 from tests.archives.conftest import filed, scan_pdf
 from tests.e2e.conftest import Ehr, Sessions, Signer, World, build_world
+from tests.pdftext import document_text
 
 #: The demo's queue configuration: both windows five minutes, so the span is what lapses.
 QUEUE_SPAN_SECONDS = 300
@@ -35,7 +34,7 @@ CLINICIAN = "dr-0311"
 
 
 def pdf_text(pdf: bytes) -> str:
-    return "".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf)).pages)
+    return document_text(pdf)
 
 
 def signed_event(ehr: Ehr, envelope_id: str) -> dict[str, Any]:

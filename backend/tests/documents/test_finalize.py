@@ -1,7 +1,9 @@
-"""``finalize``: the exact bytes that go under the seal.
+"""The bytes that go under the seal.
 
-Nothing after this point can be corrected -- appending to a sealed PDF invalidates the seal -- so
-this is the last place anything can be caught.
+Nothing after this point can be corrected -- adding to a sealed PDF invalidates the seal -- so
+this is the last place anything can be caught. ``finalize`` concatenates pages (an archive cover
+in front of its scan). ``embed_certificate`` attaches the certificate of completion without
+adding a page.
 """
 
 from __future__ import annotations
@@ -11,9 +13,18 @@ import io
 import pytest
 from pypdf import PdfReader
 
-from esign.contracts import Capture, DocumentService, FieldDef, Rect, SignerStamp, ValidationFailed
+from esign.contracts import (
+    CERTIFICATE_OF_COMPLETION_FILENAME,
+    Capture,
+    DocumentService,
+    FieldDef,
+    Rect,
+    SignerStamp,
+    ValidationFailed,
+)
 from tests.documents.conftest import certificate_summary
 from tests.documents.helpers import make_pdf, pdf_with_javascript, pdf_with_widget_annotation
+from tests.pdftext import certificate_text
 
 
 def signed_revision(documents: DocumentService, stamp: SignerStamp, pages: int = 2) -> bytes:
@@ -28,30 +39,44 @@ def signed_revision(documents: DocumentService, stamp: SignerStamp, pages: int =
     return documents.apply_signer_marks(make_pdf(pages=pages), [field], [capture], stamp)
 
 
-def test_the_certificate_pages_are_appended_after_the_document(documents: DocumentService, stamp: SignerStamp) -> None:
+def test_the_certificate_is_embedded_and_adds_no_page(documents: DocumentService, stamp: SignerStamp) -> None:
     body = signed_revision(documents, stamp, pages=3)
     certificate = documents.build_certificate(certificate_summary())
-    final = documents.finalize(body, certificate)
+    final = documents.embed_certificate(body, certificate)
 
     reader = PdfReader(io.BytesIO(final))
-    body_pages = len(PdfReader(io.BytesIO(body)).pages)
-    cert_pages = len(PdfReader(io.BytesIO(certificate)).pages)
-    assert len(reader.pages) == body_pages + cert_pages
+    assert len(reader.pages) == len(PdfReader(io.BytesIO(body)).pages)
     assert "Ada Lovelace" in reader.pages[0].extract_text()
-    assert "Certificate of completion" in reader.pages[body_pages].extract_text()
+    assert "Certificate of completion" not in "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert "Certificate of completion" in certificate_text(final)
+    attached = reader.attachments[CERTIFICATE_OF_COMPLETION_FILENAME]
+    assert len(attached) == 1
+    assert attached[0].startswith(b"%PDF")
 
 
-def test_the_signed_content_survives_finalisation(documents: DocumentService, stamp: SignerStamp) -> None:
+def test_concatenating_pages_still_appends_them(documents: DocumentService, stamp: SignerStamp) -> None:
+    """An archive is cover, then scan: that composition is pages, and the certificate is not."""
+    cover = signed_revision(documents, stamp, pages=1)
+    scan = make_pdf(pages=2)
+    combined = documents.finalize(cover, scan)
+    reader = PdfReader(io.BytesIO(combined))
+    assert len(reader.pages) == 3
+    assert CERTIFICATE_OF_COMPLETION_FILENAME not in reader.attachments
+
+
+def test_the_signed_content_survives_embedding(documents: DocumentService, stamp: SignerStamp) -> None:
     body = signed_revision(documents, stamp)
-    final = documents.finalize(body, documents.build_certificate(certificate_summary()))
+    final = documents.embed_certificate(body, documents.build_certificate(certificate_summary()))
     text = PdfReader(io.BytesIO(final)).pages[0].extract_text()
     assert "Ada Lovelace (self)" in text
     assert str(stamp.signer_id) in text
 
 
-def test_finalisation_strips_anything_interactive_that_slipped_through(documents: DocumentService) -> None:
+def test_embedding_strips_anything_interactive_that_slipped_through(documents: DocumentService) -> None:
     """Both inputs are our own output, but a form inside a seal is permanent, so it is re-checked."""
-    final = documents.finalize(pdf_with_widget_annotation(), documents.build_certificate(certificate_summary()))
+    final = documents.embed_certificate(
+        pdf_with_widget_annotation(), documents.build_certificate(certificate_summary())
+    )
     reader = PdfReader(io.BytesIO(final))
     assert "/AcroForm" not in reader.root_object
     for page in reader.pages:
@@ -59,30 +84,34 @@ def test_finalisation_strips_anything_interactive_that_slipped_through(documents
 
 
 def test_a_document_carrying_javascript_is_stripped_before_sealing(documents: DocumentService) -> None:
-    final = documents.finalize(pdf_with_javascript(), documents.build_certificate(certificate_summary()))
+    final = documents.embed_certificate(pdf_with_javascript(), documents.build_certificate(certificate_summary()))
     root = PdfReader(io.BytesIO(final)).root_object
-    assert "/Names" not in root
+    names = root["/Names"].get_object()
+    assert "/JavaScript" not in names
+    assert "/EmbeddedFiles" in names
     assert "/OpenAction" not in root
 
 
-def test_finalisation_is_deterministic(documents: DocumentService, stamp: SignerStamp) -> None:
+def test_embedding_is_deterministic(documents: DocumentService, stamp: SignerStamp) -> None:
     body = signed_revision(documents, stamp)
     certificate = documents.build_certificate(certificate_summary())
-    assert documents.finalize(body, certificate) == documents.finalize(body, certificate)
+    assert documents.embed_certificate(body, certificate) == documents.embed_certificate(body, certificate)
 
 
 @pytest.mark.parametrize("bad", [b"", b"not a pdf"])
 def test_unreadable_input_is_refused(documents: DocumentService, stamp: SignerStamp, bad: bytes) -> None:
     certificate = documents.build_certificate(certificate_summary())
     with pytest.raises(ValidationFailed):
-        documents.finalize(bad, certificate)
+        documents.embed_certificate(bad, certificate)
     with pytest.raises(ValidationFailed):
-        documents.finalize(signed_revision(documents, stamp), bad)
+        documents.embed_certificate(signed_revision(documents, stamp), bad)
 
 
 def test_no_stale_metadata_reaches_the_sealed_bytes(documents: DocumentService, stamp: SignerStamp) -> None:
     """The template's own /Info and XMP are the host's, not ours, and could be stale or wrong."""
-    final = documents.finalize(signed_revision(documents, stamp), documents.build_certificate(certificate_summary()))
+    final = documents.embed_certificate(
+        signed_revision(documents, stamp), documents.build_certificate(certificate_summary())
+    )
     reader = PdfReader(io.BytesIO(final))
     assert "/Metadata" not in reader.root_object
     info = reader.metadata

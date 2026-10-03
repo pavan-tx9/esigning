@@ -617,8 +617,12 @@ class FakeDocumentService:
         base = self.pages if header is None else int(header.get("pages", "0"))
         return base + (1 if b"% certificate" in pdf else 0)
 
-    def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
-        return pdf + b"\n% certificate\n" + certificate_pdf
+    def finalize(self, pdf: bytes, following_pdf: bytes) -> bytes:
+        return pdf + b"\n% certificate\n" + following_pdf
+
+    def embed_certificate(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
+        # Inside the sealed bytes, and not an extra page: ``page_count`` keys off ``% certificate``.
+        return pdf + b"\n% embedded-certificate\n" + certificate_pdf
 
 
 # --------------------------------------------------------------------------- sealing

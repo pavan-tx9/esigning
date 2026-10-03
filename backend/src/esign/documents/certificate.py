@@ -1,7 +1,8 @@
 """The certificate of completion.
 
-This is the page a court reads. It has to stand alone: someone holding only the sealed PDF, with
-no access to this system, must be able to see who signed, in what capacity, how they were
+This is the PDF a court reads. It is embedded in the sealed file as an attachment, not added as
+pages, and it has to stand alone: someone holding only the sealed PDF, with no access to this
+system, must be able to open that attachment and see who signed, in what capacity, how they were
 authenticated, what they consented to, when each step happened, what the document hashed to at
 each stage, and how to check all of that for themselves.
 
@@ -10,7 +11,7 @@ It is built from :class:`~esign.contracts.CertificateSummary` and from nothing e
 display names are on it deliberately -- a signature nobody can attribute is not evidence -- and
 they are the only personal data present.
 
-The certificate is built *before* sealing, because appending pages after a PDF signature would
+The certificate is embedded *before* sealing, because adding anything after a PDF signature would
 invalidate it (SPEC section 3, step 7). So the seal profile it prints is the configured one, and
 the profile actually achieved is recorded in the ``document.sealed`` audit event. See the contract
 note in the module report.

@@ -232,6 +232,38 @@ def test_reasons_that_would_misrepresent_the_document_are_refused(sealer: Sealer
         sealer.seal(pdf, reason=reason, envelope_id=uuid4())
 
 
+def test_an_embedded_certificate_stays_inside_the_one_seal(dev_pki: Pki, clock: FixedClock) -> None:
+    """The certificate is a file attachment. The seal is still one certification signature over it."""
+    from pypdf import PdfReader
+
+    from esign.contracts import CERTIFICATE_OF_COMPLETION_FILENAME
+    from esign.documents import build_document_service
+    from tests.documents.conftest import certificate_summary
+    from tests.pdftext import certificate_text
+
+    settings = make_settings(dev_pki)
+    documents = build_document_service(settings)
+    body = make_pdf(pages=2, text="the signed document")
+    final = documents.embed_certificate(body, documents.build_certificate(certificate_summary()))
+    assert len(PdfReader(io.BytesIO(final)).pages) == 2
+
+    sealer = build_sealer(settings, clock)
+    result = sealer.seal(final, reason="Envelope completed", envelope_id=uuid4())
+    report = sealer.validate(result.sealed_pdf)
+    assert report.ok is True, report.problems
+
+    sealed = PdfReader(io.BytesIO(result.sealed_pdf))
+    assert len(sealed.pages) == 2
+    assert "Certificate of completion" not in "".join(page.extract_text() or "" for page in sealed.pages)
+    assert len(sealed.attachments[CERTIFICATE_OF_COMPLETION_FILENAME]) == 1
+    assert "Certificate of completion" in certificate_text(result.sealed_pdf)
+
+    reader = PdfFileReader(io.BytesIO(result.sealed_pdf))
+    assert len(reader.embedded_regular_signatures) == 1
+    certification = read_certification_data(reader)
+    assert certification is not None and certification.permission == MDPPerm.NO_CHANGES
+
+
 def test_development_on_the_local_key_still_gets_the_in_process_authority(dev_pki: Pki, clock: FixedClock) -> None:
     """The allowance that remains: ``APP_ENV=dev`` on the dev PKI's own key, offline."""
     sealer = build_sealer(make_settings(dev_pki, app_env="dev", tsa_url=""), clock)

@@ -2,22 +2,22 @@
 
 The span weakens per-document proof, so the containment has to be visible in the two places a
 dispute actually reaches: the certificate of completion inside the sealed bytes, and the
-verification report. A signature that borrowed an attestation says so on the page a court reads,
-and verification goes back to the ``reauth_attestations`` row to confirm the trail's account of it.
+verification report. A signature that borrowed an attestation says so in the embedded certificate
+a court opens, and verification goes back to the ``reauth_attestations`` row to confirm the
+trail's account of it.
 """
 
 from __future__ import annotations
 
-import io
 import re
 from typing import Any
 
 import pytest
-from pypdf import PdfReader
 from sqlalchemy import Engine, text
 
 from esign.clock import FixedClock
 from esign.config import REAUTH_SPAN_MAX_SECONDS, Settings
+from tests.pdftext import certificate_text as embedded_certificate_text
 from tests.reauth_span.conftest import DEMO_SPAN_SECONDS, Queue, QueueFactory
 from tests.reauth_span.test_signing_queue import envelope_for, first_document, signed_data
 
@@ -51,8 +51,7 @@ def a_queue_of_two(q: Queue, clock: FixedClock) -> tuple[dict[str, Any], dict[st
 def certificate_text(q: Queue, envelope_id: str) -> str:
     response = q.ehr.get(f"/envelopes/{envelope_id}/document")
     assert response.status_code == 200, response.text
-    pages = PdfReader(io.BytesIO(response.content)).pages
-    return re.sub(r"\s+", " ", "\n".join(page.extract_text() or "" for page in pages))
+    return re.sub(r"\s+", " ", embedded_certificate_text(response.content))
 
 
 def failed_checks(report: dict[str, Any]) -> dict[str, str]:

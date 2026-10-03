@@ -11,8 +11,11 @@ a display name, a typed signature or PDF bytes. See ``esign.logging``.
 
 from __future__ import annotations
 
+from pypdf import PdfWriter
+
 from esign.config import Settings
 from esign.contracts import (
+    CERTIFICATE_OF_COMPLETION_FILENAME,
     ArchiveCoverSummary,
     Capture,
     CertificateSummary,
@@ -29,12 +32,24 @@ from esign.documents import certificate as certificate_module
 from esign.documents import definitions as definitions_module
 from esign.documents import images, inspection, stamping, supplied
 from esign.documents.fonts import ensure_fonts_registered
-from esign.documents.pdfutil import open_reader, sanitized_bytes, writer_from_bytes
+from esign.documents.pdfutil import open_reader, sanitize_document, sanitized_bytes, to_bytes, writer_from_bytes
 from esign.logging import get_logger
 
 __all__ = ["PdfDocumentService"]
 
 log = get_logger(__name__)
+
+
+def _sanitized_writer(writer: PdfWriter) -> PdfWriter:
+    """The writer ``sanitized_bytes`` would write, still open so a file can be attached.
+
+    ``sanitize_document`` removes ``/Names``. An attachment added before this step would be
+    deleted with it, so callers attach afterwards and write with ``to_bytes`` directly.
+    """
+    sanitize_document(writer)
+    reborn = writer_from_bytes(to_bytes(writer))
+    sanitize_document(reborn, flatten_annotations=False)
+    return reborn
 
 
 def _recoded(code: str, kind: str) -> str:
@@ -198,23 +213,38 @@ class PdfDocumentService:
         """Pages in a PDF this service produced (a prepared, stamped or finalized revision)."""
         return len(open_reader(pdf).pages)
 
-    def finalize(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
-        """Append the certificate pages and return the exact bytes to be sealed.
+    def finalize(self, pdf: bytes, following_pdf: bytes) -> bytes:
+        """Append ``following_pdf``'s pages. An archive cover goes in front of its scan this way.
 
-        Both inputs are this service's own output, but they are re-checked anyway: a
-        ``finalize`` that quietly accepted a document with a form or a script would put one inside
-        the seal, where it is permanent.
+        Both inputs are re-checked: a concatenation that quietly accepted a form or a script
+        would put one inside the seal, where it is permanent.
         """
         writer = writer_from_bytes(pdf)
-        certificate_writer = writer_from_bytes(certificate_pdf)
-        if not certificate_writer.pages:  # pragma: no cover - writer_from_bytes already refuses
-            raise ValidationFailed("certificate has no pages", code="certificate_empty")
-        for page in certificate_writer.pages:
+        following = writer_from_bytes(following_pdf)
+        for page in following.pages:
             writer.add_page(page)
         out = sanitized_bytes(writer)
         log.info(
             "documents.finalized",
             page_count=len(writer.pages),
+            size_bytes=len(out),
+        )
+        return out
+
+    def embed_certificate(self, pdf: bytes, certificate_pdf: bytes) -> bytes:
+        """Attach the certificate and return the exact bytes to be sealed.
+
+        Sanitizing deletes ``/Names``, which is where a file attachment lives, so the attachment
+        is added after that and the result is not sanitized again. The certificate's own pages
+        are sanitized before they are attached. The document's page count does not change.
+        """
+        body = _sanitized_writer(writer_from_bytes(pdf))
+        certificate = to_bytes(_sanitized_writer(writer_from_bytes(certificate_pdf)))
+        body.add_attachment(CERTIFICATE_OF_COMPLETION_FILENAME, certificate)
+        out = to_bytes(body)
+        log.info(
+            "documents.finalized",
+            page_count=len(body.pages),
             size_bytes=len(out),
         )
         return out

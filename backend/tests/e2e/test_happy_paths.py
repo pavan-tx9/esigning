@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import io
-
-from pypdf import PdfReader
-
 from tests.e2e.conftest import CLINICIAN_NAME, PATIENT_NAME, Ehr, World
+from tests.pdftext import certificate_text
 
 
 def test_a_single_signer_envelope_goes_from_created_to_sealed_and_verifies(ehr: Ehr, world: World) -> None:
@@ -51,8 +48,8 @@ def test_a_single_signer_envelope_goes_from_created_to_sealed_and_verifies(ehr: 
     assert document.headers["cache-control"] == "no-store"
     assert document.content == copy.content
 
-    # The sealed PDF carries the signature block and the certificate of completion.
-    text = "".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(document.content)).pages)
+    # The sealed PDF carries the certificate of completion as a file attachment.
+    text = certificate_text(document.content)
     assert "Certificate of completion" in text
     assert envelope["id"] in text
 

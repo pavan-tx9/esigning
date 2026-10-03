@@ -86,7 +86,7 @@ in KMS and only its *identifier* is configuration.
 | `MAX_SIGNATURE_PNG_DIMENSION` / `MIN_SIGNATURE_PNG_DIMENSION` | `4000` / `8` | a 4000×1 image passes a pixel budget and is not a signature |
 | `MAX_TYPED_SIGNATURE_CHARS` | `200` | stamped into the document and kept for years |
 | `MAX_TEXT_FIELD_CHARS` | `2000` | likewise |
-| `SIGNATURE_CAPTION` | `false` | the caption under a signature or initials mark. Off, the mark fills its field and a `date_signed` field shows the day alone (`MM/DD/YYYY`); the certificate page and the audit trail still carry who, capacity, when and signer id. `true` prints the caption on the document |
+| `SIGNATURE_CAPTION` | `false` | the caption under a signature or initials mark. Off, the mark fills its field and a `date_signed` field shows the day alone (`MM/DD/YYYY`); the embedded certificate of completion and the audit trail still carry who, capacity, when and signer id. `true` prints the caption on the document |
 | `MAX_REQUEST_BYTES` | 8 MiB | enforced while the body is arriving, not after. Three routes carry files and are bounded by their own limit plus 1 MiB of multipart framing instead: `POST /v1/templates` by `MAX_TEMPLATE_BYTES`, `POST /v1/archives` by `MAX_SCAN_BYTES`, and a multipart `POST /v1/envelopes` by `MAX_SUPPLIED_DOCUMENT_BYTES`. Over the bound is `413 payload_too_large`; an oversized file part inside a legal request is `scan_too_large` / `supplied_too_large` |
 
 ## API and worker

@@ -23,7 +23,7 @@ A signed document is not one artefact. It is five, and they corroborate each oth
 
 | # | Evidence | Where it lives | Can it be changed? |
 |---|---|---|---|
-| 1 | **The sealed PDF** — the document, the signature marks, and the certificate of completion, under one PAdES certification signature with an RFC 3161 timestamp | blob store, content-addressed by its own SHA-256; S3 Object Lock in production | No. Any byte change breaks the seal |
+| 1 | **The sealed PDF** — the document, the signature marks, and the certificate of completion embedded as a file attachment, under one PAdES certification signature with an RFC 3161 timestamp | blob store, content-addressed by its own SHA-256; S3 Object Lock in production | No. Any byte change breaks the seal |
 | 2 | **Every intermediate revision** — what was presented, and what the document looked like after each signer | same blob store, one blob per revision; `document_revisions` is the index | No. Append-only table, write-once object, re-hashed on every read |
 | 3 | **The audit trail** — a hash-chained event per step, per envelope | `audit_events` | No. The runtime role has `SELECT, INSERT` only; a database trigger refuses `UPDATE`, `DELETE` and `TRUNCATE` even for the owner |
 | 4 | **The raw signer input** — the drawn PNG as it left the pad, or the typed text | `signature_captures` plus a blob for the image; a saved signature (§5) keeps its ink once, in `adopted_signatures`, and the capture points at that row | No. Append-only since migration `0502`; `adopted_signatures` rows are never deleted and take exactly one UPDATE, the revocation |
@@ -90,7 +90,7 @@ revision 2 "signer_applied" ─────▶   document_revisions(2)
                                      signer.signed.captures[].image_sha256 / typed_text_sha256
       │ … one more revision per signer …
       ▼
-revision N "final_unsealed"  ────▶   certificate of completion appended
+revision N "final_unsealed"  ────▶   certificate of completion embedded
                                      document.finalized.document_sha256
                                      document.finalized.audit_head_hash  ← the chain, quoted
       │ PAdES seal, DocMDP 1, RFC 3161 timestamp, KMS key
@@ -251,8 +251,9 @@ this as `seal_bound_to_envelope`.
 
 #### (d) The certificate of completion agrees with the trail
 
-Open the sealed PDF and read the last pages. Under "Audit trail" it prints the number of events and
-the head hash *at the moment it was written*, and both are inside the seal. Compare:
+Open the sealed PDF and open the attached file `certificate-of-completion.pdf` (Acrobat's
+attachments panel; it is not a page of the document). Under "Audit trail" it prints the number of
+events and the head hash *at the moment it was written*, and both are inside the seal. Compare:
 
 ```sh
 # what the certificate printed, taken from the event that recorded writing it
@@ -270,12 +271,13 @@ psql -At -c "SELECT encode(event_hash,'hex') FROM audit_events
 The trail will have grown since — every download and every verification adds an event — but the
 first *N* events must still be there and event *N* must still hash to the printed value. That is
 exactly what the `certificate_head_hash` check does, and `certificate_head_hash_in_document`
-confirms the value is really printed on a page inside the seal rather than merely recorded.
+confirms the value is really printed in that attached file, inside the seal, and not merely
+recorded beside it.
 
-Also on those pages, for every signer: name, role, capacity, signer id, authentication method,
+Also in that file, for every signer: name, role, capacity, signer id, authentication method,
 re-authentication, consent version, the viewed/consented/signed times in UTC, IP, user agent, and
-any kiosk staff member and identity check. That page is designed to stand alone in front of a
-reader who has none of this infrastructure.
+any kiosk staff member and identity check. It is designed to stand alone in front of a reader who
+has none of this infrastructure.
 
 Two of those lines say more than they used to, and both are Addendum 1 (section 5):
 
@@ -644,7 +646,7 @@ which is what `audit_events.event_hash` holds for this row, and what the eighth 
 | `signer.signed` | the whole act: what they were shown, what the marks went onto, what came out, how each field was filled, the digest of the ink, the consent version, whether re-authentication was used and by what method — and, since Addendum 1, *which* attestation covered it (`reauth_attestation_id`), whether that attestation was made in this session or borrowed (`reauth_scope`), how old it was (`reauth_age_seconds`), and the saved signature applied, if any (`adopted_signature_id`) |
 | `signer.declined` / `envelope.declined` | the refusal and its reason code |
 | `envelope.completed` | the last signature landed |
-| `document.finalized` | the certificate of completion was appended, over this many events ending in this head hash |
+| `document.finalized` | the certificate of completion was embedded, over this many events ending in this head hash |
 | `document.sealed` | the profile achieved, the key backend, the signing certificate's fingerprint, the timestamp authority's time |
 | `document.stored` | the sealed bytes went to write-once storage with this retain-until |
 | `document.downloaded` | somebody took a copy — the signer or the host |

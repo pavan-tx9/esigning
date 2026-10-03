@@ -119,7 +119,7 @@ def test_a_full_round_trip_works_on_every_sample(documents: DocumentService, key
         )
         current = documents.apply_signer_marks(current, fields, captures, stamp)
 
-    final = documents.finalize(current, documents.build_certificate(certificate_summary()))
+    final = documents.embed_certificate(current, documents.build_certificate(certificate_summary()))
     assert final.startswith(b"%PDF")
 
 
